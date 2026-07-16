@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "bork",
+  "outputfilename": "bork",
+  "build:dir": "build",
+  "wailsjsdir": "build",
+  "frontend:dir": "frontend",
+  "frontend:install": "npm ci",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Bork contributors"
+  },
+  "info": {
+    "productName": "Bork",
+    "productVersion": "0.0.1",
+    "comments": "Low-latency voice-first chat"
+  }
+}

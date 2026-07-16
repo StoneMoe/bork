@@ -1,0 +1,570 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"sync"
+	"time"
+
+	"bork/internal/audio"
+	"bork/internal/config"
+	"bork/internal/identity"
+	"bork/internal/media"
+	"bork/internal/networking/endpoint"
+	"bork/internal/peer"
+	"bork/internal/protocol"
+
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+)
+
+const stateCoalesceInterval = 50 * time.Millisecond
+
+type App struct {
+	config config.Config
+	logger *slog.Logger
+	emit   func(context.Context, string, ...interface{})
+
+	commandMu sync.Mutex
+	stateMu   sync.RWMutex
+
+	appContext  context.Context
+	startupDone chan struct{}
+	startupErr  error
+
+	stateRevision        uint64
+	statePending         chan struct{}
+	stopStateNotifier    context.CancelFunc
+	stateNotifierStopped chan struct{}
+	notificationsClosed  bool
+
+	localIdentity    *identity.LocalIdentity
+	identityLease    *identity.Lease
+	room             *roomSession
+	audioEngine      *audio.Engine
+	audioInitError   string
+	stopAudioWatcher context.CancelFunc
+	audioWatcherDone chan struct{}
+	lastDiagnostics  Diagnostics
+	lastError        *AppError
+	nextErrorID      uint64
+	shuttingDown     bool
+}
+
+type roomSession struct {
+	client   *peer.Client
+	media    *media.Flow
+	cancel   context.CancelFunc
+	done     chan struct{}
+	stopping bool
+}
+
+type roomStateChange struct {
+	room     *roomSession
+	err      error
+	terminal bool
+}
+
+func NewApp(cfg config.Config, logger *slog.Logger) *App {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &App{
+		config:          cfg,
+		logger:          logger,
+		emit:            wailsruntime.EventsEmit,
+		startupDone:     make(chan struct{}),
+		statePending:    make(chan struct{}, 1),
+		lastDiagnostics: emptyDiagnostics(),
+	}
+}
+
+func (a *App) startup(ctx context.Context) {
+	a.stateMu.Lock()
+	a.appContext = ctx
+	a.stateMu.Unlock()
+	a.startStateNotifier(ctx)
+
+	a.commandMu.Lock()
+	startupErr := a.initializeIdentity()
+	if startupErr == nil {
+		if err := a.initializeAudio(); err != nil {
+			a.setAudioInitError(err)
+		} else {
+			a.setAudioInitError(nil)
+		}
+		a.startAudioWatcher(ctx)
+		encodedInvite, err := a.config.LoadInvite()
+		if err == nil && encodedInvite != "" {
+			err = a.joinRoom(encodedInvite)
+		}
+		if err != nil {
+			a.recordError(err)
+		}
+	} else if errors.Is(startupErr, identity.ErrAlreadyActive) {
+		a.recordError(errors.New("当前身份已在另一个 Bork 实例中使用。请先关闭已有实例"))
+	} else {
+		a.recordError(startupErr)
+	}
+	a.commandMu.Unlock()
+
+	a.stateMu.Lock()
+	a.startupErr = startupErr
+	a.stateMu.Unlock()
+	a.markStateChanged()
+	close(a.startupDone)
+
+}
+
+func (a *App) waitForStartup() error {
+	<-a.startupDone
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return a.startupErr
+}
+
+func (a *App) startStateNotifier(parent context.Context) {
+	a.stateMu.Lock()
+	if a.notificationsClosed || a.stopStateNotifier != nil {
+		a.stateMu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	a.stopStateNotifier = cancel
+	a.stateNotifierStopped = done
+	a.stateMu.Unlock()
+	go func() {
+		defer close(done)
+		var lastEmitted uint64
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-a.statePending:
+			}
+
+			timer := time.NewTimer(stateCoalesceInterval)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return
+			case <-timer.C:
+			}
+			draining := true
+			for draining {
+				select {
+				case <-a.statePending:
+				default:
+					draining = false
+				}
+			}
+			a.stateMu.RLock()
+			revision := a.stateRevision
+			a.stateMu.RUnlock()
+			if revision != lastEmitted {
+				a.emit(ctx, stateChangedEvent, revision)
+				lastEmitted = revision
+			}
+		}
+	}()
+}
+
+func (a *App) markStateChanged() {
+	a.stateMu.Lock()
+	a.stateRevision++
+	a.stateMu.Unlock()
+	select {
+	case a.statePending <- struct{}{}:
+	default:
+	}
+}
+
+func (a *App) publishRoomChange(change roomStateChange) {
+	a.commandMu.Lock()
+	defer a.commandMu.Unlock()
+	if !a.isActiveRoom(change.room) {
+		return
+	}
+	if change.terminal {
+		diagnostics := projectDiagnostics(change.room.client.NetworkSnapshot())
+		a.stateMu.Lock()
+		a.lastDiagnostics = diagnostics
+		a.stateMu.Unlock()
+		if change.err != nil {
+			a.recordError(change.err)
+		}
+		room := a.detachActiveRoom()
+		if room != nil {
+			room.cancel()
+		}
+		if audioEngine, err := a.readyAudioEngine(); err == nil {
+			audioEngine.Stop()
+		}
+		a.markStateChanged()
+		return
+	}
+	a.reconcileAudioLocked(change.room)
+	a.markStateChanged()
+}
+
+func (a *App) initializeIdentity() error {
+	a.stateMu.RLock()
+	existingIdentity := a.localIdentity
+	shuttingDown := a.shuttingDown
+	a.stateMu.RUnlock()
+	if shuttingDown {
+		return errors.New("application is shutting down")
+	}
+	if existingIdentity != nil {
+		return nil
+	}
+	localIdentity, err := identity.LoadOrCreate(a.config.DataDir)
+	if err == nil {
+		var identityLease *identity.Lease
+		identityLease, err = identity.Acquire(localIdentity)
+		if err == nil {
+			a.stateMu.Lock()
+			a.localIdentity = localIdentity
+			a.identityLease = identityLease
+			a.stateMu.Unlock()
+		}
+	}
+	if err != nil {
+		a.logger.Error("initialise identity", "error", err)
+	}
+	return err
+}
+
+func (a *App) initializeAudio() error {
+	a.stateMu.RLock()
+	hasIdentity := a.localIdentity != nil
+	existingAudioEngine := a.audioEngine
+	shuttingDown := a.shuttingDown
+	a.stateMu.RUnlock()
+	if shuttingDown {
+		return errors.New("application is shutting down")
+	}
+	if !hasIdentity || existingAudioEngine != nil {
+		return nil
+	}
+	audioEngine, err := audio.New(audio.Options{MaxEncodedFrameBytes: protocol.MaxVoicePayload}, a.logger)
+	if err != nil {
+		a.logger.Warn("initialise voice audio", "error", err)
+		return err
+	}
+	a.stateMu.Lock()
+	a.audioEngine = audioEngine
+	a.stateMu.Unlock()
+	return nil
+}
+
+func (a *App) setAudioInitError(err error) {
+	a.stateMu.Lock()
+	if err == nil {
+		a.audioInitError = ""
+	} else {
+		a.audioInitError = err.Error()
+	}
+	a.stateMu.Unlock()
+}
+
+func (a *App) startAudioWatcher(parent context.Context) {
+	a.stateMu.Lock()
+	if a.shuttingDown || a.audioEngine == nil || a.stopAudioWatcher != nil {
+		a.stateMu.Unlock()
+		return
+	}
+	audioEngine := a.audioEngine
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	a.stopAudioWatcher = cancel
+	a.audioWatcherDone = done
+	a.stateMu.Unlock()
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-audioEngine.StatusChanges():
+				a.markStateChanged()
+			}
+		}
+	}()
+}
+
+func (a *App) activateRoom(client *peer.Client) error {
+	a.stateMu.RLock()
+	parent := a.appContext
+	a.stateMu.RUnlock()
+	if parent == nil {
+		return errors.New("application has not started")
+	}
+	ctx, cancel := context.WithCancel(parent)
+	room := &roomSession{client: client, media: media.NewFlow(), cancel: cancel, done: make(chan struct{})}
+	a.stateMu.Lock()
+	a.room = room
+	a.lastDiagnostics = emptyDiagnostics()
+	a.stateMu.Unlock()
+	go a.watchRoom(ctx, room)
+	return nil
+}
+
+func (a *App) watchRoom(ctx context.Context, room *roomSession) {
+	defer func() {
+		a.stateMu.Lock()
+		if a.room == room {
+			a.room = nil
+		}
+		a.stateMu.Unlock()
+		close(room.done)
+		a.markStateChanged()
+	}()
+	peerChanges := room.client.StateChanges()
+	peerResult := make(chan error, 1)
+	go func() { peerResult <- room.client.Loop(ctx, room.media) }()
+	for {
+		select {
+		case <-peerChanges:
+			a.publishRoomChange(roomStateChange{room: room})
+		case err := <-peerResult:
+			a.publishRoomChange(roomStateChange{room: room, err: err, terminal: true})
+			return
+		case <-ctx.Done():
+			<-peerResult
+			return
+		}
+	}
+}
+
+func (a *App) detachActiveRoom() *roomSession {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	if a.room == nil || a.room.stopping {
+		return nil
+	}
+	a.room.stopping = true
+	return a.room
+}
+
+func (a *App) stopRoom(room *roomSession) {
+	if room == nil {
+		return
+	}
+	room.cancel()
+	<-room.done
+}
+
+func (a *App) isActiveRoom(room *roomSession) bool {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return a.room == room && room != nil && !room.stopping
+}
+
+func (a *App) reconcileAudioLocked(room *roomSession) {
+	a.stateMu.RLock()
+	audioEngine := a.audioEngine
+	isActiveRoom := a.room == room && room != nil && !room.stopping
+	a.stateMu.RUnlock()
+	if audioEngine == nil || !isActiveRoom {
+		return
+	}
+	peerSnapshot := room.client.Snapshot()
+	shouldRunAudio := len(peerSnapshot.RemotePeers) > 0
+	status := audioEngine.Status()
+	if status.Running == shouldRunAudio {
+		return
+	}
+	if shouldRunAudio && status.Available {
+		if _, err := audioEngine.Start(room.media); err != nil {
+			a.logger.Warn("start voice automatically", "error", err)
+		}
+	} else if !shouldRunAudio && status.Running {
+		audioEngine.Stop()
+	}
+}
+
+func (a *App) activeClient() (*peer.Client, error) {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	if a.room == nil || a.room.stopping {
+		return nil, errors.New("not in a room")
+	}
+	return a.room.client, nil
+}
+
+func (a *App) snapshot() AppSnapshot {
+	for {
+		a.stateMu.RLock()
+		revision := a.stateRevision
+		localIdentity := a.localIdentity
+		room := a.room
+		if room != nil && room.stopping {
+			room = nil
+		}
+		audioEngine := a.audioEngine
+		audioInitError := a.audioInitError
+		diagnostics := cloneDiagnostics(a.lastDiagnostics)
+		var lastError *AppError
+		if a.lastError != nil {
+			value := *a.lastError
+			lastError = &value
+		}
+		a.stateMu.RUnlock()
+
+		state := AppSnapshot{
+			Revision:    revision,
+			Audio:       emptyAudioStatus(),
+			Diagnostics: diagnostics,
+			Error:       lastError,
+		}
+		if localIdentity != nil {
+			state.PeerID = localIdentity.PeerID()
+		}
+		if audioEngine != nil {
+			state.Audio = audioEngine.Status()
+		} else if audioInitError != "" {
+			state.Audio.Error = audioInitError
+		}
+		if room != nil {
+			peerSnapshot, networkSnapshot := room.client.StateSnapshot()
+			state.Room = &RoomState{
+				Name:         peerSnapshot.Name,
+				Phase:        peerSnapshot.Phase,
+				LocalAddress: peerSnapshot.LocalAddress,
+				RemotePeers:  make([]RemotePeer, 0, len(peerSnapshot.RemotePeers)),
+			}
+			for _, remotePeer := range peerSnapshot.RemotePeers {
+				state.Room.RemotePeers = append(state.Room.RemotePeers, projectRemotePeer(remotePeer))
+			}
+			state.Diagnostics = projectDiagnostics(networkSnapshot)
+		}
+
+		a.stateMu.RLock()
+		stable := a.stateRevision == revision
+		if room == nil {
+			stable = stable && (a.room == nil || a.room.stopping)
+		} else {
+			stable = stable && a.room == room && !a.room.stopping
+		}
+		a.stateMu.RUnlock()
+		if stable {
+			return state
+		}
+	}
+}
+
+func (a *App) recordError(err error) {
+	if err == nil {
+		return
+	}
+	a.stateMu.Lock()
+	a.nextErrorID++
+	a.lastError = &AppError{ID: a.nextErrorID, Message: err.Error()}
+	a.stateMu.Unlock()
+}
+
+func (a *App) clearError() {
+	a.stateMu.Lock()
+	a.lastError = nil
+	a.stateMu.Unlock()
+}
+
+func (a *App) beforeClose(context.Context) bool {
+	a.stopStateNotifications()
+	return false
+}
+
+func (a *App) stopStateNotifications() {
+	a.stateMu.Lock()
+	stop, done := a.stopStateNotifier, a.stateNotifierStopped
+	a.notificationsClosed = true
+	a.stopStateNotifier, a.stateNotifierStopped = nil, nil
+	a.stateMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+func (a *App) shutdown(context.Context) {
+	a.commandMu.Lock()
+	a.stateMu.Lock()
+	if a.shuttingDown {
+		a.stateMu.Unlock()
+		a.commandMu.Unlock()
+		return
+	}
+	a.shuttingDown = true
+	room := a.room
+	if room != nil {
+		room.stopping = true
+	}
+	a.stateMu.Unlock()
+	a.stopStateNotifications()
+	if room != nil {
+		room.cancel()
+	}
+	if audioEngine, err := a.readyAudioEngine(); err == nil {
+		audioEngine.Stop()
+	}
+	a.commandMu.Unlock()
+	a.stopRoom(room)
+
+	a.stateMu.Lock()
+	stopAudioWatcher, audioWatcherDone := a.stopAudioWatcher, a.audioWatcherDone
+	audioEngine, identityLease := a.audioEngine, a.identityLease
+	a.stopAudioWatcher, a.audioWatcherDone = nil, nil
+	a.audioEngine, a.identityLease = nil, nil
+	a.stateMu.Unlock()
+	if stopAudioWatcher != nil {
+		stopAudioWatcher()
+	}
+	if audioWatcherDone != nil {
+		<-audioWatcherDone
+	}
+	if audioEngine != nil {
+		if err := audioEngine.Close(); err != nil {
+			a.logger.Warn("close voice audio", "error", err)
+		}
+	}
+	if identityLease != nil {
+		if err := identityLease.Close(); err != nil {
+			a.logger.Warn("release identity lease", "error", err)
+		}
+	}
+}
+
+func (a *App) readyAudioEngine() (*audio.Engine, error) {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	if a.audioEngine == nil {
+		return nil, errors.New("voice audio is unavailable")
+	}
+	return a.audioEngine, nil
+}
+
+func (a *App) isShuttingDown() bool {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return a.shuttingDown
+}
+
+func emptyAudioStatus() audio.Status {
+	return audio.Status{CaptureDevices: []audio.Device{}, PlaybackDevices: []audio.Device{}}
+}
+
+func emptyDiagnostics() Diagnostics {
+	return Diagnostics{Candidates: []endpoint.Candidate{}, STUN: []endpoint.STUNResult{}}
+}
+
+func cloneDiagnostics(value Diagnostics) Diagnostics {
+	value.Candidates = append([]endpoint.Candidate{}, value.Candidates...)
+	value.STUN = append([]endpoint.STUNResult{}, value.STUN...)
+	return value
+}
