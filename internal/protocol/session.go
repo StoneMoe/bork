@@ -13,24 +13,14 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-type LinkKeys struct {
-	ControlSend [32]byte
-	ControlRecv [32]byte
-	VoiceSend   [32]byte
-	VoiceRecv   [32]byte
-}
-
 type SessionMaterial struct {
-	SessionID      [16]byte
-	TranscriptHash [32]byte
-	Keys           LinkKeys
+	SessionID [16]byte
+	Ciphers   SessionCiphers
 }
 
-type LinkCiphers struct {
+type SessionCiphers struct {
 	ControlSend cipher.AEAD
 	ControlRecv cipher.AEAD
-	VoiceSend   cipher.AEAD
-	VoiceRecv   cipher.AEAD
 }
 
 func DeriveSession(privateKey *ecdh.PrivateKey, localHello, remoteHello HelloPacket) (SessionMaterial, error) {
@@ -72,64 +62,35 @@ func DeriveSession(privateKey *ecdh.PrivateKey, localHello, remoteHello HelloPac
 	binary.BigEndian.PutUint16(length[:], uint16(len(second.wire)))
 	_, _ = hash.Write(length[:])
 	_, _ = hash.Write(second.wire[:])
-	var material SessionMaterial
-	copy(material.TranscriptHash[:], hash.Sum(nil))
+	var transcriptHash [32]byte
+	copy(transcriptHash[:], hash.Sum(nil))
 
-	sessionID, err := hkdf.Key(sha256.New, sharedSecret, material.TranscriptHash[:], wireDomain+"session-id", 16)
+	sessionID, err := hkdf.Key(sha256.New, sharedSecret, transcriptHash[:], wireDomain+"session-id", 16)
 	if err != nil {
 		return SessionMaterial{}, err
 	}
+	var material SessionMaterial
 	copy(material.SessionID[:], sessionID)
-	controlAB, err := deriveSessionKey(sharedSecret, material.TranscriptHash, wireDomain+"chacha20poly1305/control/a-to-b")
+	controlAB, err := deriveSessionCipher(sharedSecret, transcriptHash, wireDomain+"chacha20poly1305/control/a-to-b")
 	if err != nil {
 		return SessionMaterial{}, err
 	}
-	controlBA, err := deriveSessionKey(sharedSecret, material.TranscriptHash, wireDomain+"chacha20poly1305/control/b-to-a")
-	if err != nil {
-		return SessionMaterial{}, err
-	}
-	voiceAB, err := deriveSessionKey(sharedSecret, material.TranscriptHash, wireDomain+"chacha20poly1305/voice/a-to-b")
-	if err != nil {
-		return SessionMaterial{}, err
-	}
-	voiceBA, err := deriveSessionKey(sharedSecret, material.TranscriptHash, wireDomain+"chacha20poly1305/voice/b-to-a")
+	controlBA, err := deriveSessionCipher(sharedSecret, transcriptHash, wireDomain+"chacha20poly1305/control/b-to-a")
 	if err != nil {
 		return SessionMaterial{}, err
 	}
 	if localFirst {
-		material.Keys = LinkKeys{ControlSend: controlAB, ControlRecv: controlBA, VoiceSend: voiceAB, VoiceRecv: voiceBA}
+		material.Ciphers = SessionCiphers{ControlSend: controlAB, ControlRecv: controlBA}
 	} else {
-		material.Keys = LinkKeys{ControlSend: controlBA, ControlRecv: controlAB, VoiceSend: voiceBA, VoiceRecv: voiceAB}
+		material.Ciphers = SessionCiphers{ControlSend: controlBA, ControlRecv: controlAB}
 	}
 	return material, nil
 }
 
-func deriveSessionKey(sharedSecret []byte, transcriptHash [32]byte, info string) ([32]byte, error) {
-	derived, err := hkdf.Key(sha256.New, sharedSecret, transcriptHash[:], info, 32)
+func deriveSessionCipher(sharedSecret []byte, transcriptHash [32]byte, info string) (cipher.AEAD, error) {
+	key, err := hkdf.Key(sha256.New, sharedSecret, transcriptHash[:], info, chacha20poly1305.KeySize)
 	if err != nil {
-		return [32]byte{}, err
+		return nil, err
 	}
-	var key [32]byte
-	copy(key[:], derived)
-	return key, nil
-}
-
-func NewLinkCiphers(keys LinkKeys) (LinkCiphers, error) {
-	controlSend, err := chacha20poly1305.New(keys.ControlSend[:])
-	if err != nil {
-		return LinkCiphers{}, err
-	}
-	controlRecv, err := chacha20poly1305.New(keys.ControlRecv[:])
-	if err != nil {
-		return LinkCiphers{}, err
-	}
-	voiceSend, err := chacha20poly1305.New(keys.VoiceSend[:])
-	if err != nil {
-		return LinkCiphers{}, err
-	}
-	voiceRecv, err := chacha20poly1305.New(keys.VoiceRecv[:])
-	if err != nil {
-		return LinkCiphers{}, err
-	}
-	return LinkCiphers{ControlSend: controlSend, ControlRecv: controlRecv, VoiceSend: voiceSend, VoiceRecv: voiceRecv}, nil
+	return chacha20poly1305.New(key)
 }

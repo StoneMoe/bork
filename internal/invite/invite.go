@@ -3,8 +3,6 @@ package invite
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -20,16 +18,15 @@ const (
 	TrackerHashSize  = 20
 	MaxDisplayRunes  = 64
 	MaxDisplayBytes  = 256
-	MaxEncodedSize   = 1024
+	MaxEncodedSize   = 512
 	prefix           = "bork://join/"
-	payloadFixedSize = 1 + RoomSeedSize + 2
+	payloadFixedSize = 1 + RoomSeedSize
 	checksumSize     = 4
 	hkdfSalt         = "bork/invite/hkdf-sha256/v1"
 )
 
 type Invite struct {
-	Version     uint8  `json:"version"`
-	DisplayName string `json:"displayName"`
+	DisplayName string
 	roomSeed    [RoomSeedSize]byte
 }
 
@@ -38,7 +35,7 @@ func New(displayName string) (Invite, error) {
 	if err != nil {
 		return Invite{}, err
 	}
-	invite := Invite{Version: Version, DisplayName: displayName}
+	invite := Invite{DisplayName: displayName}
 	if _, err := rand.Read(invite.roomSeed[:]); err != nil {
 		return Invite{}, fmt.Errorf("generate room seed: %w", err)
 	}
@@ -57,11 +54,11 @@ func Parse(encoded string) (Invite, error) {
 	if strings.ContainsAny(encoded, "\r\n") {
 		return Invite{}, errors.New("invite encoding is invalid")
 	}
-	payload, err := base64.RawURLEncoding.Strict().DecodeString(encoded)
+	payload, err := decodeBase58(encoded)
 	if err != nil {
 		return Invite{}, errors.New("invite encoding is invalid")
 	}
-	if base64.RawURLEncoding.EncodeToString(payload) != encoded {
+	if encodeBase58(payload) != encoded {
 		return Invite{}, errors.New("invite encoding is not canonical")
 	}
 	if len(payload) < payloadFixedSize+checksumSize {
@@ -70,33 +67,32 @@ func Parse(encoded string) (Invite, error) {
 	if payload[0] != Version {
 		return Invite{}, fmt.Errorf("unsupported invite version %d", payload[0])
 	}
-	nameLength := int(binary.BigEndian.Uint16(payload[1+RoomSeedSize : payloadFixedSize]))
-	if len(payload) != payloadFixedSize+nameLength+checksumSize {
-		return Invite{}, errors.New("invite payload length is invalid")
-	}
 	content := payload[:len(payload)-checksumSize]
 	wantChecksum := sha256.Sum256(content)
 	if string(payload[len(payload)-checksumSize:]) != string(wantChecksum[:checksumSize]) {
 		return Invite{}, errors.New("invite checksum is invalid")
 	}
-	displayName, err := validateDisplayName(string(content[payloadFixedSize:]))
+	rawDisplayName := string(content[payloadFixedSize:])
+	displayName, err := validateDisplayName(rawDisplayName)
 	if err != nil {
 		return Invite{}, err
 	}
-	invite := Invite{Version: Version, DisplayName: displayName}
+	if displayName != rawDisplayName {
+		return Invite{}, errors.New("invite room name is not canonical")
+	}
+	invite := Invite{DisplayName: displayName}
 	copy(invite.roomSeed[:], payload[1:1+RoomSeedSize])
 	return invite, nil
 }
 
 func (i Invite) Encode() string {
 	payload := make([]byte, payloadFixedSize+len(i.DisplayName)+checksumSize)
-	payload[0] = i.Version
+	payload[0] = Version
 	copy(payload[1:1+RoomSeedSize], i.roomSeed[:])
-	binary.BigEndian.PutUint16(payload[1+RoomSeedSize:payloadFixedSize], uint16(len(i.DisplayName)))
 	copy(payload[payloadFixedSize:], i.DisplayName)
 	checksum := sha256.Sum256(payload[:len(payload)-checksumSize])
 	copy(payload[len(payload)-checksumSize:], checksum[:checksumSize])
-	return prefix + base64.RawURLEncoding.EncodeToString(payload)
+	return prefix + encodeBase58(payload)
 }
 
 // TrackerHash returns the non-enumerable swarm identifier used for tracker discovery.
@@ -105,6 +101,17 @@ func (i Invite) TrackerHash() [TrackerHashSize]byte {
 	var hash [TrackerHashSize]byte
 	copy(hash[:], derived)
 	return hash
+}
+
+// GroupMediaKey returns the room-scoped symmetric key that seals realtime
+// group datagrams. It is a group transport key, not forward-secret group E2EE:
+// every RoomSeed holder can decrypt, while sender signatures prevent another
+// member from forging the claimed sender identity.
+func (i Invite) GroupMediaKey() [32]byte {
+	derived := i.derive("bork/group-media/v1", 32)
+	var key [32]byte
+	copy(key[:], derived)
+	return key
 }
 
 // AdmissionKey returns the secret key used to prove possession of the room invite.
@@ -121,10 +128,6 @@ func (i Invite) RoomTag() [16]byte {
 	var tag [16]byte
 	copy(tag[:], derived)
 	return tag
-}
-
-func (i Invite) Equal(other Invite) bool {
-	return i.Version == other.Version && i.DisplayName == other.DisplayName && i.roomSeed == other.roomSeed
 }
 
 func (i Invite) derive(info string, length int) []byte {

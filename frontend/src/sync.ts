@@ -1,4 +1,4 @@
-import { Accessor, createSignal, onCleanup, onMount } from "solid-js";
+import { createSignal, onCleanup, onMount } from "solid-js";
 import { GetSnapshot } from "@wailsjs/go/app/App";
 import { app } from "@wailsjs/go/models";
 import { EventsOn } from "@wailsjs/runtime/runtime";
@@ -7,27 +7,31 @@ import type { AppState } from "./types";
 const emptyState = new app.AppSnapshot({
   revision: 0,
   peerId: "",
+  nickname: "",
   audio: {
     available: false,
     running: false,
     muted: false,
+    speaking: false,
+    speakingPeerIds: [],
     captureDeviceId: "",
     playbackDeviceId: "",
     captureDevices: [],
     playbackDevices: [],
   },
-  diagnostics: { listenAddress: "", candidates: [], stun: [] },
+  diagnostics: {
+    listenAddress: "",
+    candidates: [],
+    stun: [],
+    tracker: [],
+    connectivity: {
+      knownAddresses: [],
+    },
+  },
 });
 
-export interface RemoteState {
-  state: Accessor<AppState>;
-  ready: Accessor<boolean>;
-  refresh: () => Promise<void>;
-}
-
-export function createRemoteState(reportError: (message: string) => void): RemoteState {
+export function createRemoteState(reportError: (message: string) => void) {
   const [state, setState] = createSignal<AppState>(emptyState);
-  const [ready, setReady] = createSignal(false);
   let disposed = false;
   let requested = false;
   let pulling: Promise<void> | undefined;
@@ -42,9 +46,8 @@ export function createRemoteState(reportError: (message: string) => void): Remot
         try {
           const next = await GetSnapshot();
           if (disposed) return;
-          if (!ready() || next.revision >= state().revision) {
+          if (next.revision >= state().revision) {
             setState(next);
-            setReady(true);
           }
           if (next.error && next.error.id > lastErrorId) {
             lastErrorId = next.error.id;
@@ -72,5 +75,5 @@ export function createRemoteState(reportError: (message: string) => void): Remot
     });
   });
 
-  return { state, ready, refresh };
+  return { state, refresh };
 }

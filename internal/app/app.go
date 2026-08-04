@@ -11,6 +11,7 @@ import (
 	"bork/internal/config"
 	"bork/internal/identity"
 	"bork/internal/media"
+	"bork/internal/networking/discovery/tracker"
 	"bork/internal/networking/endpoint"
 	"bork/internal/peer"
 	"bork/internal/protocol"
@@ -40,6 +41,7 @@ type App struct {
 
 	localIdentity    *identity.LocalIdentity
 	identityLease    *identity.Lease
+	nickname         string
 	room             *roomSession
 	audioEngine      *audio.Engine
 	audioInitError   string
@@ -189,7 +191,8 @@ func (a *App) publishRoomChange(change roomStateChange) {
 		return
 	}
 	if change.terminal {
-		diagnostics := projectDiagnostics(change.room.client.NetworkSnapshot())
+		peerSnapshot, networkSnapshot := change.room.client.StateSnapshot()
+		diagnostics := projectDiagnostics(networkSnapshot, peerSnapshot.Connectivity)
 		a.stateMu.Lock()
 		a.lastDiagnostics = diagnostics
 		a.stateMu.Unlock()
@@ -250,7 +253,7 @@ func (a *App) initializeAudio() error {
 	if !hasIdentity || existingAudioEngine != nil {
 		return nil
 	}
-	audioEngine, err := audio.New(audio.Options{MaxEncodedFrameBytes: protocol.MaxVoicePayload}, a.logger)
+	audioEngine, err := audio.New(audio.Options{MaxEncodedFrameBytes: protocol.MaxGroupDatagramPayload}, a.logger)
 	if err != nil {
 		a.logger.Warn("initialise voice audio", "error", err)
 		return err
@@ -372,14 +375,15 @@ func (a *App) reconcileAudioLocked(room *roomSession) {
 	if audioEngine == nil || !isActiveRoom {
 		return
 	}
-	peerSnapshot := room.client.Snapshot()
-	shouldRunAudio := len(peerSnapshot.RemotePeers) > 0
+	remotePeerCount := room.client.RemotePeerCount()
+	audioEngine.SetVoiceBitrate(audio.RecommendedVoiceBitrate(remotePeerCount + 1))
+	shouldRunAudio := remotePeerCount > 0
 	status := audioEngine.Status()
 	if status.Running == shouldRunAudio {
 		return
 	}
 	if shouldRunAudio && status.Available {
-		if _, err := audioEngine.Start(room.media); err != nil {
+		if err := audioEngine.Start(room.media); err != nil {
 			a.logger.Warn("start voice automatically", "error", err)
 		}
 	} else if !shouldRunAudio && status.Running {
@@ -401,13 +405,17 @@ func (a *App) snapshot() AppSnapshot {
 		a.stateMu.RLock()
 		revision := a.stateRevision
 		localIdentity := a.localIdentity
+		nickname := a.nickname
 		room := a.room
 		if room != nil && room.stopping {
 			room = nil
 		}
 		audioEngine := a.audioEngine
 		audioInitError := a.audioInitError
-		diagnostics := cloneDiagnostics(a.lastDiagnostics)
+		var diagnostics Diagnostics
+		if room == nil {
+			diagnostics = cloneDiagnostics(a.lastDiagnostics)
+		}
 		var lastError *AppError
 		if a.lastError != nil {
 			value := *a.lastError
@@ -417,6 +425,7 @@ func (a *App) snapshot() AppSnapshot {
 
 		state := AppSnapshot{
 			Revision:    revision,
+			Nickname:    nickname,
 			Audio:       emptyAudioStatus(),
 			Diagnostics: diagnostics,
 			Error:       lastError,
@@ -432,15 +441,14 @@ func (a *App) snapshot() AppSnapshot {
 		if room != nil {
 			peerSnapshot, networkSnapshot := room.client.StateSnapshot()
 			state.Room = &RoomState{
-				Name:         peerSnapshot.Name,
-				Phase:        peerSnapshot.Phase,
-				LocalAddress: peerSnapshot.LocalAddress,
-				RemotePeers:  make([]RemotePeer, 0, len(peerSnapshot.RemotePeers)),
+				Name:        peerSnapshot.Name,
+				Phase:       peerSnapshot.Phase,
+				RemotePeers: make([]RemotePeer, 0, len(peerSnapshot.RemotePeers)),
 			}
 			for _, remotePeer := range peerSnapshot.RemotePeers {
 				state.Room.RemotePeers = append(state.Room.RemotePeers, projectRemotePeer(remotePeer))
 			}
-			state.Diagnostics = projectDiagnostics(networkSnapshot)
+			state.Diagnostics = projectDiagnostics(networkSnapshot, peerSnapshot.Connectivity)
 		}
 
 		a.stateMu.RLock()
@@ -556,15 +564,20 @@ func (a *App) isShuttingDown() bool {
 }
 
 func emptyAudioStatus() audio.Status {
-	return audio.Status{CaptureDevices: []audio.Device{}, PlaybackDevices: []audio.Device{}}
+	return audio.Status{SpeakingPeerIDs: []string{}, CaptureDevices: []audio.Device{}, PlaybackDevices: []audio.Device{}}
 }
 
 func emptyDiagnostics() Diagnostics {
-	return Diagnostics{Candidates: []endpoint.Candidate{}, STUN: []endpoint.STUNResult{}}
+	return Diagnostics{
+		Candidates: []endpoint.Candidate{}, STUN: []endpoint.STUNResult{}, Tracker: []tracker.ProviderStatus{},
+		Connectivity: peer.ConnectivitySnapshot{KnownAddresses: []peer.KnownAddressSnapshot{}},
+	}
 }
 
 func cloneDiagnostics(value Diagnostics) Diagnostics {
 	value.Candidates = append([]endpoint.Candidate{}, value.Candidates...)
 	value.STUN = append([]endpoint.STUNResult{}, value.STUN...)
+	value.Tracker = append([]tracker.ProviderStatus{}, value.Tracker...)
+	value.Connectivity.KnownAddresses = append([]peer.KnownAddressSnapshot{}, value.Connectivity.KnownAddresses...)
 	return value
 }

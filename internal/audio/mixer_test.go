@@ -2,12 +2,90 @@ package audio
 
 import (
 	"math"
+	"slices"
 	"testing"
 
 	"bork/internal/media"
 )
 
 const testMaxEncodedFrameBytes = 1200
+
+func TestSpeakingThresholdAndReleaseHold(t *testing.T) {
+	pcm := make([]float32, FrameSamples)
+	for index := range pcm {
+		pcm[index] = 0.001
+	}
+	if level := pcmRMS(pcm); !(level > 0.0001) || level > speakingThreshold {
+		t.Fatal("speaking threshold changed the lower mixer audibility threshold")
+	}
+	for index := range pcm {
+		pcm[index] = 0.02
+	}
+	if pcmRMS(pcm) <= speakingThreshold {
+		t.Fatal("loud PCM did not cross the speaking threshold")
+	}
+
+	var hold speakingHold
+	if !hold.update(true) || !hold.active() {
+		t.Fatal("loud frame did not activate speaking hold")
+	}
+	for tick := 1; tick < speakingReleaseFrames; tick++ {
+		if hold.update(false) || !hold.active() {
+			t.Fatalf("speaking hold released after %dms", tick*FrameDuration)
+		}
+	}
+	if !hold.update(false) || hold.active() {
+		t.Fatalf("speaking hold did not release after %dms", speakingReleaseFrames*FrameDuration)
+	}
+}
+
+func TestMixerMapsSpeakingToSortedSourceIDs(t *testing.T) {
+	loud := packetWithAmplitude(t, 0.2)
+	quiet := packetWithAmplitude(t, 0.001)
+	mixer := newMixer(testMaxEncodedFrameBytes)
+	for _, source := range []struct {
+		id     string
+		packet []byte
+	}{
+		{"peer-z", loud},
+		{"peer-quiet", quiet},
+		{"peer-a", loud},
+	} {
+		for sequence := uint64(1); sequence <= prebufferFrames; sequence++ {
+			if err := mixer.Add(media.ReceivedFrame{SourceID: source.id, Sequence: sequence, Timestamp: uint32(sequence) * FrameSamples, Payload: source.packet}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if len(mixer.SpeakingPeerIDs()) != 0 {
+		t.Fatal("packet presence alone marked a source as speaking")
+	}
+	if _, _, err := mixerNext(mixer); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := mixer.SpeakingPeerIDs(), []string{"peer-a", "peer-z"}; !slices.Equal(got, want) {
+		t.Fatalf("speaking peer IDs = %v, want %v", got, want)
+	}
+
+	for _, stream := range mixer.streams {
+		stream.started = false
+		clear(stream.frames)
+	}
+	for range speakingReleaseFrames - 1 {
+		if _, _, err := mixerNext(mixer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := mixer.SpeakingPeerIDs(); len(got) != 2 {
+		t.Fatalf("missing output released speaking early: %v", got)
+	}
+	if _, _, err := mixerNext(mixer); err != nil {
+		t.Fatal(err)
+	}
+	if got := mixer.SpeakingPeerIDs(); len(got) != 0 {
+		t.Fatalf("missing output did not release speaking: %v", got)
+	}
+}
 
 func TestMixerPrebuffersAndDecodesOutOfOrderFrames(t *testing.T) {
 	encoder, err := newOpusEncoder(testMaxEncodedFrameBytes)
@@ -53,21 +131,10 @@ func TestMixerPrebuffersAndDecodesOutOfOrderFrames(t *testing.T) {
 	}
 }
 
-func TestMixerUsesPLCForMissingFrame(t *testing.T) {
-	encoder, err := newOpusEncoder(testMaxEncodedFrameBytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pcm := make([]float32, FrameSamples)
-	for index := range pcm {
-		pcm[index] = 0.1
-	}
-	packet, err := encoder.Encode(pcm)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestMixerUsesPLCForTimestampGap(t *testing.T) {
+	packet := audiblePacket(t)
 	mixer := newMixer(testMaxEncodedFrameBytes)
-	for _, sequence := range []uint64{1, 3, 4} {
+	for sequence := uint64(1); sequence <= prebufferFrames; sequence++ {
 		if err := mixer.Add(media.ReceivedFrame{SourceID: "peer", Sequence: sequence, Timestamp: uint32(sequence) * FrameSamples, Payload: packet}); err != nil {
 			t.Fatal(err)
 		}
@@ -76,7 +143,16 @@ func TestMixerUsesPLCForMissingFrame(t *testing.T) {
 		t.Fatalf("initial decode: active=%v err=%v", active, err)
 	}
 	if _, active, err := mixerNext(mixer); err != nil || !active {
+		t.Fatalf("pre-gap decode: active=%v err=%v", active, err)
+	}
+	if err := mixer.Add(media.ReceivedFrame{SourceID: "peer", Sequence: 3, Timestamp: 4 * FrameSamples, Payload: packet}); err != nil {
+		t.Fatal(err)
+	}
+	if _, active, err := mixerNext(mixer); err != nil || !active {
 		t.Fatalf("PLC decode: active=%v err=%v", active, err)
+	}
+	if _, active, err := mixerNext(mixer); err != nil || !active {
+		t.Fatalf("post-gap decode: active=%v err=%v", active, err)
 	}
 }
 
@@ -160,26 +236,6 @@ func mixerNext(mixer *mixer) ([]float32, bool, error) {
 	return pcm, active, err
 }
 
-func TestMixerTreatsTimestampGapAsLossInsteadOfRestart(t *testing.T) {
-	packet := audiblePacket(t)
-	mixer := newMixer(testMaxEncodedFrameBytes)
-	for sequence := uint64(1); sequence <= 2; sequence++ {
-		if err := mixer.Add(media.ReceivedFrame{SourceID: "peer", Sequence: sequence, Timestamp: uint32(sequence) * FrameSamples, Payload: packet}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, active, err := mixerNext(mixer); err != nil || !active {
-		t.Fatalf("initial decode: active=%v err=%v", active, err)
-	}
-	if err := mixer.Add(media.ReceivedFrame{SourceID: "peer", Sequence: 3, Timestamp: 4 * FrameSamples, Payload: packet}); err != nil {
-		t.Fatal(err)
-	}
-	stream := mixer.streams["peer"]
-	if !stream.started || stream.expectedTimestamp != 2*FrameSamples {
-		t.Fatalf("timestamp gap restarted stream: %#v", stream)
-	}
-}
-
 func TestMixerHandlesTimestampWrap(t *testing.T) {
 	packet := audiblePacket(t)
 	mixer := newMixer(testMaxEncodedFrameBytes)
@@ -219,6 +275,10 @@ func TestMixerRejectsOlderSequencesAfterTimestampRestart(t *testing.T) {
 }
 
 func audiblePacket(t *testing.T) []byte {
+	return packetWithAmplitude(t, 0.2)
+}
+
+func packetWithAmplitude(t *testing.T, amplitude float64) []byte {
 	t.Helper()
 	encoder, err := newOpusEncoder(testMaxEncodedFrameBytes)
 	if err != nil {
@@ -226,7 +286,7 @@ func audiblePacket(t *testing.T) []byte {
 	}
 	pcm := make([]float32, FrameSamples)
 	for index := range pcm {
-		pcm[index] = float32(math.Sin(float64(index)*0.03)) * 0.2
+		pcm[index] = float32(math.Sin(float64(index)*0.03) * amplitude)
 	}
 	packet, err := encoder.Encode(pcm)
 	if err != nil {

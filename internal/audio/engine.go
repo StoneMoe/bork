@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +33,7 @@ type engineRun struct {
 	playback          *malgo.Device
 	workers           sync.WaitGroup
 	captureGeneration atomic.Uint64
+	active            atomic.Bool
 
 	monitorDone chan struct{}
 }
@@ -46,6 +49,7 @@ type Engine struct {
 
 	run           *engineRun
 	muted         atomic.Bool
+	targetBitrate atomic.Int64
 	statusChanges chan struct{}
 	closed        bool
 }
@@ -66,14 +70,30 @@ func New(options Options, logger *slog.Logger) (*Engine, error) {
 		logger:               logger,
 		context:              audioContext,
 		maxEncodedFrameBytes: options.MaxEncodedFrameBytes,
+		state:                Status{SpeakingPeerIDs: []string{}},
 		statusChanges:        make(chan struct{}, 1),
 	}
+	engine.targetBitrate.Store(defaultVoiceBitrate)
 	if err := engine.refreshDevicesLocked(); err != nil {
 		_ = audioContext.Uninit()
 		audioContext.Free()
 		return nil, err
 	}
 	return engine, nil
+}
+
+// RecommendedVoiceBitrate lowers per-speaker bitrate continuously as room
+// membership grows. It is a quality adaptation, not a membership limit.
+func RecommendedVoiceBitrate(members int) int {
+	if members <= 16 {
+		return defaultVoiceBitrate
+	}
+	bitrate := int(float64(defaultVoiceBitrate) * math.Sqrt(16/float64(members)))
+	return max(minimumVoiceBitrate, min(defaultVoiceBitrate, bitrate))
+}
+
+func (e *Engine) SetVoiceBitrate(bitrate int) {
+	e.targetBitrate.Store(int64(max(minimumVoiceBitrate, min(defaultVoiceBitrate, bitrate))))
 }
 
 func preferredBackends() []malgo.Backend {
@@ -97,22 +117,22 @@ func (e *Engine) Status() Status {
 	return cloneStatus(e.state)
 }
 
-func (e *Engine) RefreshDevices() (Status, error) {
+func (e *Engine) RefreshDevices() error {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
 	if e.closed {
-		return e.Status(), errors.New("audio engine is closed")
+		return errors.New("audio engine is closed")
 	}
 	e.mu.RLock()
 	running := e.state.Running
 	e.mu.RUnlock()
 	if running {
-		return e.Status(), errors.New("stop voice before refreshing audio devices")
+		return errors.New("stop voice before refreshing audio devices")
 	}
 	if err := e.refreshDevicesLocked(); err != nil {
-		return e.Status(), err
+		return err
 	}
-	return e.Status(), nil
+	return nil
 }
 
 func (e *Engine) refreshDevicesLocked() error {
@@ -168,34 +188,33 @@ func deviceExists(devices []Device, id string) bool {
 	return false
 }
 
-func (e *Engine) SetDevices(captureID, playbackID string) (Status, error) {
+func (e *Engine) SetDevices(captureID, playbackID string) error {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
 	if e.closed {
-		return e.Status(), errors.New("audio engine is closed")
+		return errors.New("audio engine is closed")
 	}
 	e.mu.Lock()
 	if e.state.Running {
 		e.mu.Unlock()
-		return e.Status(), errors.New("stop voice before changing audio devices")
+		return errors.New("stop voice before changing audio devices")
 	}
 	if !deviceExists(e.state.CaptureDevices, captureID) {
 		e.mu.Unlock()
-		return e.Status(), errors.New("capture device is unavailable")
+		return errors.New("capture device is unavailable")
 	}
 	if !deviceExists(e.state.PlaybackDevices, playbackID) {
 		e.mu.Unlock()
-		return e.Status(), errors.New("playback device is unavailable")
+		return errors.New("playback device is unavailable")
 	}
 	e.state.CaptureDeviceID = captureID
 	e.state.PlaybackDeviceID = playbackID
-	state := cloneStatus(e.state)
 	e.mu.Unlock()
 	e.publish()
-	return state, nil
+	return nil
 }
 
-func (e *Engine) SetMuted(muted bool) Status {
+func (e *Engine) SetMuted(muted bool) {
 	e.opMu.Lock()
 	if muted {
 		e.muted.Store(true)
@@ -208,32 +227,36 @@ func (e *Engine) SetMuted(muted bool) Status {
 		e.muted.Store(false)
 	}
 	e.mu.Lock()
+	changed := e.state.Muted != muted
 	e.state.Muted = muted
-	state := cloneStatus(e.state)
+	if muted && e.state.Speaking {
+		e.state.Speaking = false
+		changed = true
+	}
 	e.mu.Unlock()
-	e.publish()
+	if changed {
+		e.publish()
+	}
 	e.opMu.Unlock()
-	return state
 }
 
-func (e *Engine) Start(mediaPort media.AudioPort) (Status, error) {
+func (e *Engine) Start(mediaPort media.AudioPort) error {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
 	if e.closed {
-		return e.Status(), errors.New("audio engine is closed")
+		return errors.New("audio engine is closed")
 	}
 	if mediaPort == nil {
-		return e.Status(), errors.New("audio media port is required")
+		return errors.New("audio media port is required")
 	}
 	e.mu.RLock()
 	if e.state.Running {
-		state := cloneStatus(e.state)
 		e.mu.RUnlock()
-		return state, nil
+		return nil
 	}
 	if !e.state.Available {
 		e.mu.RUnlock()
-		return e.Status(), errors.New("capture and playback devices are required")
+		return errors.New("capture and playback devices are required")
 	}
 	captureID := e.state.CaptureDeviceID
 	playbackID := e.state.PlaybackDeviceID
@@ -293,16 +316,15 @@ func (e *Engine) Start(mediaPort media.AudioPort) (Status, error) {
 		return e.fail(fmt.Errorf("start capture device: %w", err))
 	}
 
-	e.run = run
-	go e.watchDeviceStop(ctx, run, deviceStopped)
-
 	e.mu.Lock()
+	e.run = run
+	run.active.Store(true)
 	e.state.Running = true
 	e.state.Error = ""
-	state := cloneStatus(e.state)
 	e.mu.Unlock()
+	go e.watchDeviceStop(ctx, run, deviceStopped)
 	e.publish()
-	return state, nil
+	return nil
 }
 
 func (e *Engine) initCaptureDevice(deviceID string, queue *pcmFrameQueue, ready, stopped chan<- struct{}, generation *atomic.Uint64) (*malgo.Device, error) {
@@ -400,6 +422,9 @@ func byteFloats(data []byte) []float32 {
 func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrameQueue, ready <-chan struct{}, encoder *opusEncoder) {
 	defer run.workers.Done()
 	var encoderGeneration uint64
+	var speakingGeneration uint64
+	var localSpeaking speakingHold
+	encoderBitrate := defaultVoiceBitrate
 	for {
 		select {
 		case <-ctx.Done():
@@ -416,8 +441,24 @@ func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrame
 					continue
 				}
 				if encoderGeneration != generation {
-					encoder.Reset()
+					encoder.codec.Reset()
 					encoderGeneration = generation
+				}
+				if speakingGeneration != generation {
+					localSpeaking.reset()
+					e.setLocalSpeaking(run, generation, false)
+					speakingGeneration = generation
+				}
+				if run.active.Load() && !e.muted.Load() && localSpeaking.update(speakingFrame(frame.Samples[:])) {
+					e.setLocalSpeaking(run, generation, localSpeaking.active())
+				}
+				targetBitrate := int(e.targetBitrate.Load())
+				if targetBitrate != encoderBitrate {
+					if err := encoder.codec.SetBitrate(targetBitrate); err != nil {
+						e.setRuntimeError(fmt.Errorf("configure Opus bitrate: %w", err))
+					} else {
+						encoderBitrate = targetBitrate
+					}
 				}
 				payload, err := encoder.Encode(frame.Samples[:])
 				timestamp := frame.Timestamp
@@ -426,11 +467,11 @@ func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrame
 					e.setRuntimeError(fmt.Errorf("encode Opus: %w", err))
 					continue
 				}
-				if len(payload) == 0 {
+				if len(payload) == 0 || encoder.codec.InDTX() {
 					continue
 				}
 				if generation != run.captureGeneration.Load() {
-					encoder.Reset()
+					encoder.codec.Reset()
 					encoderGeneration = 0
 					continue
 				}
@@ -494,6 +535,7 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 			target := demand.Load()
 			for nextIndex < target {
 				_, err := mixer.NextInto(discard)
+				e.setSpeakingPeerIDs(run, mixer.SpeakingPeerIDs())
 				if err != nil {
 					e.setRuntimeError(fmt.Errorf("decode Opus: %w", err))
 				}
@@ -505,6 +547,7 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 					break
 				}
 				_, err := mixer.NextInto(slot.Samples[:])
+				e.setSpeakingPeerIDs(run, mixer.SpeakingPeerIDs())
 				slot.Index = nextIndex
 				queue.CommitWrite()
 				nextIndex++
@@ -516,25 +559,26 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 	}
 }
 
-func (e *Engine) Stop() Status {
+func (e *Engine) Stop() {
 	e.opMu.Lock()
 	run := e.run
-	state := e.stopRunLocked(run)
+	e.stopRunLocked(run)
 	e.opMu.Unlock()
 	if run != nil {
 		<-run.monitorDone
 	}
-	return state
 }
 
-func (e *Engine) stopRunLocked(run *engineRun) Status {
+func (e *Engine) stopRunLocked(run *engineRun) {
 	if run == nil || e.run != run {
-		return e.Status()
+		return
 	}
 	e.run = nil
 	e.mu.Lock()
+	run.active.Store(false)
 	e.state.Running = false
-	state := cloneStatus(e.state)
+	e.state.Speaking = false
+	e.state.SpeakingPeerIDs = []string{}
 	e.mu.Unlock()
 	run.port.Reset()
 	run.cancel()
@@ -546,7 +590,6 @@ func (e *Engine) stopRunLocked(run *engineRun) Status {
 	}
 	run.workers.Wait()
 	e.publish()
-	return state
 }
 
 func (e *Engine) Close() error {
@@ -567,13 +610,14 @@ func (e *Engine) Close() error {
 	return err
 }
 
-func (e *Engine) fail(err error) (Status, error) {
+func (e *Engine) fail(err error) error {
 	e.mu.Lock()
 	e.state.Error = err.Error()
-	state := cloneStatus(e.state)
+	e.state.Speaking = false
+	e.state.SpeakingPeerIDs = []string{}
 	e.mu.Unlock()
 	e.publish()
-	return state, err
+	return err
 }
 
 func (e *Engine) setRuntimeError(err error) {
@@ -585,6 +629,28 @@ func (e *Engine) setRuntimeError(err error) {
 	e.state.Error = err.Error()
 	e.mu.Unlock()
 	e.logger.Warn("voice audio degraded", "error", err)
+	e.publish()
+}
+
+func (e *Engine) setLocalSpeaking(run *engineRun, generation uint64, speaking bool) {
+	e.mu.Lock()
+	if !run.active.Load() || e.muted.Load() || generation != run.captureGeneration.Load() || e.state.Speaking == speaking {
+		e.mu.Unlock()
+		return
+	}
+	e.state.Speaking = speaking
+	e.mu.Unlock()
+	e.publish()
+}
+
+func (e *Engine) setSpeakingPeerIDs(run *engineRun, peerIDs []string) {
+	e.mu.Lock()
+	if !run.active.Load() || slices.Equal(e.state.SpeakingPeerIDs, peerIDs) {
+		e.mu.Unlock()
+		return
+	}
+	e.state.SpeakingPeerIDs = append(e.state.SpeakingPeerIDs[:0], peerIDs...)
+	e.mu.Unlock()
 	e.publish()
 }
 
@@ -603,6 +669,7 @@ func notifyPlayback(wake chan<- struct{}) {
 }
 
 func cloneStatus(state Status) Status {
+	state.SpeakingPeerIDs = append([]string{}, state.SpeakingPeerIDs...)
 	state.CaptureDevices = append([]Device{}, state.CaptureDevices...)
 	state.PlaybackDevices = append([]Device{}, state.PlaybackDevices...)
 	return state

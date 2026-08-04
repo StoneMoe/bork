@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 
 	"bork/internal/media"
 
@@ -28,15 +29,21 @@ type jitterStream struct {
 	idle              int
 	losses            int
 	pcm               []float32
+	speaking          speakingHold
 }
 
 type mixer struct {
-	streams       map[string]*jitterStream
-	maxFrameBytes int
+	streams         map[string]*jitterStream
+	maxFrameBytes   int
+	speakingPeerIDs []string
 }
 
 func newMixer(maxFrameBytes int) *mixer {
-	return &mixer{streams: make(map[string]*jitterStream), maxFrameBytes: maxFrameBytes}
+	return &mixer{
+		streams:         make(map[string]*jitterStream),
+		maxFrameBytes:   maxFrameBytes,
+		speakingPeerIDs: []string{},
+	}
 }
 
 func (m *mixer) Add(frame media.ReceivedFrame) error {
@@ -140,6 +147,7 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 		if !stream.started {
 			start, ok := contiguousStart(stream.frames)
 			if !ok {
+				stream.speaking.update(false)
 				continue
 			}
 			stream.expectedTimestamp = start
@@ -157,6 +165,7 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 				stream.decoder.Reset()
 				stream.started = false
 				stream.losses = 0
+				stream.speaking.update(false)
 				continue
 			}
 		}
@@ -186,7 +195,9 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 			continue
 		}
 		stream.expectedTimestamp += FrameSamples
-		if !audible(stream.pcm) {
+		level := pcmRMS(stream.pcm)
+		stream.speaking.update(level > speakingThreshold)
+		if !(level > 0.0001) {
 			continue
 		}
 		active++
@@ -194,6 +205,7 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 			destination[index] += stream.pcm[index]
 		}
 	}
+	m.refreshSpeakingPeerIDs()
 	if active == 0 {
 		return false, mixErr
 	}
@@ -204,6 +216,20 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 		destination[index] = max(-1, min(1, sample))
 	}
 	return true, mixErr
+}
+
+func (m *mixer) SpeakingPeerIDs() []string {
+	return m.speakingPeerIDs
+}
+
+func (m *mixer) refreshSpeakingPeerIDs() {
+	m.speakingPeerIDs = m.speakingPeerIDs[:0]
+	for peerID, stream := range m.streams {
+		if stream.speaking.active() {
+			m.speakingPeerIDs = append(m.speakingPeerIDs, peerID)
+		}
+	}
+	slices.Sort(m.speakingPeerIDs)
 }
 
 func contiguousStart(frames map[uint32]jitterFrame) (uint32, bool) {
@@ -230,10 +256,36 @@ func contiguousStart(frames map[uint32]jitterFrame) (uint32, bool) {
 	return selected, found
 }
 
-func audible(pcm []float32) bool {
+func speakingFrame(pcm []float32) bool {
+	return pcmRMS(pcm) > speakingThreshold
+}
+
+func pcmRMS(pcm []float32) float64 {
 	var energy float64
 	for _, sample := range pcm {
 		energy += float64(sample * sample)
 	}
-	return math.Sqrt(energy/float64(len(pcm))) > 0.0001
+	return math.Sqrt(energy / float64(len(pcm)))
+}
+
+type speakingHold struct {
+	frames int
+}
+
+func (h *speakingHold) update(loud bool) bool {
+	wasActive := h.active()
+	if loud {
+		h.frames = speakingReleaseFrames
+	} else if h.frames > 0 {
+		h.frames--
+	}
+	return wasActive != h.active()
+}
+
+func (h *speakingHold) active() bool {
+	return h.frames > 0
+}
+
+func (h *speakingHold) reset() {
+	h.frames = 0
 }

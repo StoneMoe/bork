@@ -1,6 +1,5 @@
 import {
   For,
-  Index,
   Show,
   createMemo,
   createSignal,
@@ -11,8 +10,10 @@ import { ClipboardSetText } from "@wailsjs/runtime/runtime";
 import { createRemoteState } from "./sync";
 import type { AppState, Candidate, FriendlyStatus, RemotePeer } from "./types";
 
+const maxInviteLength = 512;
+
 function humanStatus(state: AppState): FriendlyStatus {
-	if (!state.peerId && state.error) return { badge: "启动失败", title: "", detail: "" };
+  if (!state.peerId && state.error) return { badge: "启动失败", title: "", detail: "" };
   if (!state.peerId) return { badge: "正在启动", title: "", detail: "" };
   if (!state.room) return { badge: "准备就绪", title: "", detail: "" };
   if (state.room.phase === "gathering") {
@@ -26,14 +27,6 @@ function humanStatus(state: AppState): FriendlyStatus {
   if (remotePeers.length > 0) {
     return {
       badge: state.audio.running ? (state.audio.muted ? "通话中 · 已静音" : "语音通话中") : `已连接 ${remotePeers.length}`,
-      title: `已连接 ${remotePeers.length} 位成员`,
-      detail: state.audio.running
-        ? "语音正在通过认证链路传输。"
-        : state.audio.error
-          ? "成员已连接，但音频设备暂时不可用。"
-          : !state.audio.available
-            ? "成员已连接，但没有可用的麦克风或扬声器。"
-          : "成员已连接，正在自动接通语音。",
     };
   }
   return {
@@ -49,7 +42,7 @@ export default function App() {
   const [error, setError] = createSignal("");
   const remote = createRemoteState(setError);
   const state = remote.state;
-  const operational = createMemo(() => remote.ready() && Boolean(state().peerId));
+  const operational = createMemo(() => Boolean(state().peerId));
   const inRoom = createMemo(() => Boolean(state().room));
   const friendly = createMemo(() => humanStatus(state()));
 
@@ -71,7 +64,7 @@ export default function App() {
   }
 
   return (
-    <main class="shell" classList={{ busy: busy() }}>
+    <main class="shell">
       <header class="topbar">
         <div class="wordmark">
           BORK<span>/</span>
@@ -108,14 +101,15 @@ export default function App() {
         </Show>
       </section>
 
-      <Settings
-        state={state()}
-        open={settingsOpen()}
-        busy={busy()}
-        ready={operational()}
-        close={() => setSettingsOpen(false)}
-        runAction={runAction}
-      />
+      <Show when={settingsOpen()}>
+        <Settings
+          state={state()}
+          busy={busy()}
+          ready={operational()}
+          close={() => setSettingsOpen(false)}
+          runAction={runAction}
+        />
+      </Show>
 
       <Show when={error()}>
         <div class="error" role="alert">
@@ -173,7 +167,7 @@ function Lobby(props: ActionProps) {
           <label for="inviteInput">加入房间</label>
           <textarea
             id="inviteInput"
-            maxlength={1024}
+            maxlength={maxInviteLength}
             spellcheck={false}
             autocomplete="off"
             placeholder="粘贴房间邀请"
@@ -241,11 +235,7 @@ function Room(props: RoomProps) {
             }
           >
             <section class="room-peers" aria-label="房间成员">
-              <header>
-                <div><span class="label">ROOM NETWORK</span><strong>房间拓扑</strong></div>
-                <b>{remotePeers().length + 1}</b>
-              </header>
-          <NetworkTopology state={props.state} remotePeers={remotePeers()} />
+              <RoomMemberList state={props.state} remotePeers={remotePeers()} />
               <Show when={props.state.audio.running}>
                 <div class="voice-controls">
                   <button
@@ -270,125 +260,86 @@ function Room(props: RoomProps) {
   );
 }
 
-interface TopologyPosition {
-  x: number;
-  y: number;
-}
-
-function topologyPositions(count: number): TopologyPosition[] {
-  if (count === 1) return [{ x: 50, y: 17 }];
-  return Array.from({ length: count }, (_, index) => {
-    const outerCount = Math.min(count, 8);
-    const innerCount = count - outerCount;
-    const inner = index >= outerCount;
-    const ringIndex = inner ? index - outerCount : index;
-    const ringCount = inner ? innerCount : outerCount;
-    const angle = -Math.PI / 2 + (ringIndex * Math.PI * 2) / ringCount;
-    return {
-      x: 50 + Math.cos(angle) * (inner ? 24 : 39),
-      y: 50 + Math.sin(angle) * (inner ? 24 : 36),
-    };
-  });
-}
-
-function NetworkTopology(props: { state: AppState; remotePeers: RemotePeer[] }) {
-  const positions = () => topologyPositions(props.remotePeers.length);
-  const audioDetail = () => props.state.audio.running
-    ? (props.state.audio.muted ? "运行中，麦克风已静音" : "运行中，正在发送语音")
-    : (props.state.audio.error || "尚未运行");
-
+function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer[] }) {
+  const localSpeaking = () => props.state.audio.speaking && !props.state.audio.muted;
+  const remoteSpeaking = (remotePeer: RemotePeer) => !remotePeer.muted && props.state.audio.speakingPeerIds.includes(remotePeer.peerId);
+  const remoteName = (remotePeer: RemotePeer) => remotePeer.nickname || remotePeer.peerId.slice(0, 14);
+  const localStatus = () => props.state.audio.muted ? "已静音" : localSpeaking() ? "正在说话" : "空闲";
+  const remoteStatus = (remotePeer: RemotePeer) => remotePeer.muted ? "已静音" : remoteSpeaking(remotePeer) ? "正在说话" : "空闲";
+  const remoteTransport = (remotePeer: RemotePeer) => remotePeer.transport === "bridge" ? "桥接" : "直连";
   return (
-    <div class="topology-graph" aria-label="当前已认证网络拓扑">
-      <svg class="topology-lines" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-        <Index each={props.remotePeers}>{(_, index) => {
-          const position = () => positions()[index];
-          return <line x1="50" y1="50" x2={position().x} y2={position().y} />;
-        }}</Index>
-      </svg>
-
-      <div class="topology-node client" tabindex={0} style={{ left: "50%", top: "50%" }}>
-        <span class="node-avatar">你</span>
-        <strong>本机</strong>
-        <small>{props.state.audio.running ? (props.state.audio.muted ? "已静音" : "语音中") : "在线"}</small>
-        <div class="topology-tooltip node-tooltip">
-          <b>本机 Peer</b>
-          <dl>
-            <dt>PeerID</dt><dd>{props.state.peerId || "正在载入"}</dd>
-            <dt>UDP endpoint</dt><dd>{props.state.room?.localAddress || "尚未打开"}</dd>
-            <dt>房间状态</dt><dd>{props.state.room?.phase || "未知"}</dd>
-            <dt>音频设备</dt><dd>{props.state.audio.available ? "可用" : "不可用"}</dd>
-            <dt>语音状态</dt><dd>{audioDetail()}</dd>
-          </dl>
+    <div class="member-list" aria-label="当前房间成员">
+      <div
+        class="member-row local-member"
+        classList={{ speaking: localSpeaking() }}
+        tabindex="0"
+        aria-label={`${props.state.nickname || "本机"}，本机，${localStatus()}`}
+      >
+        <strong class="member-name">{props.state.nickname || "本机"}</strong>
+        <span class="member-connection local">本机</span>
+        <span class="member-latency">—</span>
+        <span class="member-status">{localStatus()}</span>
+        <div class="member-details">
+          <span><small>PeerID</small><code>{props.state.peerId || "正在载入"}</code></span>
+          <span><small>本机端点</small><code>{props.state.diagnostics.listenAddress || "尚未打开"}</code></span>
+          <span><small>房间状态</small><b>{props.state.room?.phase || "未知"}</b></span>
         </div>
       </div>
-
-      <Index each={props.remotePeers}>{(remotePeer, index) => {
-        const position = () => positions()[index];
-        const midpoint = () => ({ x: (50 + position().x) / 2, y: (50 + position().y) / 2 });
-        return <>
-          <div
-            class="topology-edge-target"
-            classList={{ "near-left": midpoint().x < 30, "near-right": midpoint().x > 70, "near-top": midpoint().y < 30 }}
-            tabindex={0}
-            style={{ left: `${midpoint().x}%`, top: `${midpoint().y}%` }}
-            aria-label={`到 ${remotePeer().peerId.slice(0, 14)} 的认证链路`}
-          >
-            <span>{remotePeer().rttMillis || 1} ms</span>
-            <div class="topology-tooltip edge-tooltip">
-              <b>认证直连链路</b>
-              <dl>
-                <dt>传输</dt><dd>UDP / 逐链路 AEAD</dd>
-                <dt>远端地址</dt><dd>{remotePeer().address}</dd>
-                <dt>RTT</dt><dd>{remotePeer().rttMillis || 1} ms</dd>
-                <dt>SessionID</dt><dd>{remotePeer().sessionId || "未知"}</dd>
-                <dt>控制面</dt><dd>已认证 / 防重放</dd>
-                <dt>实时语音</dt><dd>{props.state.audio.running ? "启用 / 不重传" : "未发送"}</dd>
-              </dl>
-            </div>
+      <For each={props.remotePeers}>{(remotePeer) => (
+        <div
+          class="member-row"
+          classList={{ speaking: remoteSpeaking(remotePeer) }}
+          tabindex="0"
+          aria-label={`${remoteName(remotePeer)}，${remoteTransport(remotePeer)}，${remotePeer.rttMillis || 1} 毫秒，${remoteStatus(remotePeer)}`}
+        >
+          <strong class="member-name">{remoteName(remotePeer)}</strong>
+          <span class="member-connection" classList={{ bridge: remotePeer.transport === "bridge" }}>
+            {remoteTransport(remotePeer)}
+          </span>
+          <span class="member-latency">{remotePeer.rttMillis || 1} ms</span>
+          <span class="member-status">{remoteStatus(remotePeer)}</span>
+          <div class="member-details">
+            <span><small>PeerID</small><code>{remotePeer.peerId}</code></span>
+            <span><small>Session</small><code>{remotePeer.sessionId || "未知"}</code></span>
+            <span>
+              <small>{remotePeer.transport === "bridge" ? "下一跳" : "远端地址"}</small>
+              <code>{remotePeer.address}</code>
+            </span>
           </div>
-          <div
-            class="topology-node remote-peer"
-            classList={{ "near-left": position().x < 30, "near-right": position().x > 70, "near-top": position().y < 30 }}
-            tabindex={0}
-            style={{ left: `${position().x}%`, top: `${position().y}%` }}
-          >
-            <span class="node-avatar">{remotePeer().peerId.slice(0, 1).toUpperCase()}</span>
-            <strong>{remotePeer().peerId.slice(0, 10)}</strong>
-            <small>{remotePeer().rttMillis || 1} ms</small>
-            <div class="topology-tooltip node-tooltip">
-              <b>已认证成员</b>
-              <dl>
-                <dt>PeerID</dt><dd>{remotePeer().peerId}</dd>
-                <dt>认证状态</dt><dd>Ed25519 + RoomSeed</dd>
-                <dt>远端地址</dt><dd>{remotePeer().address}</dd>
-                <dt>RTT</dt><dd>{remotePeer().rttMillis || 1} ms</dd>
-                <dt>SessionID</dt><dd>{remotePeer().sessionId || "未知"}</dd>
-              </dl>
-            </div>
-          </div>
-        </>;
-      }}</Index>
+        </div>
+      )}</For>
     </div>
   );
 }
 
 interface SettingsProps extends ActionProps {
   state: AppState;
-  open: boolean;
   close: () => void;
 }
 
 function Settings(props: SettingsProps) {
   const audio = () => props.state.audio;
   const diagnostics = () => props.state.diagnostics;
-  const candidates = () => diagnostics().candidates;
-  const stun = () => diagnostics().stun;
-  const diagnosticError = () => diagnostics().networkError || diagnostics().discoveryError || "";
+  const candidates = () => diagnostics().candidates || [];
+  const stun = () => diagnostics().stun || [];
+  const trackers = () => diagnostics().tracker || [];
+  const connectivity = () => diagnostics().connectivity;
+  const knownAddresses = () => connectivity()?.knownAddresses || [];
+  const diagnosticErrors = () => [diagnostics().networkError, diagnostics().discoveryError, diagnostics().portMappingError]
+    .filter((message): message is string => Boolean(message));
+  const [nickname, setNickname] = createSignal(props.state.nickname);
+  const [now, setNow] = createSignal(Date.now());
+  const clock = window.setInterval(() => setNow(Date.now()), 1000);
+  onCleanup(() => window.clearInterval(clock));
+
+  async function saveNickname(event: SubmitEvent) {
+    event.preventDefault();
+    if (await props.runAction(() => Backend.SetNickname(nickname()))) setNickname(props.state.nickname);
+  }
 
   return (
-    <div class="settings-layer" classList={{ open: props.open }} aria-hidden={!props.open}>
+    <div class="settings-layer">
       <button class="settings-backdrop" type="button" aria-label="关闭设置" onClick={props.close} />
-      <Show when={props.open}>
       <aside class="settings-drawer" aria-label="设置">
         <header class="settings-header">
           <div><span>SETTINGS</span><strong>设置</strong></div>
@@ -439,6 +390,21 @@ function Settings(props: SettingsProps) {
         </section>
         <section class="settings-section">
           <h3>设备</h3>
+          <form class="nickname-form" onSubmit={saveNickname}>
+            <label for="nickname">房间昵称</label>
+            <div>
+              <input
+                id="nickname"
+                autocomplete="nickname"
+                placeholder="未设置"
+                value={nickname()}
+                disabled={props.busy || !props.ready}
+                onInput={(event) => setNickname(event.currentTarget.value)}
+              />
+              <button type="submit" disabled={props.busy || !props.ready}>保存</button>
+            </div>
+            <small>最多 64 个字符，加入房间后对其他成员可见。</small>
+          </form>
           <div class="setting-row stacked">
             <span>用户身份</span>
             <code>{props.state.peerId || "正在载入"}</code>
@@ -447,39 +413,86 @@ function Settings(props: SettingsProps) {
         <section class="settings-section">
           <h3>连接诊断</h3>
           <div class="setting-row stacked">
-            <span>共享 UDP 地址</span>
-            <code>{diagnostics().listenAddress || "尚未打开"}</code>
+            <span>本机端点</span>
+            <Show when={diagnostics().listenAddress}>
+              <code>{`${diagnostics().listenAddress}（UDP）`}</code>
+            </Show>
+            <Show when={!diagnostics().listenAddress}>
+              <small>{props.state.room ? "正在打开本机 UDP 端点。" : "加入房间后打开 UDP 端点。"}</small>
+            </Show>
           </div>
-          <div class="diagnostic-heading"><span>候选地址</span><b>{candidates().length}</b></div>
+          <div class="diagnostic-heading"><span>本机候选地址</span><b>{candidates().length}</b></div>
           <ol class="candidate-list">
             <For each={candidates()}>{(candidate) => <CandidateRow candidate={candidate} />}</For>
           </ol>
           <Show when={candidates().length === 0}>
-            <div class="empty-diagnostic">加入房间后开始收集。</div>
+            <div class="empty-diagnostic">{props.state.room ? "尚未发现可用的本机候选地址。" : "加入房间后开始收集本机候选地址。"}</div>
           </Show>
           <div class="diagnostic-heading"><span>STUN 探测</span></div>
           <ol class="stun-list">
             <For each={stun()}>{(result) => (
-              <li classList={{ ok: Boolean(result.mappedAddress), failed: !result.mappedAddress }} title={result.error || ""}>
+              <li classList={{ failed: !result.mappedAddress }} title={result.error || ""}>
                 <span>{result.server}</span>
                 <b>{result.mappedAddress ? `${result.rttMillis || 1} ms` : "失败"}</b>
               </li>
             )}</For>
           </ol>
-          <Show when={diagnosticError()}>
-            <p class="diagnostic-error">{diagnosticError()}</p>
+          <Show when={stun().length === 0}>
+            <div class="empty-diagnostic">{props.state.room ? "尚未获得 STUN 探测结果。" : "加入房间后开始 STUN 探测。"}</div>
           </Show>
+          <div class="diagnostic-heading"><span>Tracker 公告</span></div>
+          <ol class="stun-list">
+            <For each={trackers()}>{(tracker) => (
+              <li classList={{ failed: Boolean(tracker.error) }} title={tracker.error || `返回 ${tracker.peerCount} 个地址`}>
+                <span><strong>{tracker.provider}</strong><small>请求 {tracker.candidate}</small></span>
+                <span class="tracker-result">
+                  <b>{tracker.error ? "失败" : tracker.observedAddress || "未返回"}</b>
+                  <small>{tracker.nextAnnounce ? formatRelativeTime(tracker.nextAnnounce, now()) : "等待 announce"}</small>
+                </span>
+              </li>
+            )}</For>
+          </ol>
+          <Show when={trackers().length === 0}>
+            <div class="empty-diagnostic">{props.state.room ? "尚未产生 Tracker announce 记录。" : "加入房间后开始 Tracker announce。"}</div>
+          </Show>
+          <div class="diagnostic-heading"><span>已知地址</span><b>{knownAddresses().length}</b></div>
+          <ol class="candidate-list known-address-list">
+            <For each={knownAddresses()}>{(address) => (
+              <li>
+                <b>{address.source}</b>
+                <div>
+                  <code>{address.address}</code>
+                  <small>{address.expiresAt}</small>
+                </div>
+              </li>
+            )}</For>
+          </ol>
+          <Show when={knownAddresses().length === 0}>
+            <div class="empty-diagnostic">{props.state.room ? "尚未发现其他成员地址。" : "加入房间后开始发现其他成员。"}</div>
+          </Show>
+          <For each={diagnosticErrors()}>{(message) => <p class="diagnostic-error">{message}</p>}</For>
         </section>
       </aside>
-      </Show>
     </div>
   );
 }
 
+function formatRelativeTime(value: string, now: number): string {
+  const target = Date.parse(value);
+  if (!Number.isFinite(target)) return "等待 announce";
+  const seconds = Math.max(0, Math.ceil((target - now) / 1000));
+  return `${seconds} 秒后`;
+}
+
 function CandidateRow(props: { candidate: Candidate }) {
+  const typeLabel = () => {
+    if (props.candidate.type === "port-mapped") return "端口映射";
+    if (props.candidate.type === "server-reflexive") return "STUN 公网";
+    return "本机";
+  };
   return (
     <li>
-      <b>{props.candidate.type === "server-reflexive" ? "公网" : "本机"}</b>
+      <b>{typeLabel()}</b>
       <div>
         <code>{props.candidate.address}</code>
         <small>{props.candidate.interface || props.candidate.source || props.candidate.family || ""}</small>

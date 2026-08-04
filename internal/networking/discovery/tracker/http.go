@@ -1,0 +1,284 @@
+package tracker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+
+	"bork/internal/networking/discovery"
+)
+
+const (
+	maxHTTPRequestURLLength     = 4096
+	maxConfiguredQueryKeys      = 32
+	maxConfiguredQueryValues    = 64
+	maxConfiguredQueryKeySize   = 128
+	maxConfiguredQueryValueSize = 1024
+	maxHTTPRedirects            = 3
+	maxHTTPResponseHeaders      = int64(64 << 10)
+)
+
+var trackerHTTPTransport = func() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxResponseHeaderBytes = maxHTTPResponseHeaders
+	transport.ResponseHeaderTimeout = defaultAnnouncerTiming.httpRequestTimeout
+	return transport
+}()
+
+var generatedHTTPQueryKeys = map[string]struct{}{
+	"info_hash":  {},
+	"peer_id":    {},
+	"port":       {},
+	"uploaded":   {},
+	"downloaded": {},
+	"left":       {},
+	"compact":    {},
+	"numwant":    {},
+	"event":      {},
+	"ip":         {},
+}
+
+func newHTTPClient() *http.Client {
+	return &http.Client{
+		Transport:     trackerHTTPTransport,
+		Timeout:       defaultAnnouncerTiming.httpRequestTimeout,
+		CheckRedirect: trackerRedirectPolicy,
+	}
+}
+
+func (a *Announcer) runHTTPTracker(ctx context.Context, configured provider, hints chan<- discovery.Hint, timing announcerTiming) (bool, error) {
+	candidate := a.candidate
+	registration := a.registration(configured, candidate)
+	started := false
+	announces := 0
+	announced := false
+	var active *trackerRegistration
+	defer func() {
+		if active != nil {
+			a.stopHTTPRegistration(configured, *active, timing)
+		}
+	}()
+	for {
+		if !started {
+			active = &registration
+		}
+		response, err := a.httpAnnounce(ctx, configured, registration, !started, timing)
+		if err != nil {
+			return announced, fmt.Errorf("announce to %s: %w", configured.display, err)
+		}
+		started = true
+		active = &registration
+		interval := effectiveAnnounceInterval(response.interval, timing, announces)
+		announces++
+		a.recordSuccess(configured, candidate, response, interval)
+		announced = true
+		if err := publishAndWait(ctx, hints, response, interval, timing); err != nil {
+			return announced, err
+		}
+	}
+}
+
+func (a *Announcer) httpAnnounce(
+	ctx context.Context,
+	configured provider,
+	registration trackerRegistration,
+	started bool,
+	timing announcerTiming,
+) (announceResponse, error) {
+	event := eventNone
+	if started {
+		event = eventStarted
+	}
+	return a.httpAnnounceEvent(ctx, configured, registration, event, timing)
+}
+
+func (a *Announcer) httpAnnounceEvent(
+	ctx context.Context,
+	configured provider,
+	registration trackerRegistration,
+	event uint32,
+	timing announcerTiming,
+) (announceResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return announceResponse{}, err
+	}
+	requestURL, err := a.buildHTTPAnnounceURL(configured, registration, event)
+	if err != nil {
+		return announceResponse{}, err
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, timing.httpRequestTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return announceResponse{}, fmt.Errorf("build HTTP tracker request: %w", err)
+	}
+	request.Header.Set("Accept", "text/plain, application/octet-stream")
+	request.Header.Set("Cache-Control", "no-cache")
+
+	response, err := a.httpClient.Do(request)
+	if err != nil {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		if ctx.Err() != nil {
+			return announceResponse{}, ctx.Err()
+		}
+		return announceResponse{}, fmt.Errorf("HTTP tracker request: %w", httpErrorWithoutURL(err))
+	}
+	if response == nil || response.Body == nil {
+		return announceResponse{}, errors.New("HTTP tracker returned no response body")
+	}
+	defer response.Body.Close()
+	if ctx.Err() != nil {
+		return announceResponse{}, ctx.Err()
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return announceResponse{}, fmt.Errorf("HTTP tracker returned status %d", response.StatusCode)
+	}
+	if response.ContentLength > maxHTTPTrackerResponseSize {
+		return announceResponse{}, fmt.Errorf("HTTP tracker response exceeds %d bytes", maxHTTPTrackerResponseSize)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxHTTPTrackerResponseSize+1))
+	if err != nil {
+		if ctx.Err() != nil {
+			return announceResponse{}, ctx.Err()
+		}
+		return announceResponse{}, fmt.Errorf("read HTTP tracker response: %w", err)
+	}
+	if len(body) > maxHTTPTrackerResponseSize {
+		return announceResponse{}, fmt.Errorf("HTTP tracker response exceeds %d bytes", maxHTTPTrackerResponseSize)
+	}
+	if ctx.Err() != nil {
+		return announceResponse{}, ctx.Err()
+	}
+	return parseHTTPAnnounceResponse(body)
+}
+
+func (a *Announcer) buildHTTPAnnounceURL(configured provider, registration trackerRegistration, event uint32) (string, error) {
+	endpoint := configured.announceURL
+	query, err := url.ParseQuery(endpoint.RawQuery)
+	if err != nil {
+		return "", errors.New("configured HTTP tracker query is invalid")
+	}
+	query.Set("info_hash", string(a.infoHash[:]))
+	query.Set("peer_id", string(registration.peerID[:]))
+	query.Set("port", strconv.FormatUint(uint64(registration.candidate.Port), 10))
+	if registration.candidate.Address.IsValid() {
+		query.Set("ip", registration.candidate.Address.String())
+	} else {
+		query.Del("ip")
+	}
+	query.Set("uploaded", "0")
+	query.Set("downloaded", "0")
+	query.Set("left", "0")
+	query.Set("compact", "1")
+	query.Set("numwant", strconv.Itoa(maxAnnouncePeers))
+	switch event {
+	case eventStarted:
+		query.Set("event", "started")
+	case eventStopped:
+		query.Set("event", "stopped")
+	default:
+		query.Del("event")
+	}
+	endpoint.RawQuery = query.Encode()
+	encoded := endpoint.String()
+	if len(encoded) > maxHTTPRequestURLLength {
+		return "", fmt.Errorf("HTTP tracker request URL exceeds %d bytes", maxHTTPRequestURLLength)
+	}
+	return encoded, nil
+}
+
+func (a *Announcer) stopHTTPRegistration(configured provider, registration trackerRegistration, timing announcerTiming) {
+	timeout := min(timing.httpRequestTimeout, trackerStopTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if _, err := a.httpAnnounceEvent(ctx, configured, registration, eventStopped, timing); err != nil {
+		a.logger.Debug("stop HTTP tracker registration", "provider", configured.display, "candidate", registration.candidate.String(), "error", err)
+	}
+}
+
+func validateHTTPProviderQuery(rawQuery string) error {
+	if rawQuery == "" {
+		return nil
+	}
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return errors.New("HTTP tracker URL query is invalid")
+	}
+	if len(query) > maxConfiguredQueryKeys {
+		return errors.New("HTTP tracker URL query has too many keys")
+	}
+	values := 0
+	for key, entries := range query {
+		if key == "" || len(key) > maxConfiguredQueryKeySize {
+			return errors.New("HTTP tracker URL query key is invalid")
+		}
+		if _, generated := generatedHTTPQueryKeys[key]; generated {
+			return fmt.Errorf("HTTP tracker URL query duplicates protocol key %q", key)
+		}
+		values += len(entries)
+		if values > maxConfiguredQueryValues {
+			return errors.New("HTTP tracker URL query has too many values")
+		}
+		for _, entry := range entries {
+			if len(entry) > maxConfiguredQueryValueSize {
+				return errors.New("HTTP tracker URL query value is too long")
+			}
+		}
+	}
+	return nil
+}
+
+func trackerRedirectPolicy(request *http.Request, via []*http.Request) error {
+	if len(via) == 0 || len(via) > maxHTTPRedirects {
+		return errors.New("HTTP tracker redirect limit exceeded")
+	}
+	original := via[0].URL
+	if request.URL.Scheme != "http" && request.URL.Scheme != "https" {
+		return errors.New("HTTP tracker redirected to an unsupported scheme")
+	}
+	if original.Scheme == "https" && request.URL.Scheme != "https" {
+		return errors.New("HTTPS tracker attempted an insecure redirect")
+	}
+	if !strings.EqualFold(original.Hostname(), request.URL.Hostname()) {
+		return errors.New("HTTP tracker attempted a cross-host redirect")
+	}
+	if request.URL.User != nil || request.URL.Fragment != "" {
+		return errors.New("HTTP tracker redirect contains credentials or a fragment")
+	}
+
+	originalQuery, err := url.ParseQuery(original.RawQuery)
+	if err != nil {
+		return errors.New("original HTTP tracker query is invalid")
+	}
+	redirectQuery, err := url.ParseQuery(request.URL.RawQuery)
+	if err != nil {
+		return errors.New("redirected HTTP tracker query is invalid")
+	}
+	for key, values := range originalQuery {
+		if redirected, exists := redirectQuery[key]; exists && !slices.Equal(redirected, values) {
+			return fmt.Errorf("HTTP tracker redirect changed query key %q", key)
+		}
+		redirectQuery[key] = append([]string(nil), values...)
+	}
+	request.URL.RawQuery = redirectQuery.Encode()
+	if len(request.URL.String()) > maxHTTPRequestURLLength {
+		return errors.New("redirected HTTP tracker URL is too long")
+	}
+	return nil
+}
+
+func httpErrorWithoutURL(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err
+	}
+	return err
+}

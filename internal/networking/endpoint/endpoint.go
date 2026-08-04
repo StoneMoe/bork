@@ -2,6 +2,7 @@ package endpoint
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,31 +13,45 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"bork/internal/protocol"
 )
 
 const (
-	maxDatagramSize      = 2048
-	udpReceiveBufferSize = 64 * 1024
-	maxSTUNServerResults = 8
-	maxSTUNAddresses     = 4
-	maxPendingSTUN       = maxSTUNServerResults * maxSTUNAddresses
-	maxPeerDatagrams     = 32
-	maxVoiceBatches      = 1
-	maxVoiceFanout       = 16
-	maxVoiceWriteTime    = 20 * time.Millisecond
-	controlWriteTimeout  = time.Second
-	controlSourceRate    = 64.0
-	controlSourceBurst   = 64.0
-	controlGlobalRate    = 512.0
-	controlGlobalBurst   = 256.0
-	maxControlSources    = 256
-	voiceSourceRate      = 120.0
-	voiceSourceBurst     = 24.0
-	voiceIPRate          = 800.0
-	voiceIPBurst         = 160.0
-	voiceGlobalRate      = 2000.0
-	voiceGlobalBurst     = 320.0
-	maxVoiceSources      = 256
+	maxDatagramSize = 2048
+	// MaxRealtimeBatchDatagrams is an internal memory and amplification safety
+	// budget, not a room participant limit.
+	MaxRealtimeBatchDatagrams = 256
+	maxRealtimeBatchBytes     = MaxRealtimeBatchDatagrams * protocol.MaxDatagramSize
+	udpReceiveBufferSize      = 64 * 1024
+	maxSTUNServerResults      = 8
+	maxSTUNAddresses          = 4
+	maxPendingSTUN            = maxSTUNServerResults * maxSTUNAddresses
+	maxPendingTracker         = 32
+	maxTrackerDatagram        = 2048
+	maxPeerDatagrams          = 256
+	maxAudioBatches           = 64
+	maxInteractiveBatches     = 32
+	maxAudioWriteTime         = 20 * time.Millisecond
+	maxInteractiveWriteTime   = 50 * time.Millisecond
+	controlWriteTimeout       = time.Second
+	controlSourceRate         = 64.0
+	controlSourceBurst        = 64.0
+	controlGlobalRate         = 512.0
+	controlGlobalBurst        = 256.0
+	maxControlSources         = 256
+	audioSourceRate           = 120.0
+	audioSourceBurst          = 24.0
+	audioIPRate               = 800.0
+	audioIPBurst              = 160.0
+	audioGlobalRate           = 10000.0
+	audioGlobalBurst          = 1000.0
+	maxAudioSources           = 256
+	interactiveSourceRate     = 1000.0
+	interactiveSourceBurst    = 200.0
+	interactiveGlobalRate     = 5000.0
+	interactiveGlobalBurst    = 1000.0
+	maxInteractiveSources     = 256
 )
 
 type Datagram struct {
@@ -45,41 +60,49 @@ type Datagram struct {
 	ReceivedAt time.Time
 }
 
-type PacketClass byte
+type packetClass byte
 
 const (
-	PacketDrop PacketClass = iota
-	PacketControl
-	PacketVoice
+	packetDrop packetClass = iota
+	packetControl
+	packetAudio
+	packetInteractive
 )
 
-type PacketClassifier func([]byte) PacketClass
-
-type VoiceDatagram struct {
+type RealtimeDatagram struct {
 	Data        []byte
 	Destination netip.AddrPort
 }
 
-type VoiceBatch struct {
-	Datagrams  []VoiceDatagram
+type RealtimeBatch struct {
+	Class      protocol.TrafficClass
+	Datagrams  []RealtimeDatagram
 	Deadline   time.Time
 	Generation uint64
 }
 
-type stunResponse struct {
-	message []byte
-	from    netip.AddrPort
+type queuedWrite struct {
+	data        []byte
+	destination netip.AddrPort
+	deadline    time.Time
+	result      chan error
 }
 
 type pendingSTUN struct {
 	server netip.AddrPort
-	result chan stunResponse
+	result chan []byte
 }
 
 type stunProbeResult struct {
 	mapped    netip.AddrPort
 	rttMillis int64
 	err       error
+}
+
+type pendingTracker struct {
+	server         netip.AddrPort
+	expectedAction uint32
+	result         chan []byte
 }
 
 type tokenBucket struct {
@@ -104,47 +127,71 @@ type ingressLimiter struct {
 
 type Endpoint struct {
 	options Options
+	roomTag [16]byte
 	logger  *slog.Logger
 
 	mu       sync.RWMutex
 	conn     *net.UDPConn
 	snapshot Snapshot
 	pending  map[stunTransaction]pendingSTUN
+	trackers map[uint32]pendingTracker
 	started  bool
 	closed   bool
 
-	classifier      PacketClassifier
-	snapshotChanges chan struct{}
-	controlPackets  chan Datagram
-	voicePackets    chan Datagram
-	voiceBatches    chan VoiceBatch
-	writeGate       chan struct{}
-	voiceMu         sync.Mutex
-	voiceGeneration uint64
+	snapshotChanges    chan struct{}
+	controlPackets     chan Datagram
+	audioPackets       chan Datagram
+	interactivePackets chan Datagram
+	audioBatches       chan RealtimeBatch
+	interactiveBatches chan RealtimeBatch
+	controlWrites      chan queuedWrite
+	backgroundWrites   chan queuedWrite
+	realtimeMu         sync.Mutex
+	realtimeGeneration uint64
 }
 
-func New(options Options, logger *slog.Logger) *Endpoint {
-	return NewClassified(options, logger, nil)
-}
-
-func NewClassified(options Options, logger *slog.Logger, classifier PacketClassifier) *Endpoint {
+func New(options Options, roomTag [16]byte, logger *slog.Logger) *Endpoint {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	if classifier == nil {
-		classifier = func([]byte) PacketClass { return PacketControl }
-	}
 	return &Endpoint{
-		options:         normalizeOptions(options),
-		logger:          logger,
-		pending:         make(map[stunTransaction]pendingSTUN),
-		classifier:      classifier,
-		snapshotChanges: make(chan struct{}, 1),
-		controlPackets:  make(chan Datagram, maxPeerDatagrams),
-		voicePackets:    make(chan Datagram, maxPeerDatagrams),
-		voiceBatches:    make(chan VoiceBatch, maxVoiceBatches),
-		writeGate:       make(chan struct{}, 1),
+		options:            normalizeOptions(options),
+		roomTag:            roomTag,
+		logger:             logger,
+		pending:            make(map[stunTransaction]pendingSTUN),
+		trackers:           make(map[uint32]pendingTracker),
+		snapshotChanges:    make(chan struct{}, 1),
+		controlPackets:     make(chan Datagram, maxPeerDatagrams),
+		audioPackets:       make(chan Datagram, maxPeerDatagrams),
+		interactivePackets: make(chan Datagram, maxPeerDatagrams),
+		audioBatches:       make(chan RealtimeBatch, maxAudioBatches),
+		interactiveBatches: make(chan RealtimeBatch, maxInteractiveBatches),
+		controlWrites:      make(chan queuedWrite, 256),
+		backgroundWrites:   make(chan queuedWrite, 32),
 	}
+}
+
+func (e *Endpoint) classifyRoomPacket(packet []byte) packetClass {
+	packetType, roomTag, err := protocol.ParsePrefix(packet)
+	if err != nil || roomTag != e.roomTag || !protocol.ValidPacketSize(packetType, len(packet)) {
+		return packetDrop
+	}
+	switch packetType {
+	case protocol.PacketGroupDatagram:
+		header, err := protocol.ParseGroupDatagramHeader(packet, e.roomTag)
+		if err != nil {
+			return packetDrop
+		}
+		switch header.Class {
+		case protocol.TrafficAudio:
+			return packetAudio
+		case protocol.TrafficInteractive, protocol.TrafficCustomRealtime:
+			return packetInteractive
+		}
+	case protocol.PacketHello, protocol.PacketPing, protocol.PacketPong, protocol.PacketReliable, protocol.PacketBridgeControl:
+		return packetControl
+	}
+	return packetDrop
 }
 
 func (e *Endpoint) SnapshotChanges() <-chan struct{} {
@@ -154,13 +201,16 @@ func (e *Endpoint) SnapshotChanges() <-chan struct{} {
 func (e *Endpoint) Snapshot() Snapshot {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return cloneSnapshot(e.snapshot)
+	return e.snapshot.Clone()
 }
 
-func (e *Endpoint) ControlPackets() <-chan Datagram { return e.controlPackets }
-func (e *Endpoint) VoicePackets() <-chan Datagram   { return e.voicePackets }
+func (e *Endpoint) ControlPackets() <-chan Datagram     { return e.controlPackets }
+func (e *Endpoint) AudioPackets() <-chan Datagram       { return e.audioPackets }
+func (e *Endpoint) InteractivePackets() <-chan Datagram { return e.interactivePackets }
 
-func (e *Endpoint) Send(data []byte, destination netip.AddrPort) error {
+// EnqueueControl validates and admits a control datagram. It does not wait for
+// the kernel write because peer control paths must not inherit socket latency.
+func (e *Endpoint) EnqueueControl(data []byte, destination netip.AddrPort) error {
 	if len(data) == 0 || len(data) > maxDatagramSize {
 		return fmt.Errorf("peer datagram must contain 1 to %d bytes", maxDatagramSize)
 	}
@@ -168,67 +218,147 @@ func (e *Endpoint) Send(data []byte, destination netip.AddrPort) error {
 		return errors.New("peer datagram destination is invalid")
 	}
 	e.mu.RLock()
-	conn := e.conn
-	closed := e.closed
-	e.mu.RUnlock()
-	if conn == nil || closed {
+	defer e.mu.RUnlock()
+	if e.conn == nil || e.closed {
 		return errors.New("UDP endpoint is not running")
 	}
-	return e.writeWithTimeout(conn, data, destination, controlWriteTimeout)
+	request := queuedWrite{
+		data: append([]byte(nil), data...), destination: destination,
+		deadline: time.Now().Add(controlWriteTimeout),
+	}
+	select {
+	case e.controlWrites <- request:
+		return nil
+	default:
+		return errors.New("UDP control queue is full")
+	}
 }
 
-func (e *Endpoint) SendVoiceBatch(batch VoiceBatch) error {
-	if len(batch.Datagrams) == 0 {
-		return errors.New("voice batch is empty")
+// ExchangeTracker exchanges one BEP 15 request on the room's shared UDP
+// socket. Only the exact tracker source, transaction, and response action can
+// satisfy the exchange.
+func (e *Endpoint) ExchangeTracker(
+	ctx context.Context,
+	server netip.AddrPort,
+	request []byte,
+	expectedAction uint32,
+	transaction uint32,
+) ([]byte, error) {
+	if ctx == nil {
+		return nil, errors.New("tracker context is required")
 	}
-	if len(batch.Datagrams) > maxVoiceFanout {
-		return fmt.Errorf("voice batch exceeds %d destinations", maxVoiceFanout)
+	if _, ok := ctx.Deadline(); !ok {
+		return nil, errors.New("tracker exchange requires a deadline")
+	}
+	server = netip.AddrPortFrom(server.Addr().Unmap(), server.Port())
+	if !server.IsValid() || server.Port() == 0 || server.Addr().IsUnspecified() || server.Addr().IsMulticast() {
+		return nil, errors.New("tracker server is invalid")
+	}
+	if len(request) < 16 || len(request) > maxTrackerDatagram {
+		return nil, fmt.Errorf("tracker request must contain 16 to %d bytes", maxTrackerDatagram)
+	}
+	if transaction == 0 || binary.BigEndian.Uint32(request[8:12]) != expectedAction || binary.BigEndian.Uint32(request[12:16]) != transaction {
+		return nil, errors.New("tracker request action or transaction is invalid")
+	}
+
+	response := make(chan []byte, 1)
+	e.mu.Lock()
+	if e.closed || e.conn == nil {
+		e.mu.Unlock()
+		return nil, errors.New("UDP endpoint is closed")
+	}
+	if len(e.trackers) >= maxPendingTracker {
+		e.mu.Unlock()
+		return nil, errors.New("too many pending tracker transactions")
+	}
+	if _, exists := e.trackers[transaction]; exists {
+		e.mu.Unlock()
+		return nil, errors.New("duplicate tracker transaction")
+	}
+	e.trackers[transaction] = pendingTracker{server: server, expectedAction: expectedAction, result: response}
+	e.mu.Unlock()
+	defer e.removePendingTracker(transaction)
+
+	if err := e.queueWrite(ctx, e.backgroundWrites, request, server); err != nil {
+		return nil, fmt.Errorf("send tracker request: %w", err)
+	}
+	select {
+	case received, open := <-response:
+		if !open {
+			return nil, errors.New("UDP endpoint closed during tracker exchange")
+		}
+		return received, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (e *Endpoint) SendRealtimeBatch(batch RealtimeBatch) error {
+	if len(batch.Datagrams) == 0 {
+		return errors.New("realtime batch is empty")
+	}
+	if len(batch.Datagrams) > MaxRealtimeBatchDatagrams {
+		return fmt.Errorf("realtime batch contains more than %d datagrams", MaxRealtimeBatchDatagrams)
 	}
 	if !batch.Deadline.IsZero() && time.Now().After(batch.Deadline) {
-		return errors.New("voice batch deadline has expired")
+		return errors.New("realtime batch deadline has expired")
 	}
+	var batches chan RealtimeBatch
+	switch batch.Class {
+	case protocol.TrafficAudio:
+		batches = e.audioBatches
+	case protocol.TrafficInteractive, protocol.TrafficCustomRealtime:
+		batches = e.interactiveBatches
+	default:
+		return errors.New("realtime batch traffic class is invalid")
+	}
+	totalBytes := 0
 	for _, packet := range batch.Datagrams {
 		if len(packet.Data) == 0 || len(packet.Data) > maxDatagramSize {
 			return fmt.Errorf("peer datagram must contain 1 to %d bytes", maxDatagramSize)
 		}
+		if len(packet.Data) > maxRealtimeBatchBytes-totalBytes {
+			return fmt.Errorf("realtime batch contains more than %d bytes", maxRealtimeBatchBytes)
+		}
+		totalBytes += len(packet.Data)
 		if !packet.Destination.IsValid() || packet.Destination.Port() == 0 {
 			return errors.New("peer datagram destination is invalid")
 		}
 	}
 	e.mu.RLock()
-	running := e.conn != nil && !e.closed
-	e.mu.RUnlock()
-	if !running {
+	defer e.mu.RUnlock()
+	if e.conn == nil || e.closed {
 		return errors.New("UDP endpoint is not running")
 	}
-	e.voiceMu.Lock()
-	defer e.voiceMu.Unlock()
-	if batch.Generation != e.voiceGeneration {
-		return errors.New("voice batch generation is stale")
+	e.realtimeMu.Lock()
+	defer e.realtimeMu.Unlock()
+	if batch.Generation != 0 && batch.Generation != e.realtimeGeneration {
+		return errors.New("realtime batch generation is stale")
 	}
-	select {
-	case e.voiceBatches <- batch:
-	default:
-		select {
-		case <-e.voiceBatches:
-		default:
-		}
-		select {
-		case e.voiceBatches <- batch:
-		default:
-		}
-	}
+	enqueueFresh(batches, batch)
 	return nil
 }
 
-func (e *Endpoint) InvalidateVoice(generation uint64) {
-	e.voiceMu.Lock()
-	e.voiceGeneration = generation
+func (e *Endpoint) InvalidateRealtime(generation uint64) {
+	e.realtimeMu.Lock()
+	e.realtimeGeneration = generation
+	retainRealtimeGeneration(e.audioBatches, generation)
+	retainRealtimeGeneration(e.interactiveBatches, generation)
+	e.realtimeMu.Unlock()
+}
+
+func retainRealtimeGeneration(batches chan RealtimeBatch, generation uint64) {
+	retained := make([]RealtimeBatch, 0, len(batches))
 	for {
 		select {
-		case <-e.voiceBatches:
+		case batch := <-batches:
+			if batch.Generation == 0 || batch.Generation == generation {
+				retained = append(retained, batch)
+			}
 		default:
-			e.voiceMu.Unlock()
+			for _, batch := range retained {
+				batches <- batch
+			}
 			return
 		}
 	}
@@ -273,7 +403,7 @@ func (e *Endpoint) Run(ctx context.Context) error {
 		workerDone <- e.readLoop(conn)
 	}()
 	go func() {
-		workerDone <- e.writeVoiceLoop(ctx, conn)
+		workerDone <- e.writeLoop(ctx, conn)
 	}()
 	discoveryDone := make(chan struct{})
 	go func() {
@@ -291,6 +421,7 @@ func (e *Endpoint) Run(ctx context.Context) error {
 			runErr = fmt.Errorf("run UDP endpoint worker: %w", runErr)
 		}
 	}
+	e.stopAcceptingWrites(conn)
 	cancel()
 	_ = conn.Close()
 	for workersFinished < 2 {
@@ -301,16 +432,19 @@ func (e *Endpoint) Run(ctx context.Context) error {
 	}
 	<-discoveryDone
 	e.mu.Lock()
-	e.closed = true
-	e.conn = nil
 	for transaction, pending := range e.pending {
 		delete(e.pending, transaction)
+		close(pending.result)
+	}
+	for transaction, pending := range e.trackers {
+		delete(e.trackers, transaction)
 		close(pending.result)
 	}
 	e.mu.Unlock()
 	close(e.snapshotChanges)
 	close(e.controlPackets)
-	close(e.voicePackets)
+	close(e.audioPackets)
+	close(e.interactivePackets)
 	return runErr
 }
 
@@ -336,8 +470,9 @@ func unsupportedAddressFamily(err error) bool {
 func (e *Endpoint) readLoop(conn *net.UDPConn) error {
 	buffer := make([]byte, udpReceiveBufferSize)
 	controlLimiter := newIngressLimiter(controlSourceRate, controlSourceBurst, controlGlobalRate, controlGlobalBurst, maxControlSources)
-	voiceLimiter := newIngressLimiter(voiceSourceRate, voiceSourceBurst, voiceGlobalRate, voiceGlobalBurst, maxVoiceSources)
-	voiceIPLimiter := newIngressLimiter(voiceIPRate, voiceIPBurst, voiceGlobalRate, voiceGlobalBurst, maxVoiceSources)
+	audioLimiter := newIngressLimiter(audioSourceRate, audioSourceBurst, audioGlobalRate, audioGlobalBurst, maxAudioSources)
+	audioIPLimiter := newIngressLimiter(audioIPRate, audioIPBurst, audioGlobalRate, audioGlobalBurst, maxAudioSources)
+	interactiveLimiter := newIngressLimiter(interactiveSourceRate, interactiveSourceBurst, interactiveGlobalRate, interactiveGlobalBurst, maxInteractiveSources)
 	for {
 		count, remote, err := conn.ReadFromUDPAddrPort(buffer)
 		if err != nil {
@@ -355,36 +490,58 @@ func (e *Endpoint) readLoop(conn *net.UDPConn) error {
 			if exists && pending.server == remote {
 				message := append([]byte(nil), buffer[:count]...)
 				select {
-				case pending.result <- stunResponse{message: message, from: remote}:
+				case pending.result <- message:
 				default:
 				}
 				continue
 			}
 		}
-		class := e.classifier(buffer[:count])
-		if class == PacketDrop {
+		if count >= 8 && count <= maxTrackerDatagram {
+			action := binary.BigEndian.Uint32(buffer[0:4])
+			transaction := binary.BigEndian.Uint32(buffer[4:8])
+			e.mu.Lock()
+			pending, exists := e.trackers[transaction]
+			if exists && pending.server == remote && (action == pending.expectedAction || action == 3) {
+				delete(e.trackers, transaction)
+			} else {
+				exists = false
+			}
+			e.mu.Unlock()
+			if exists {
+				pending.result <- append([]byte(nil), buffer[:count]...)
+				continue
+			}
+		}
+		class := e.classifyRoomPacket(buffer[:count])
+		if class == packetDrop {
 			continue
 		}
 		receivedAt := time.Now()
 		switch class {
-		case PacketControl:
+		case packetControl:
 			controlSource := netip.AddrPortFrom(remote.Addr(), 0)
 			if !controlLimiter.allow(controlSource, receivedAt) {
 				continue
 			}
-		case PacketVoice:
-			voiceIPSource := netip.AddrPortFrom(remote.Addr(), 0)
-			if !voiceIPLimiter.allow(voiceIPSource, receivedAt) || !voiceLimiter.allow(remote, receivedAt) {
+		case packetAudio:
+			audioIPSource := netip.AddrPortFrom(remote.Addr(), 0)
+			if !audioIPLimiter.allow(audioIPSource, receivedAt) || !audioLimiter.allow(remote, receivedAt) {
+				continue
+			}
+		case packetInteractive:
+			if !interactiveLimiter.allow(remote, receivedAt) {
 				continue
 			}
 		}
 		packetData := append([]byte(nil), buffer[:count]...)
 		packet := Datagram{Data: packetData, From: remote, ReceivedAt: receivedAt}
 		switch class {
-		case PacketControl:
+		case packetControl:
 			enqueueFresh(e.controlPackets, packet)
-		case PacketVoice:
-			enqueueFresh(e.voicePackets, packet)
+		case packetAudio:
+			enqueueFresh(e.audioPackets, packet)
+		case packetInteractive:
+			enqueueFresh(e.interactivePackets, packet)
 		}
 	}
 }
@@ -441,40 +598,144 @@ func (b *tokenBucket) refill(now time.Time, rate, burst float64) {
 	}
 }
 
-func (e *Endpoint) writeVoiceLoop(ctx context.Context, conn *net.UDPConn) error {
+func (e *Endpoint) writeLoop(ctx context.Context, conn *net.UDPConn) error {
+	defer func() {
+		e.stopAcceptingWrites(conn)
+		drainErr := net.ErrClosed
+		if ctx.Err() != nil {
+			drainErr = ctx.Err()
+		}
+		drainQueuedWrites(e.controlWrites, drainErr)
+		drainQueuedWrites(e.backgroundWrites, drainErr)
+	}()
+
+	const (
+		audioLane = iota
+		controlLane
+		interactiveLane
+		backgroundLane
+		laneCount
+	)
+	weights := [laneCount]int{8, 2, 2, 1}
+	lane, remaining := audioLane, weights[audioLane]
+	advance := func() {
+		lane = (lane + 1) % laneCount
+		remaining = weights[lane]
+	}
+
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case batch := <-e.voiceBatches:
-			if err := e.writeVoiceBatch(ctx, conn, batch); errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
-				return err
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		var batch RealtimeBatch
+		var request queuedWrite
+		selected, ready := lane, false
+		for checked := 0; checked < laneCount && !ready; checked++ {
+			selected = lane
+			switch lane {
+			case audioLane:
+				select {
+				case batch = <-e.audioBatches:
+					ready = true
+				default:
+				}
+			case controlLane:
+				select {
+				case request = <-e.controlWrites:
+					ready = true
+				default:
+				}
+			case interactiveLane:
+				select {
+				case batch = <-e.interactiveBatches:
+					ready = true
+				default:
+				}
+			case backgroundLane:
+				select {
+				case request = <-e.backgroundWrites:
+					ready = true
+				default:
+				}
 			}
+			if ready {
+				remaining--
+				if remaining == 0 {
+					advance()
+				}
+			} else {
+				advance()
+			}
+		}
+
+		if !ready {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case batch = <-e.audioBatches:
+				selected = audioLane
+			case request = <-e.controlWrites:
+				selected = controlLane
+			case batch = <-e.interactiveBatches:
+				selected = interactiveLane
+			case request = <-e.backgroundWrites:
+				selected = backgroundLane
+			}
+			lane, remaining = selected, weights[selected]-1
+			if remaining == 0 {
+				advance()
+			}
+		}
+
+		var err error
+		if selected == audioLane || selected == interactiveLane {
+			err = e.writeRealtimeBatch(ctx, conn, batch)
+		} else {
+			err = writeQueued(conn, request)
+		}
+		if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+			return err
 		}
 	}
 }
 
-func (e *Endpoint) writeVoiceBatch(ctx context.Context, conn *net.UDPConn, batch VoiceBatch) error {
-	writeDeadline := time.Now().Add(maxVoiceWriteTime)
+func (e *Endpoint) stopAcceptingWrites(conn *net.UDPConn) {
+	e.mu.Lock()
+	e.closed = true
+	if e.conn == conn {
+		e.conn = nil
+	}
+	e.mu.Unlock()
+}
+
+func (e *Endpoint) writeRealtimeBatch(ctx context.Context, conn *net.UDPConn, batch RealtimeBatch) error {
+	var writeBudget time.Duration
+	switch batch.Class {
+	case protocol.TrafficAudio:
+		writeBudget = maxAudioWriteTime
+	case protocol.TrafficInteractive, protocol.TrafficCustomRealtime:
+		writeBudget = maxInteractiveWriteTime
+	default:
+		return nil
+	}
+
+	e.realtimeMu.Lock()
+	defer e.realtimeMu.Unlock()
+	now := time.Now()
+	if (batch.Generation != 0 && batch.Generation != e.realtimeGeneration) || (!batch.Deadline.IsZero() && now.After(batch.Deadline)) {
+		return nil
+	}
+	writeDeadline := now.Add(writeBudget)
 	if !batch.Deadline.IsZero() && batch.Deadline.Before(writeDeadline) {
 		writeDeadline = batch.Deadline
-	}
-	if err := e.acquireWrite(ctx, writeDeadline); err != nil {
-		return err
-	}
-	defer e.releaseWrite()
-
-	e.voiceMu.Lock()
-	defer e.voiceMu.Unlock()
-	if batch.Generation != e.voiceGeneration || (!batch.Deadline.IsZero() && time.Now().After(batch.Deadline)) {
-		return nil
 	}
 	if err := conn.SetWriteDeadline(writeDeadline); err != nil {
 		return err
 	}
 	defer conn.SetWriteDeadline(time.Time{})
 	for _, packet := range batch.Datagrams {
-		if !batch.Deadline.IsZero() && time.Now().After(batch.Deadline) {
+		if time.Now().After(writeDeadline) {
 			break
 		}
 		select {
@@ -486,60 +747,88 @@ func (e *Endpoint) writeVoiceBatch(ctx context.Context, conn *net.UDPConn, batch
 			if errors.Is(err, net.ErrClosed) {
 				return err
 			}
-			e.logger.Debug("drop voice datagram after send failure", "destination", packet.Destination, "error", err)
+			e.logger.Debug("drop realtime datagram after send failure", "destination", packet.Destination, "error", err)
 		}
 	}
 	return nil
 }
 
-func (e *Endpoint) writeWithTimeout(conn *net.UDPConn, data []byte, destination netip.AddrPort, timeout time.Duration) error {
-	return e.writeWithDeadline(context.Background(), conn, data, destination, time.Now().Add(timeout))
+func (e *Endpoint) queueWrite(ctx context.Context, lane chan<- queuedWrite, data []byte, destination netip.AddrPort) error {
+	if ctx == nil {
+		return errors.New("write context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return errors.New("write context requires a deadline")
+	}
+	if !deadline.After(time.Now()) {
+		return context.DeadlineExceeded
+	}
+	request := queuedWrite{
+		data:        append([]byte(nil), data...),
+		destination: destination,
+		deadline:    deadline,
+		result:      make(chan error, 1),
+	}
+	select {
+	case lane <- request:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-request.result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
-func (e *Endpoint) writeWithDeadline(ctx context.Context, conn *net.UDPConn, data []byte, destination netip.AddrPort, deadline time.Time) error {
-	if err := e.acquireWrite(ctx, deadline); err != nil {
+func writeQueued(conn *net.UDPConn, request queuedWrite) error {
+	if !request.deadline.After(time.Now()) {
+		reportQueuedWrite(request, context.DeadlineExceeded)
+		return nil
+	}
+	if err := conn.SetWriteDeadline(request.deadline); err != nil {
+		reportQueuedWrite(request, err)
 		return err
 	}
-	defer e.releaseWrite()
-	if err := conn.SetWriteDeadline(deadline); err != nil {
-		return err
-	}
-	_, err := conn.WriteToUDPAddrPort(data, destination)
+	_, err := conn.WriteToUDPAddrPort(request.data, request.destination)
 	_ = conn.SetWriteDeadline(time.Time{})
+	reportQueuedWrite(request, err)
 	return err
 }
 
-func (e *Endpoint) acquireWrite(ctx context.Context, deadline time.Time) error {
-	wait := time.Until(deadline)
-	if wait <= 0 {
-		return context.DeadlineExceeded
-	}
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
+func reportQueuedWrite(request queuedWrite, err error) {
 	select {
-	case e.writeGate <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return context.DeadlineExceeded
+	case request.result <- err:
+	default:
 	}
 }
 
-func (e *Endpoint) releaseWrite() {
-	<-e.writeGate
+func drainQueuedWrites(lane <-chan queuedWrite, err error) {
+	for {
+		select {
+		case request := <-lane:
+			reportQueuedWrite(request, err)
+		default:
+			return
+		}
+	}
 }
 
-func enqueueFresh(queue chan Datagram, packet Datagram) {
+func enqueueFresh[T any](queue chan T, value T) {
 	select {
-	case queue <- packet:
+	case queue <- value:
 	default:
 		select {
 		case <-queue:
 		default:
 		}
 		select {
-		case queue <- packet:
+		case queue <- value:
 		default:
 		}
 	}
@@ -569,20 +858,13 @@ func (e *Endpoint) refreshSTUN(ctx context.Context) {
 		servers = servers[:maxSTUNServerResults]
 	}
 	results := make(chan STUNResult, len(servers))
-	var wait sync.WaitGroup
 	for _, server := range servers {
-		server := server
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			results <- e.querySTUN(ctx, server)
-		}()
+		go func() { results <- e.querySTUN(ctx, server) }()
 	}
-	wait.Wait()
-	close(results)
 
 	stunResults := make([]STUNResult, 0, len(servers))
-	for result := range results {
+	for range servers {
+		result := <-results
 		stunResults = append(stunResults, result)
 		if result.Error != "" {
 			e.logger.Debug("STUN probe failed", "server", result.Server, "error", result.Error)
@@ -637,16 +919,15 @@ func (e *Endpoint) querySTUN(ctx context.Context, server string) STUNResult {
 		return result
 	}
 	e.mu.RLock()
-	conn := e.conn
+	running := e.conn != nil
 	e.mu.RUnlock()
-	if conn == nil {
+	if !running {
 		result.Error = "UDP endpoint is not running"
 		return result
 	}
 	probes := make(chan stunProbeResult, len(serverAddresses))
 	for _, serverAddress := range serverAddresses {
-		serverAddress := serverAddress
-		go func() { probes <- e.probeSTUN(queryCtx, conn, serverAddress) }()
+		go func() { probes <- e.probeSTUN(queryCtx, serverAddress) }()
 	}
 	var lastErr error
 	for range serverAddresses {
@@ -672,19 +953,18 @@ func (e *Endpoint) querySTUN(ctx context.Context, server string) STUNResult {
 	return result
 }
 
-func (e *Endpoint) probeSTUN(ctx context.Context, conn *net.UDPConn, server netip.AddrPort) stunProbeResult {
+func (e *Endpoint) probeSTUN(ctx context.Context, server netip.AddrPort) stunProbeResult {
 	transaction, request, err := newBindingRequest()
 	if err != nil {
 		return stunProbeResult{err: err}
 	}
-	response := make(chan stunResponse, 1)
+	response := make(chan []byte, 1)
 	if err := e.addPending(transaction, pendingSTUN{server: server, result: response}); err != nil {
 		return stunProbeResult{err: err}
 	}
 	defer e.removePending(transaction)
 	started := time.Now()
-	deadline, _ := ctx.Deadline()
-	if err := e.writeWithDeadline(ctx, conn, request, server, deadline); err != nil {
+	if err := e.queueWrite(ctx, e.controlWrites, request, server); err != nil {
 		return stunProbeResult{err: fmt.Errorf("send STUN request: %w", err)}
 	}
 	select {
@@ -692,7 +972,7 @@ func (e *Endpoint) probeSTUN(ctx context.Context, conn *net.UDPConn, server neti
 		if !ok {
 			return stunProbeResult{err: errors.New("UDP endpoint closed")}
 		}
-		mapped, err := parseBindingResponse(packet.message, transaction)
+		mapped, err := parseBindingResponse(packet, transaction)
 		if err != nil {
 			return stunProbeResult{err: err}
 		}
@@ -770,6 +1050,12 @@ func (e *Endpoint) addPending(transaction stunTransaction, pending pendingSTUN) 
 func (e *Endpoint) removePending(transaction stunTransaction) {
 	e.mu.Lock()
 	delete(e.pending, transaction)
+	e.mu.Unlock()
+}
+
+func (e *Endpoint) removePendingTracker(transaction uint32) {
+	e.mu.Lock()
+	delete(e.trackers, transaction)
 	e.mu.Unlock()
 }
 

@@ -11,329 +11,349 @@ import (
 
 	"bork/internal/identity"
 	"bork/internal/invite"
-	"bork/internal/media"
+	"bork/internal/networking"
+	"bork/internal/networking/discovery"
 	"bork/internal/networking/endpoint"
-	"bork/internal/networking/link"
 	"bork/internal/protocol"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 func TestMismatchedChallengeCannotEstablishSession(t *testing.T) {
-	peerRemoteIdentity := testRemoteIdentity(t)
-	path, err := link.NewPath(netip.MustParseAddrPort("127.0.0.1:9000"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	remoteIdentity := testRemoteIdentity(t)
+	path, _ := NewPath(netip.MustParseAddrPort("127.0.0.1:9000"))
 	peerSess := testPeeringSession(t, path)
 	peerSess.pendingPing = pendingPing{challenge: 99, path: path, sentAt: time.Now()}
-	peerRemote := &RemotePeer{identity: peerRemoteIdentity, candidateSess: peerSess}
+	remotePeer := &RemotePeer{identity: remoteIdentity, candidateSession: peerSess}
 	client := &Client{
 		logger:      slog.Default(),
 		roomTag:     [16]byte{1},
-		remotePeers: map[string]*RemotePeer{peerRemoteIdentity.PeerID(): peerRemote},
+		remotePeers: map[string]*RemotePeer{remoteIdentity.PeerID(): remotePeer},
 	}
 	packet, err := protocol.MarshalControl(protocol.PacketPong, client.roomTag, peerSess.sessionID, 1, 98, peerSess.ciphers.ControlRecv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	client.handleSessionPacket(endpoint.Datagram{Data: packet, From: path.Address()})
-	if peerSess.authenticated || peerRemote.peerSess != nil {
+	if peerSess.authenticated || remotePeer.session != nil {
 		t.Fatal("mismatched challenge established a session")
 	}
 }
 
-func TestRemotePeerExpiryPreservesPeeringSession(t *testing.T) {
-	peerRemoteIdentity := testRemoteIdentity(t)
-	path, err := link.NewPath(netip.MustParseAddrPort("127.0.0.1:9000"))
-	if err != nil {
-		t.Fatal(err)
+func TestHelloReusesThenReplacesCandidateSession(t *testing.T) {
+	client, remoteIdentity, remoteHello := testHelloClient(t)
+	address := netip.MustParseAddrPort("127.0.0.1:9001")
+	client.handleHello(endpoint.Datagram{Data: remoteHello, From: address})
+	remote := client.remotePeers[remoteIdentity.PeerID()]
+	first := remote.candidateSession
+	challenge := first.pendingPing.challenge
+
+	client.handleHello(endpoint.Datagram{Data: remoteHello, From: address})
+	if remote.candidateSession != first || first.pendingPing.challenge != challenge || challenge == 0 {
+		t.Fatal("duplicate Hello did not reuse the pending candidate session")
 	}
+
+	replacementHello := testRemoteHello(t, client, remoteIdentity, 3)
+	client.handleHello(endpoint.Datagram{Data: replacementHello, From: address})
+	if remote.candidateSession == nil || remote.candidateSession == first || remote.candidateSession.sessionID == first.sessionID {
+		t.Fatal("new handshake transcript did not replace the candidate session")
+	}
+}
+
+func TestCandidateSessionAuthenticatesOnAlternatePath(t *testing.T) {
+	client, remoteIdentity, remoteHello := testHelloClient(t)
+	firstPath, _ := NewPath(netip.MustParseAddrPort("127.0.0.1:9010"))
+	secondPath, _ := NewPath(netip.MustParseAddrPort("127.0.0.1:9011"))
+	client.handleHello(endpoint.Datagram{Data: remoteHello, From: firstPath.Address()})
+	remote := client.remotePeers[remoteIdentity.PeerID()]
+	peerSess := remote.candidateSession
+	client.handleHello(endpoint.Datagram{Data: remoteHello, From: secondPath.Address()})
+	answerCandidatePong(t, client, peerSess, secondPath, 1, 20*time.Millisecond)
+
+	if remote.session != peerSess || remote.candidateSession != nil || !peerSess.authenticated || peerSess.path != secondPath || peerSess.candidatePath != nil {
+		t.Fatal("alternate path did not authenticate and promote the candidate session")
+	}
+}
+
+func TestStalePathDeauthenticatesAndRetries(t *testing.T) {
+	client, remoteIdentity, remoteHello := testHelloClient(t)
+	address := netip.MustParseAddrPort("127.0.0.1:9020")
+	peerSess := establishHelloSession(t, client, remoteIdentity, remoteHello, address)
+	candidatePath, _ := NewPath(netip.MustParseAddrPort("127.0.0.1:9021"))
+	client.rememberCandidatePath(peerSess, candidatePath, time.Now())
+	peerSess.pendingPing = pendingPing{challenge: 100, path: peerSess.path, sentAt: time.Now()}
+	peerSess.lastAuthenticatedPacketAt = time.Now().Add(-pathFailoverTimeout - time.Second)
+	generation := client.topologyGeneration
+
+	client.expireRemotePeers()
+	remote := client.remotePeers[remoteIdentity.PeerID()]
+	if remote == nil || remote.session != peerSess || peerSess.authenticated || peerSess.pendingPing.challenge != 0 || peerSess.candidatePath != nil {
+		t.Fatal("stale active path was removed or retained authenticated probe state")
+	}
+	if client.topologyGeneration == generation || !client.fanoutDirty || client.addressHasActivePath(address) {
+		t.Fatal("stale path did not invalidate topology and discovery state")
+	}
+
+	remembered := client.discoveredAddresses[address]
+	remembered.nextProbe = time.Time{}
+	client.discoveredAddresses[address] = remembered
+	network := client.roomNetwork.(*fakeRoomNetwork)
+	before := len(network.sentAddresses())
+	client.sendHellos(time.Now())
+	if len(network.sentAddresses()) != before+1 {
+		t.Fatal("stale direct path did not resume Hello probing")
+	}
+	client.handleHello(endpoint.Datagram{Data: remoteHello, From: address})
+	if peerSess.pendingPing.challenge == 0 || !peerSess.pendingPing.path.SameRoute(peerSess.path) {
+		t.Fatal("matching Hello did not retry authentication on the retained session")
+	}
+}
+
+func TestStaleRoomSessionRetainsControlState(t *testing.T) {
+	remoteIdentity := testRemoteIdentity(t)
+	path, _ := NewPath(netip.MustParseAddrPort("127.0.0.1:9030"))
 	peerSess := testPeeringSession(t, path)
 	peerSess.authenticated = true
 	peerSess.everAuthenticated = true
 	peerSess.lastAuthenticatedPacketAt = time.Now().Add(-remotePeerTimeout - time.Second)
 	for range 12 {
-		if _, err := peerSess.control.NextSendSequence(); err != nil {
+		if _, err := peerSess.control.nextSendSequence(); err != nil {
 			t.Fatal(err)
 		}
 	}
-	peerRemote := &RemotePeer{identity: peerRemoteIdentity, peerSess: peerSess}
-	client := &Client{
-		logger:              slog.Default(),
-		remotePeers:         map[string]*RemotePeer{peerRemoteIdentity.PeerID(): peerRemote},
-		discoveredAddresses: map[netip.AddrPort]discoveredAddress{path.Address(): {}},
-	}
+	remotePeer := &RemotePeer{identity: remoteIdentity, session: peerSess}
+	client := &Client{logger: slog.Default(), remotePeers: map[string]*RemotePeer{remoteIdentity.PeerID(): remotePeer}}
 	client.expireRemotePeers()
-	kept := client.remotePeers[peerRemoteIdentity.PeerID()]
-	if kept != peerRemote || kept.peerSess != peerSess || peerSess.authenticated {
-		t.Fatal("expired peering session was replaced, removed, or remained online")
+	if client.remotePeers[remoteIdentity.PeerID()] != remotePeer || remotePeer.session != peerSess || peerSess.authenticated {
+		t.Fatal("stale room session was removed or remained authenticated")
 	}
-	if next, err := peerSess.control.NextSendSequence(); err != nil || next != 13 {
+	if next, err := peerSess.control.nextSendSequence(); err != nil || next != 13 {
 		t.Fatalf("control flow was reset: next sequence = %d, %v", next, err)
 	}
 }
 
-func TestSendMediaSkipsCandidateOnlyRemotePeer(t *testing.T) {
-	peerRemoteIdentity := testRemoteIdentity(t)
-	path, err := link.NewPath(netip.MustParseAddrPort("127.0.0.1:9000"))
+func TestDirectPathMigrationKeepsSessionAndDiscardsOldPath(t *testing.T) {
+	client, remoteIdentity, remoteHello := testHelloClient(t)
+	primaryPath, _ := NewPath(netip.MustParseAddrPort("127.0.0.1:9040"))
+	candidatePath, _ := NewPath(netip.MustParseAddrPort("127.0.0.1:9041"))
+	peerSess := establishHelloSession(t, client, remoteIdentity, remoteHello, primaryPath.Address())
+	sessionID := peerSess.sessionID
+	sequenceBefore, err := peerSess.control.nextSendSequence()
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidate := testPeeringSession(t, path)
-	client := &Client{
-		roomNetwork: &fakeRoomNetwork{},
-		remotePeers: map[string]*RemotePeer{
-			peerRemoteIdentity.PeerID(): {
-				identity:      peerRemoteIdentity,
-				candidateSess: candidate,
-			},
-		},
+
+	client.handleHello(endpoint.Datagram{Data: remoteHello, From: candidatePath.Address()})
+	peerSess.lastAuthenticatedPacketAt = time.Now().Add(-pathFailoverTimeout - time.Second)
+	answerCandidatePong(t, client, peerSess, candidatePath, 2, 20*time.Millisecond)
+	if peerSess.sessionID != sessionID || !peerSess.authenticated || peerSess.path != candidatePath || peerSess.candidatePath != nil {
+		t.Fatal("direct migration replaced the session or retained the previous path")
 	}
-	client.sendMedia(media.SendFrame{Timestamp: 480, Payload: []byte{1}})
-	if next, err := candidate.media.NextSendSequence(); err != nil || next != 1 {
-		t.Fatalf("candidate media flow advanced: next sequence = %d, %v", next, err)
+	if sequenceAfter, err := peerSess.control.nextSendSequence(); err != nil || sequenceAfter <= sequenceBefore {
+		t.Fatalf("direct migration reset control flow: before=%d after=%d err=%v", sequenceBefore, sequenceAfter, err)
 	}
 }
 
-func TestCandidateExpiryReusesTranscriptAssociation(t *testing.T) {
-	client, remoteIdentity, remoteHello := testHelloClient(t)
-	from := netip.MustParseAddrPort("127.0.0.1:9001")
-	client.handleHello(endpoint.Datagram{Data: remoteHello, From: from})
-	first := client.remotePeers[remoteIdentity.PeerID()].candidateSess
-	challenge := first.pendingPing.challenge
-	client.handleHello(endpoint.Datagram{Data: remoteHello, From: from})
-	if first.pendingPing.challenge != challenge || challenge == 0 {
-		t.Fatal("duplicate hello reset the pending candidate challenge")
+func TestBridgePathPromotesToDirect(t *testing.T) {
+	client, _, _ := testHelloClient(t)
+	remoteIdentity := testRemoteIdentity(t)
+	bridgePath, _ := NewBridgePath(netip.MustParseAddrPort("127.0.0.1:9050"), [32]byte{1}, rawPeerIdentity(remoteIdentity))
+	directPath, _ := NewPath(netip.MustParseAddrPort("127.0.0.1:9051"))
+	peerSess := testPeeringSession(t, bridgePath)
+	peerSess.authenticated = true
+	peerSess.everAuthenticated = true
+	peerSess.lastAuthenticatedPacketAt = time.Now()
+	peerSess.rttMillis = 10
+	client.remotePeers[remoteIdentity.PeerID()] = &RemotePeer{identity: remoteIdentity, session: peerSess}
+	client.rememberCandidatePath(peerSess, directPath, time.Now())
+	answerCandidatePong(t, client, peerSess, directPath, 1, 80*time.Millisecond)
+	if !peerSess.authenticated || peerSess.path != directPath || peerSess.candidatePath != nil {
+		t.Fatal("direct candidate did not replace a healthy bridge path")
 	}
-	before, err := first.control.NextSendSequence()
-	if err != nil {
-		t.Fatal(err)
+}
+
+func TestHealthyDirectPathRejectsBridgeCandidate(t *testing.T) {
+	client, _, _ := testHelloClient(t)
+	remoteIdentity := testRemoteIdentity(t)
+	directPath, _ := NewPath(netip.MustParseAddrPort("127.0.0.1:9060"))
+	bridgePath, _ := NewBridgePath(netip.MustParseAddrPort("127.0.0.1:9061"), [32]byte{1}, rawPeerIdentity(remoteIdentity))
+	peerSess := testPeeringSession(t, directPath)
+	peerSess.authenticated = true
+	peerSess.everAuthenticated = true
+	peerSess.lastAuthenticatedPacketAt = time.Now()
+	peerSess.rttMillis = 100
+	client.remotePeers[remoteIdentity.PeerID()] = &RemotePeer{identity: remoteIdentity, session: peerSess}
+	client.rememberCandidatePath(peerSess, bridgePath, time.Now())
+	answerCandidatePong(t, client, peerSess, bridgePath, 1, time.Millisecond)
+	if !peerSess.authenticated || peerSess.path != directPath || peerSess.candidatePath != nil {
+		t.Fatal("bridge candidate displaced a healthy direct path or left a completed probe")
 	}
-	first.lastAuthenticatedPacketAt = time.Now().Add(-remotePeerTimeout - time.Second)
+}
+
+func TestCandidatePathReplacementAndExpiry(t *testing.T) {
+	client := &Client{}
+	activePath, _ := NewPath(netip.MustParseAddrPort("127.0.0.1:9070"))
+	peerSess := testPeeringSession(t, activePath)
+	firstBridge, _ := NewBridgePath(netip.MustParseAddrPort("127.0.0.1:9071"), [32]byte{1}, [32]byte{9})
+	updatedBridge, _ := NewBridgePath(netip.MustParseAddrPort("127.0.0.1:9072"), [32]byte{1}, [32]byte{9})
+	newBridge, _ := NewBridgePath(netip.MustParseAddrPort("127.0.0.1:9073"), [32]byte{2}, [32]byte{9})
+	directPath, _ := NewPath(netip.MustParseAddrPort("127.0.0.1:9074"))
+	otherDirect, _ := NewPath(netip.MustParseAddrPort("127.0.0.1:9075"))
+
+	startedAt := time.Now().Add(-time.Second)
+	if !client.rememberCandidatePath(peerSess, firstBridge, startedAt) {
+		t.Fatal("first bridge probe was rejected")
+	}
+	if client.rememberCandidatePath(peerSess, updatedBridge, time.Now()) || peerSess.candidatePath.path != updatedBridge || !peerSess.candidatePath.startedAt.Equal(startedAt) {
+		t.Fatal("same bridge route did not refresh only its mutable next hop")
+	}
+	if !client.rememberCandidatePath(peerSess, newBridge, time.Now()) || peerSess.candidatePath.path != newBridge {
+		t.Fatal("newest bridge probe did not replace the previous bridge")
+	}
+	if !client.rememberCandidatePath(peerSess, directPath, time.Now()) || peerSess.candidatePath.path != directPath {
+		t.Fatal("direct probe did not replace a bridge probe")
+	}
+	if client.rememberCandidatePath(peerSess, newBridge, time.Now()) || peerSess.candidatePath.path != directPath {
+		t.Fatal("bridge probe replaced a direct probe")
+	}
+	if !client.rememberCandidatePath(peerSess, otherDirect, time.Now()) || peerSess.candidatePath.path != otherDirect {
+		t.Fatal("newest direct probe did not replace the previous direct probe")
+	}
+
+	peerSess.authenticated = true
+	peerSess.everAuthenticated = true
+	peerSess.lastAuthenticatedPacketAt = time.Now()
+	peerSess.candidatePath.startedAt = time.Now().Add(-remotePeerTimeout - time.Second)
+	remoteIdentity := testRemoteIdentity(t)
+	client.logger = slog.Default()
+	client.remotePeers = map[string]*RemotePeer{remoteIdentity.PeerID(): {identity: remoteIdentity, session: peerSess}}
 	client.expireRemotePeers()
-	if client.associations[first.transcriptHash] != first {
-		t.Fatal("candidate expiry discarded cryptographic association")
-	}
-	client.handleHello(endpoint.Datagram{Data: remoteHello, From: from})
-	second := client.remotePeers[remoteIdentity.PeerID()].candidateSess
-	after, err := second.control.NextSendSequence()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second != first || after <= before {
-		t.Fatalf("association was recreated or reset: same=%v before=%d after=%d", second == first, before, after)
+	if peerSess.candidatePath != nil {
+		t.Fatal("expired candidate probe was retained")
 	}
 }
 
-func TestReplayedHelloDoesNotPoisonTimedOutPrimaryPath(t *testing.T) {
+func TestAuthenticatedPathIsRetainedAsRoomLifetimeHint(t *testing.T) {
 	client, remoteIdentity, remoteHello := testHelloClient(t)
-	primaryAddress := netip.MustParseAddrPort("127.0.0.1:9010")
-	replayAddress := netip.MustParseAddrPort("127.0.0.1:9011")
-	peerSess := establishHelloSession(t, client, remoteIdentity, remoteHello, primaryAddress)
-
+	address := netip.MustParseAddrPort("127.0.0.1:9080")
+	peerSess := establishHelloSession(t, client, remoteIdentity, remoteHello, address)
+	remembered, exists := client.discoveredAddresses[address]
+	if !exists || remembered.source != discovery.SourceAuthenticated || !remembered.expiresAt.IsZero() {
+		t.Fatalf("authenticated discovery record = %#v, exists=%v", remembered, exists)
+	}
 	peerSess.lastAuthenticatedPacketAt = time.Now().Add(-remotePeerTimeout - time.Second)
 	client.expireRemotePeers()
-	if peerSess.authenticated {
-		t.Fatal("timed-out session remained authenticated")
-	}
-
-	client.handleHello(endpoint.Datagram{Data: remoteHello, From: replayAddress})
-	if peerSess.path.Address() != primaryAddress {
-		t.Fatalf("replayed Hello changed primary path to %v", peerSess.path.Address())
-	}
-	if peerSess.pendingPing.challenge == 0 || peerSess.pendingPing.path.Address() != primaryAddress {
-		t.Fatal("replayed Hello diverted the primary liveness probe")
-	}
-	replayProbe := peerSess.candidatePath(replayAddress)
-	if replayProbe == nil || replayProbe.pendingPing.challenge == 0 || replayProbe.pendingPing.path.Address() != replayAddress {
-		t.Fatal("replayed Hello did not create an independent candidate path probe")
-	}
-	otherAddress := netip.MustParseAddrPort("127.0.0.1:9012")
-	client.handleHello(endpoint.Datagram{Data: remoteHello, From: otherAddress})
-	if peerSess.candidatePath(replayAddress) == nil || peerSess.candidatePath(otherAddress) == nil {
-		t.Fatal("bounded path probes did not retain concurrent candidates")
-	}
-
-	for _, probe := range peerSess.candidatePaths {
-		probe.startedAt = time.Now().Add(-remotePeerTimeout - time.Second)
-	}
-	client.expireRemotePeers()
-	if len(peerSess.candidatePaths) != 0 {
-		t.Fatal("candidate path probe survived expiry while the session was unauthenticated")
-	}
-	if peerSess.pendingPing.path.Address() != primaryAddress {
-		t.Fatal("candidate path expiry changed the primary liveness probe")
-	}
-
-	client.handleHello(endpoint.Datagram{Data: remoteHello, From: replayAddress})
-	if peerSess.candidatePath(replayAddress) == nil {
-		t.Fatal("replayed Hello did not recreate a candidate path probe")
-	}
-	client.handleHello(endpoint.Datagram{Data: remoteHello, From: primaryAddress})
-	if peerSess.candidatePath(replayAddress) == nil {
-		t.Fatal("unproven primary-path Hello cleared the candidate probe")
+	if _, exists := client.discoveredAddresses[address]; !exists {
+		t.Fatal("authenticated path was removed when its session became inactive")
 	}
 }
 
-func TestMatchingCandidatePathPongMigratesExistingSession(t *testing.T) {
-	client, remoteIdentity, remoteHello := testHelloClient(t)
-	primaryAddress := netip.MustParseAddrPort("127.0.0.1:9020")
-	candidateAddress := netip.MustParseAddrPort("127.0.0.1:9021")
-	peerSess := establishHelloSession(t, client, remoteIdentity, remoteHello, primaryAddress)
-	peerRemote := client.remotePeers[remoteIdentity.PeerID()]
-	sessionID := peerSess.sessionID
-	controlSequenceBefore, err := peerSess.control.NextSendSequence()
-	if err != nil {
-		t.Fatal(err)
+func TestBridgeBudgetIsBoundedAndRefills(t *testing.T) {
+	var budget tokenBudget
+	now := time.Unix(1, 0)
+	for range 4 {
+		if !budget.allowCost(now, 1, 2, 4) {
+			t.Fatal("initial bridge burst was rejected")
+		}
 	}
-
-	client.handleHello(endpoint.Datagram{Data: remoteHello, From: candidateAddress})
-	peerSess.pendingPing.challenge = 101
-	candidateProbe := peerSess.candidatePath(candidateAddress)
-	if candidateProbe == nil {
-		t.Fatal("candidate path probe was not created")
+	if budget.allowCost(now, 1, 2, 4) {
+		t.Fatal("bridge burst limit was not enforced")
 	}
-	candidateProbe.pendingPing.challenge = 202
-	wrongPong, err := protocol.MarshalControl(protocol.PacketPong, client.roomTag, sessionID, 2, 101, peerSess.ciphers.ControlRecv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.handleSessionPacket(endpoint.Datagram{Data: wrongPong, From: candidateAddress})
-	if peerSess.path.Address() != primaryAddress || peerSess.candidatePath(candidateAddress) == nil {
-		t.Fatal("primary challenge promoted the candidate path")
-	}
-
-	matchingPong, err := protocol.MarshalControl(protocol.PacketPong, client.roomTag, sessionID, 3, 202, peerSess.ciphers.ControlRecv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.handleSessionPacket(endpoint.Datagram{Data: matchingPong, From: candidateAddress})
-	if peerRemote.peerSess != peerSess || peerSess.sessionID != sessionID {
-		t.Fatal("path migration replaced the authenticated session")
-	}
-	if !peerSess.authenticated || peerSess.path.Address() != candidateAddress {
-		t.Fatalf("candidate path was not promoted: authenticated=%v path=%v", peerSess.authenticated, peerSess.path.Address())
-	}
-	if len(peerSess.candidatePaths) != 0 {
-		t.Fatal("promoted candidate path probe was not cleared")
-	}
-	controlSequenceAfter, err := peerSess.control.NextSendSequence()
-	if err != nil || controlSequenceAfter <= controlSequenceBefore {
-		t.Fatalf("path migration reset the control sequence: before=%d after=%d err=%v", controlSequenceBefore, controlSequenceAfter, err)
+	if !budget.allowCost(now.Add(time.Second), 1, 2, 4) || !budget.allowCost(now.Add(time.Second), 1, 2, 4) || budget.allowCost(now.Add(time.Second), 1, 2, 4) {
+		t.Fatal("bridge budget did not refill at the configured rate")
 	}
 }
 
-func TestCandidatePathPingDoesNotRefreshPrimaryLiveness(t *testing.T) {
-	client, remoteIdentity, remoteHello := testHelloClient(t)
-	primaryAddress := netip.MustParseAddrPort("127.0.0.1:9030")
-	candidateAddress := netip.MustParseAddrPort("127.0.0.1:9031")
-	peerSess := establishHelloSession(t, client, remoteIdentity, remoteHello, primaryAddress)
-	client.handleHello(endpoint.Datagram{Data: remoteHello, From: candidateAddress})
-	oldAuthenticatedAt := time.Now().Add(-remotePeerTimeout - time.Second)
-	peerSess.lastAuthenticatedPacketAt = oldAuthenticatedAt
-	ping, err := protocol.MarshalControl(protocol.PacketPing, client.roomTag, peerSess.sessionID, 2, 77, peerSess.ciphers.ControlRecv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.handleSessionPacket(endpoint.Datagram{Data: ping, From: candidateAddress})
-	if !peerSess.lastAuthenticatedPacketAt.Equal(oldAuthenticatedAt) {
-		t.Fatal("unproven candidate path refreshed primary liveness")
-	}
-}
-
-func TestCandidatePathSetIsBoundedAndPrioritizesDiscoveredAddress(t *testing.T) {
-	client, remoteIdentity, remoteHello := testHelloClient(t)
-	primaryAddress := netip.MustParseAddrPort("127.0.0.1:9040")
-	peerSess := establishHelloSession(t, client, remoteIdentity, remoteHello, primaryAddress)
-	for index := range maxCandidatePaths {
-		address := netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, byte(index + 1)}), 9040)
-		client.handleHello(endpoint.Datagram{Data: remoteHello, From: address})
-	}
-	if len(peerSess.candidatePaths) != maxCandidatePaths {
-		t.Fatalf("candidate path count = %d, want %d", len(peerSess.candidatePaths), maxCandidatePaths)
-	}
-	discovered := netip.MustParseAddrPort("198.51.100.1:9040")
-	client.rememberDiscoveredAddress(discovered, time.Now())
-	client.handleHello(endpoint.Datagram{Data: remoteHello, From: discovered})
-	if len(peerSess.candidatePaths) != maxCandidatePaths || peerSess.candidatePath(discovered) == nil {
-		t.Fatal("discovered migration address did not replace an untrusted path probe")
-	}
-}
-
-func TestInactiveRemotePeerCanBeEvictedWithoutDroppingAssociation(t *testing.T) {
-	inactiveIdentity := testRemoteIdentity(t)
-	activeIdentity := testRemoteIdentity(t)
-	path, err := link.NewPath(netip.MustParseAddrPort("127.0.0.1:9002"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	inactiveSession := testPeeringSession(t, path)
-	inactiveSession.authenticated = false
-	inactiveSession.lastAuthenticatedPacketAt = time.Unix(1, 0)
-	activeSession := testPeeringSession(t, path)
-	activeSession.authenticated = true
-	client := &Client{
-		remotePeers: map[string]*RemotePeer{
-			inactiveIdentity.PeerID(): {identity: inactiveIdentity, peerSess: inactiveSession},
-			activeIdentity.PeerID():   {identity: activeIdentity, peerSess: activeSession},
-		},
-		associations:        map[[32]byte]*PeeringSession{inactiveSession.transcriptHash: inactiveSession},
-		discoveredAddresses: map[netip.AddrPort]discoveredAddress{},
-	}
-	if !client.evictInactiveRemotePeer() {
-		t.Fatal("inactive peer was not evicted")
-	}
-	if client.remotePeers[inactiveIdentity.PeerID()] != nil || client.remotePeers[activeIdentity.PeerID()] == nil {
-		t.Fatal("wrong remote peer was evicted")
-	}
-	if client.associations[inactiveSession.transcriptHash] != inactiveSession {
-		t.Fatal("eviction discarded the nonce-safety association")
-	}
-}
-
-func TestDiscoveredAddressLimitEvictsOldestUnusedAddress(t *testing.T) {
-	activeAddress := netip.MustParseAddrPort("192.0.2.1:9000")
-	activePath, err := link.NewPath(activeAddress)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestDiscoveryHintBudgetEvictsOldestUnusedAddress(t *testing.T) {
+	activeAddress := discoveryBudgetAddress(0)
+	activePath, _ := NewPath(activeAddress)
 	activeIdentity := testRemoteIdentity(t)
 	client := &Client{
 		remotePeers: map[string]*RemotePeer{
-			activeIdentity.PeerID(): {identity: activeIdentity, peerSess: testPeeringSession(t, activePath)},
+			activeIdentity.PeerID(): {identity: activeIdentity, session: testPeeringSession(t, activePath)},
 		},
 		discoveredAddresses: make(map[netip.AddrPort]discoveredAddress),
 	}
 	base := time.Unix(1000, 0)
-	for index := range maxDiscoveredAddresses {
-		address := netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, byte(index + 1)}), 9000)
-		client.rememberDiscoveredAddress(address, base.Add(time.Duration(index)*time.Second))
+	for index := range maxDiscoveryHints {
+		client.rememberDiscoveryHint(discovery.Hint{Address: discoveryBudgetAddress(index), Source: discovery.SourceMDNS}, base.Add(time.Duration(index)*time.Second))
 	}
-	oldestUnused := netip.MustParseAddrPort("192.0.2.2:9000")
+	oldestUnused := discoveryBudgetAddress(1)
 	newAddress := netip.MustParseAddrPort("198.51.100.1:9000")
-	client.rememberDiscoveredAddress(newAddress, base.Add(time.Hour))
+	client.rememberDiscoveryHint(discovery.Hint{Address: newAddress, Source: discovery.SourceMDNS}, base.Add(time.Hour))
+	if len(client.discoveredAddresses) != maxDiscoveryHints {
+		t.Fatalf("discovery hint count = %d, want %d", len(client.discoveredAddresses), maxDiscoveryHints)
+	}
 	if _, exists := client.discoveredAddresses[activeAddress]; !exists {
-		t.Fatal("LRU eviction removed an address used by an active session")
+		t.Fatal("eviction removed an address used by a session")
 	}
 	if _, exists := client.discoveredAddresses[oldestUnused]; exists {
-		t.Fatal("LRU eviction retained the oldest unused address")
+		t.Fatal("eviction retained the oldest unused address")
 	}
 	if _, exists := client.discoveredAddresses[newAddress]; !exists {
-		t.Fatal("LRU eviction did not retain the new address")
+		t.Fatal("eviction did not retain the new address")
 	}
 }
 
-func testPeeringSession(t *testing.T, path link.Path) *PeeringSession {
+func TestDiscoveryHintBudgetPrioritizesExpiredRecord(t *testing.T) {
+	client := &Client{remotePeers: make(map[string]*RemotePeer), discoveredAddresses: make(map[netip.AddrPort]discoveredAddress)}
+	base := time.Unix(2000, 0)
+	for index := range maxDiscoveryHints {
+		client.rememberDiscoveryHint(discovery.Hint{Address: discoveryBudgetAddress(index), Source: discovery.SourceMDNS}, base.Add(time.Duration(index)*time.Second))
+	}
+	expiredAddress := discoveryBudgetAddress(maxDiscoveryHints - 1)
+	expired := client.discoveredAddresses[expiredAddress]
+	expired.source = discovery.SourceTracker
+	expired.expiresAt = base.Add(30 * time.Minute)
+	client.discoveredAddresses[expiredAddress] = expired
+	oldest := discoveryBudgetAddress(0)
+	newAddress := netip.MustParseAddrPort("198.51.100.2:9000")
+	client.rememberDiscoveryHint(discovery.Hint{Address: newAddress, Source: discovery.SourceMDNS}, base.Add(time.Hour))
+	if _, exists := client.discoveredAddresses[expiredAddress]; exists {
+		t.Fatal("eviction retained an expired tracker record")
+	}
+	if _, exists := client.discoveredAddresses[oldest]; !exists {
+		t.Fatal("eviction chose the oldest record before an expired record")
+	}
+	if len(client.discoveredAddresses) != maxDiscoveryHints {
+		t.Fatalf("discovery hint count = %d, want %d", len(client.discoveredAddresses), maxDiscoveryHints)
+	}
+}
+
+func answerCandidatePong(t *testing.T, client *Client, peerSess *PeeringSession, path Path, sequence uint64, rtt time.Duration) {
 	t.Helper()
-	material := protocol.SessionMaterial{SessionID: [16]byte{2}, TranscriptHash: [32]byte{3}}
-	material.Keys.ControlSend[0] = 1
-	material.Keys.ControlRecv[0] = 2
-	material.Keys.VoiceSend[0] = 3
-	material.Keys.VoiceRecv[0] = 4
-	session, err := newPeeringSession(path, material, time.Now())
+	probe := peerSess.candidateProbe(path)
+	if probe == nil {
+		t.Fatal("candidate probe was not created")
+	}
+	probe.pendingPing = pendingPing{challenge: sequence + 100, path: path, sentAt: time.Now().Add(-rtt)}
+	packet, err := protocol.MarshalControl(protocol.PacketPong, client.roomTag, peerSess.sessionID, sequence, probe.pendingPing.challenge, peerSess.ciphers.ControlRecv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return session
+	client.handleSessionPacketOnPath(packet, path)
+}
+
+func testPeeringSession(t *testing.T, path Path) *PeeringSession {
+	t.Helper()
+	sendKey := [chacha20poly1305.KeySize]byte{1}
+	sendCipher, err := chacha20poly1305.New(sendKey[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiveKey := [chacha20poly1305.KeySize]byte{2}
+	receiveCipher, err := chacha20poly1305.New(receiveKey[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	material := protocol.SessionMaterial{
+		SessionID: [16]byte{2},
+		Ciphers: protocol.SessionCiphers{
+			ControlSend: sendCipher,
+			ControlRecv: receiveCipher,
+		},
+	}
+	return newPeeringSession(path, material, time.Now())
 }
 
 func testHelloClient(t *testing.T) (*Client, *identity.LocalIdentity, []byte) {
@@ -350,38 +370,45 @@ func testHelloClient(t *testing.T) (*Client, *identity.LocalIdentity, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := NewClient(localIdentity, roomInvite, endpoint.Options{}, slog.Default())
+	client := NewClient(localIdentity, roomInvite, networking.Options{Endpoint: endpoint.Options{}}, slog.Default())
 	client.roomNetwork = &fakeRoomNetwork{}
 	if err := client.rotateHelloEpoch(); err != nil {
 		t.Fatal(err)
 	}
+	return client, remoteIdentity, testRemoteHello(t, client, remoteIdentity, 2)
+}
+
+func testRemoteHello(t *testing.T, client *Client, remoteIdentity *identity.LocalIdentity, nonceByte byte) []byte {
+	t.Helper()
 	remotePrivate, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var remotePublic [32]byte
 	copy(remotePublic[:], remotePrivate.PublicKey().Bytes())
-	remoteHello, err := protocol.MarshalHello(client.roomTag, client.admissionKey, remoteIdentity, [16]byte{2}, remotePublic)
+	var nonce [16]byte
+	nonce[0] = nonceByte
+	remoteHello, err := protocol.MarshalHello(client.roomTag, client.admissionKey, remoteIdentity, nonce, remotePublic)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return client, remoteIdentity, remoteHello
+	return remoteHello
 }
 
 func establishHelloSession(t *testing.T, client *Client, remoteIdentity *identity.LocalIdentity, remoteHello []byte, address netip.AddrPort) *PeeringSession {
 	t.Helper()
 	client.handleHello(endpoint.Datagram{Data: remoteHello, From: address})
-	peerRemote := client.remotePeers[remoteIdentity.PeerID()]
-	if peerRemote == nil || peerRemote.candidateSess == nil {
+	remotePeer := client.remotePeers[remoteIdentity.PeerID()]
+	if remotePeer == nil || remotePeer.candidateSession == nil {
 		t.Fatal("Hello did not create a candidate session")
 	}
-	peerSess := peerRemote.candidateSess
+	peerSess := remotePeer.candidateSession
 	pong, err := protocol.MarshalControl(protocol.PacketPong, client.roomTag, peerSess.sessionID, 1, peerSess.pendingPing.challenge, peerSess.ciphers.ControlRecv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	client.handleSessionPacket(endpoint.Datagram{Data: pong, From: address})
-	if peerRemote.peerSess != peerSess || !peerSess.authenticated {
+	if remotePeer.session != peerSess || !peerSess.authenticated {
 		t.Fatal("candidate session was not authenticated")
 	}
 	return peerSess
@@ -398,4 +425,8 @@ func testRemoteIdentity(t *testing.T) identity.Identity {
 		t.Fatal(err)
 	}
 	return peerIdentity
+}
+
+func discoveryBudgetAddress(index int) netip.AddrPort {
+	return netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, byte(index >> 8), byte(index), 1}), 9000)
 }

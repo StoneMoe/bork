@@ -45,7 +45,6 @@ it("pulls the newest revision after a notification during an in-flight request",
   second.resolve(snapshot(2, "capture-b", "playback-b"));
   await waitFor(() => remote.state().revision === 2);
 
-  expect(remote.ready()).toBe(true);
   expect(remote.state().audio.captureDeviceId).toBe("capture-b");
   expect(remote.state().audio.playbackDeviceId).toBe("playback-b");
   expect(reportError).not.toHaveBeenCalled();
@@ -64,7 +63,7 @@ it("reports an asynchronous snapshot error only once per id", async () => {
     return createRemoteState(reportError);
   });
 
-  await waitFor(remote.ready);
+  await waitFor(() => remote.state().revision === 1);
   bridge.listener?.();
   await waitFor(() => bridge.getSnapshot.mock.calls.length === 2);
   expect(reportError).toHaveBeenCalledTimes(1);
@@ -76,10 +75,13 @@ function snapshot(revision: number, captureDeviceId: string, playbackDeviceId: s
   return new app.AppSnapshot({
     revision,
     peerId: "peer",
+    nickname: "",
     audio: {
       available: true,
       running: false,
       muted: false,
+      speaking: false,
+      speakingPeerIds: [],
       captureDeviceId,
       playbackDeviceId,
       captureDevices: [],

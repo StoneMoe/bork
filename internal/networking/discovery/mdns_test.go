@@ -46,6 +46,26 @@ func TestUsableDiscoveryAddress(t *testing.T) {
 	}
 }
 
+func TestConsumeMDNSEntriesEmitsTypedRoomLifetimeHint(t *testing.T) {
+	entries := make(chan *zeroconf.ServiceEntry, 1)
+	hints := make(chan Hint, 1)
+	done := make(chan string, 1)
+	entries <- &zeroconf.ServiceEntry{
+		Text:     []string{"room=room-tag", "hint=other-peer"},
+		Port:     9000,
+		AddrIPv4: []net.IP{net.ParseIP("192.0.2.10")},
+	}
+	close(entries)
+	consumeMDNSEntries(context.Background(), "IPv4", entries, done, "room-tag", "local-peer", true, hints)
+	hint := <-hints
+	if hint.Address != netip.MustParseAddrPort("192.0.2.10:9000") || hint.Source != SourceMDNS || !hint.ExpiresAt.IsZero() {
+		t.Fatalf("mDNS hint = %#v", hint)
+	}
+	if family := <-done; family != "IPv4" {
+		t.Fatalf("completed family = %q", family)
+	}
+}
+
 func TestMDNSDiscoveryDrainsResolverOnCancellation(t *testing.T) {
 	server := &fakeMDNSServer{shutdown: make(chan struct{})}
 	browseStarted := make(chan struct{})
@@ -75,7 +95,7 @@ func TestMDNSDiscoveryDrainsResolverOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		result <- discovery.Run(ctx, [16]byte{1}, netip.MustParseAddrPort("0.0.0.0:9000"), make(chan netip.AddrPort))
+		result <- discovery.Run(ctx, [16]byte{1}, netip.MustParseAddrPort("0.0.0.0:9000"), make(chan Hint))
 	}()
 	waitForTestSignal(t, browseStarted, "mDNS browse start")
 	cancel()
@@ -120,7 +140,7 @@ func TestMDNSDiscoveryDrainsWhenCancellationInterruptsCandidateDelivery(t *testi
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		result <- discovery.Run(ctx, roomTag, netip.MustParseAddrPort("0.0.0.0:9000"), make(chan netip.AddrPort))
+		result <- discovery.Run(ctx, roomTag, netip.MustParseAddrPort("0.0.0.0:9000"), make(chan Hint))
 	}()
 	waitForTestSignal(t, entryDelivered, "candidate delivery attempt")
 	cancel()
@@ -166,7 +186,7 @@ func TestMDNSDiscoveryUsesAvailableAddressFamily(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			result := make(chan error, 1)
 			go func() {
-				result <- discovery.Run(ctx, [16]byte{1}, netip.MustParseAddrPort("[::]:9000"), make(chan netip.AddrPort))
+				result <- discovery.Run(ctx, [16]byte{1}, netip.MustParseAddrPort("[::]:9000"), make(chan Hint))
 			}()
 			waitForTestSignal(t, browseStarted, "available family browse start")
 			first := waitForRequestedFamily(t, requested)
@@ -214,7 +234,7 @@ func TestMDNSDiscoveryClosesPartialResourcesAfterBrowseFailure(t *testing.T) {
 		},
 	}
 
-	err := discovery.Run(context.Background(), [16]byte{1}, netip.MustParseAddrPort("0.0.0.0:9000"), make(chan netip.AddrPort))
+	err := discovery.Run(context.Background(), [16]byte{1}, netip.MustParseAddrPort("0.0.0.0:9000"), make(chan Hint))
 	if !errors.Is(err, browseFailure) {
 		t.Fatalf("Run() error = %v", err)
 	}

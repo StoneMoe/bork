@@ -5,10 +5,7 @@ import (
 	"time"
 )
 
-const (
-	maxReceivedFramesPerSource = 2
-	maxReceiveSources          = 16
-)
+const maxReceivedFramesPerSource = 2
 
 type ReceivedFrame struct {
 	SourceID   string
@@ -75,12 +72,8 @@ func (f *Flow) SubmitReceived(frame ReceivedFrame) bool {
 		return false
 	}
 	f.mu.Lock()
-	queue, exists := f.receivedQueues[frame.SourceID]
-	if !exists {
-		if len(f.receivedQueues) >= maxReceiveSources {
-			f.mu.Unlock()
-			return false
-		}
+	queue := f.receivedQueues[frame.SourceID]
+	if len(queue) == 0 {
 		f.receivedOrder = append(f.receivedOrder, frame.SourceID)
 	}
 	if len(queue) > 0 && queue[0].StreamID != frame.StreamID {

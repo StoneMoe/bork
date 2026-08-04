@@ -6,7 +6,7 @@ import (
 )
 
 type Service interface {
-	Run(context.Context, [16]byte, netip.AddrPort, chan<- netip.AddrPort) error
+	Run(context.Context, [16]byte, netip.AddrPort, chan<- Hint) error
 }
 
 func DefaultServices() []Service {

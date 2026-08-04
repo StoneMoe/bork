@@ -24,7 +24,7 @@ func TestAudioHardwareSmoke(t *testing.T) {
 		t.Fatal("default capture and playback devices are unavailable")
 	}
 	flow := media.NewFlow()
-	if _, err := engine.Start(flow); err != nil {
+	if err := engine.Start(flow); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -37,7 +37,8 @@ func TestAudioHardwareSmoke(t *testing.T) {
 			t.Fatal("capture notification contained no Opus frame")
 		}
 	}
-	if state := engine.Stop(); state.Running || state.Error != "" {
+	engine.Stop()
+	if state := engine.Status(); state.Running || state.Error != "" {
 		t.Fatalf("audio state after Stop() = %#v", state)
 	}
 }

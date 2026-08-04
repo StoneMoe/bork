@@ -10,7 +10,6 @@ import (
 
 type HelloPacket struct {
 	RoomTag      [16]byte
-	Nonce        [16]byte
 	IdentityKey  ed25519.PublicKey
 	EphemeralKey [32]byte
 	wire         [helloPacketSize]byte
@@ -68,8 +67,7 @@ func ParseHello(packet []byte, expectedRoomTag [16]byte, admissionKey [32]byte) 
 
 	var hello HelloPacket
 	hello.RoomTag = roomTag
-	copy(hello.Nonce[:], packet[prefixSize:prefixSize+16])
-	if hello.Nonce == [16]byte{} {
+	if [16]byte(packet[prefixSize:prefixSize+16]) == [16]byte{} {
 		return HelloPacket{}, errors.New("hello nonce is empty")
 	}
 	hello.IdentityKey = publicKey

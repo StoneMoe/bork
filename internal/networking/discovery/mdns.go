@@ -46,7 +46,7 @@ func newMDNSDiscovery() *mdnsDiscovery {
 	}
 }
 
-func (m *mdnsDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddress netip.AddrPort, candidates chan<- netip.AddrPort) error {
+func (m *mdnsDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddress netip.AddrPort, hints chan<- Hint) error {
 	if !listenAddress.IsValid() || listenAddress.Port() == 0 {
 		return errors.New("mDNS requires a non-zero peer port")
 	}
@@ -105,7 +105,7 @@ func (m *mdnsDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddress
 			continue
 		}
 		activeBrowses++
-		go consumeMDNSEntries(browseCtx, family.name, entries, browseDone, roomTagText, peerHint, listenIP.Is4(), candidates)
+		go consumeMDNSEntries(browseCtx, family.name, entries, browseDone, roomTagText, peerHint, listenIP.Is4(), hints)
 	}
 	if activeBrowses == 0 {
 		if ctx.Err() != nil {
@@ -171,7 +171,7 @@ func consumeMDNSEntries(
 	roomTagText string,
 	peerHint string,
 	ipv4Only bool,
-	candidates chan<- netip.AddrPort,
+	hints chan<- Hint,
 ) {
 	defer func() { done <- family }()
 	for entry := range entries {
@@ -193,7 +193,7 @@ func consumeMDNSEntries(
 			}
 			discovered := netip.AddrPortFrom(address, uint16(entry.Port))
 			select {
-			case candidates <- discovered:
+			case hints <- Hint{Address: discovered, Source: SourceMDNS}:
 			case <-ctx.Done():
 				continue
 			}

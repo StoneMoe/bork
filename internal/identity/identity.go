@@ -24,6 +24,8 @@ const (
 	loadRetryDelay      = 10 * time.Millisecond
 )
 
+var errIdentityChanged = errors.New("user identity changed while opening")
+
 type Identity struct {
 	publicKey ed25519.PublicKey
 	peerID    string
@@ -31,7 +33,6 @@ type Identity struct {
 
 type LocalIdentity struct {
 	Identity
-	dataDir    string
 	privateKey ed25519.PrivateKey
 }
 
@@ -43,6 +44,16 @@ func LoadOrCreate(dataDir string) (*LocalIdentity, error) {
 	if err := os.MkdirAll(resolved, 0o700); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
+	directoryInfo, err := os.Lstat(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("inspect data directory: %w", err)
+	}
+	if directoryInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("data directory must not be a symbolic link")
+	}
+	if !directoryInfo.IsDir() {
+		return nil, errors.New("data directory is not a directory")
+	}
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(resolved, 0o700); err != nil {
 			return nil, fmt.Errorf("secure data directory: %w", err)
@@ -50,12 +61,12 @@ func LoadOrCreate(dataDir string) (*LocalIdentity, error) {
 	}
 
 	path := filepath.Join(resolved, identityFilename)
-	identity, err := load(path, resolved)
+	identity, err := load(path)
 	if err == nil {
 		return identity, nil
 	}
-	if isRetryableAccessError(err) {
-		return loadWithRetry(path, resolved)
+	if errors.Is(err, errIdentityChanged) || isRetryableAccessError(err) {
+		return loadWithRetry(path)
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -67,11 +78,11 @@ func LoadOrCreate(dataDir string) (*LocalIdentity, error) {
 	}
 	if err := store(path, resolved, seed); err != nil {
 		if isPublishConflict(err) {
-			return loadWithRetry(path, resolved)
+			return loadWithRetry(path)
 		}
 		return nil, err
 	}
-	return fromSeed(resolved, seed), nil
+	return fromSeed(seed), nil
 }
 
 func store(path, dataDir string, seed []byte) error {
@@ -115,19 +126,8 @@ func (i Identity) PeerID() string {
 	return i.peerID
 }
 
-func (i Identity) ShortID() string {
-	if len(i.peerID) <= 14 {
-		return i.peerID
-	}
-	return i.peerID[:14]
-}
-
 func (i Identity) PublicKey() ed25519.PublicKey {
 	return append(ed25519.PublicKey(nil), i.publicKey...)
-}
-
-func (i Identity) Verify(message, signature []byte) bool {
-	return ed25519.Verify(i.publicKey, message, signature)
 }
 
 func (i *LocalIdentity) Public() crypto.PublicKey {
@@ -139,10 +139,6 @@ func (i *LocalIdentity) Sign(_ io.Reader, message []byte, options crypto.SignerO
 		return nil, errors.New("Ed25519 messages must not be pre-hashed")
 	}
 	return ed25519.Sign(i.privateKey, message), nil
-}
-
-func (i *LocalIdentity) DataDir() string {
-	return i.dataDir
 }
 
 func FromPublicKey(publicKey ed25519.PublicKey) (Identity, error) {
@@ -170,23 +166,45 @@ func resolveDataDir(dataDir string) (string, error) {
 	return resolved, nil
 }
 
-func load(path, dataDir string) (*LocalIdentity, error) {
-	file, err := os.Open(path)
+func load(path string) (*LocalIdentity, error) {
+	return loadFile(path, os.Open)
+}
+
+func loadFile(path string, open func(string) (*os.File, error)) (*LocalIdentity, error) {
+	inspected, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !inspected.Mode().IsRegular() {
+		return nil, errors.New("user identity is not a regular file")
+	}
+	if inspected.Size() > maxIdentityFileSize {
+		return nil, errors.New("user identity is too large")
+	}
+	// Windows populates path-based FileInfo IDs lazily when SameFile is called.
+	if !os.SameFile(inspected, inspected) {
+		return nil, fmt.Errorf("%w: inspected file became unavailable", errIdentityChanged)
+	}
+
+	file, err := open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	info, err := file.Stat()
+	opened, err := file.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("inspect user identity: %w", err)
+		return nil, fmt.Errorf("inspect opened user identity: %w", err)
 	}
-	if !info.Mode().IsRegular() {
-		return nil, errors.New("user identity is not a regular file")
+	if !opened.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: opened file is not regular", errIdentityChanged)
 	}
-	if info.Size() > maxIdentityFileSize {
+	if !os.SameFile(inspected, opened) {
+		return nil, errIdentityChanged
+	}
+	if opened.Size() > maxIdentityFileSize {
 		return nil, errors.New("user identity is too large")
 	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+	if runtime.GOOS != "windows" && opened.Mode().Perm()&0o077 != 0 {
 		if err := file.Chmod(0o600); err != nil {
 			return nil, fmt.Errorf("secure user identity: %w", err)
 		}
@@ -202,13 +220,13 @@ func load(path, dataDir string) (*LocalIdentity, error) {
 	if err != nil || len(seed) != ed25519.SeedSize {
 		return nil, errors.New("user identity is corrupt or unavailable to this account")
 	}
-	return fromSeed(dataDir, seed), nil
+	return fromSeed(seed), nil
 }
 
-func loadWithRetry(path, dataDir string) (*LocalIdentity, error) {
+func loadWithRetry(path string) (*LocalIdentity, error) {
 	var lastErr error
 	for range loadRetryAttempts {
-		identity, err := load(path, dataDir)
+		identity, err := load(path)
 		if err == nil {
 			return identity, nil
 		}
@@ -218,7 +236,7 @@ func loadWithRetry(path, dataDir string) (*LocalIdentity, error) {
 	return nil, lastErr
 }
 
-func fromSeed(dataDir string, seed []byte) *LocalIdentity {
+func fromSeed(seed []byte) *LocalIdentity {
 	privateKey := ed25519.NewKeyFromSeed(seed)
 	publicKey := append(ed25519.PublicKey(nil), privateKey.Public().(ed25519.PublicKey)...)
 	publicIdentity, err := FromPublicKey(publicKey)
@@ -227,7 +245,6 @@ func fromSeed(dataDir string, seed []byte) *LocalIdentity {
 	}
 	return &LocalIdentity{
 		Identity:   publicIdentity,
-		dataDir:    dataDir,
 		privateKey: privateKey,
 	}
 }

@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"crypto/cipher"
+	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
 )
@@ -9,10 +11,12 @@ const (
 	Version    byte = 1
 	wireDomain      = "bork/wire-v1/"
 
-	PacketHello PacketType = 1
-	PacketPing  PacketType = 2
-	PacketPong  PacketType = 3
-	PacketVoice PacketType = 4
+	PacketHello         PacketType = 1
+	PacketPing          PacketType = 2
+	PacketPong          PacketType = 3
+	PacketBridgeControl PacketType = 4
+	PacketGroupDatagram PacketType = 5
+	PacketReliable      PacketType = 6
 
 	prefixSize            = 4 + 1 + 1 + 16
 	establishedHeaderSize = prefixSize + 16 + 8
@@ -26,9 +30,14 @@ const (
 	controlPlaintextSize = 8
 	controlPacketSize    = establishedHeaderSize + controlPlaintextSize + aeadTagSize
 
-	MaxVoicePacketSize      = 1200
-	MaxVoicePayload         = MaxVoicePacketSize - establishedHeaderSize - voicePlaintextFixedSize - aeadTagSize
-	voicePlaintextFixedSize = 4
+	MaxDatagramSize = 1200
+
+	// Group datagrams are sealed once per stream and forwarded verbatim. The
+	// authenticated cleartext header exposes only scheduling/routing metadata.
+	groupDatagramHeaderSize    = prefixSize + 1 + 32 + 16 + 8
+	groupDatagramSignatureSize = ed25519.SignatureSize
+	MaxGroupDatagramPayload    = MaxDatagramSize - groupDatagramHeaderSize - 4 - aeadTagSize - groupDatagramSignatureSize
+	groupDatagramMinPacketSize = groupDatagramHeaderSize + 4 + 1 + aeadTagSize + groupDatagramSignatureSize
 )
 
 type PacketType byte
@@ -60,8 +69,12 @@ func ValidPacketSize(packetType PacketType, size int) bool {
 		return size == helloPacketSize
 	case PacketPing, PacketPong:
 		return size == controlPacketSize
-	case PacketVoice:
-		return size >= establishedHeaderSize+voicePlaintextFixedSize+1+aeadTagSize && size <= MaxVoicePacketSize
+	case PacketBridgeControl:
+		return size >= bridgeMinPacketSize && size <= MaxDatagramSize
+	case PacketGroupDatagram:
+		return size >= groupDatagramMinPacketSize && size <= MaxDatagramSize
+	case PacketReliable:
+		return size >= establishedHeaderSize+reliablePlaintextFixedSize+aeadTagSize && size <= MaxBridgeInnerSize
 	default:
 		return false
 	}
@@ -85,7 +98,7 @@ func ParseEstablishedHeader(packet []byte) (EstablishedHeader, error) {
 		return EstablishedHeader{}, errors.New("established packet is truncated")
 	}
 	packetType, roomTag, err := ParsePrefix(packet)
-	if err != nil || (packetType != PacketPing && packetType != PacketPong && packetType != PacketVoice) {
+	if err != nil || (packetType != PacketPing && packetType != PacketPong && packetType != PacketBridgeControl && packetType != PacketReliable) {
 		return EstablishedHeader{}, errors.New("established packet prefix is invalid")
 	}
 	var header EstablishedHeader
@@ -101,6 +114,10 @@ func ParseEstablishedHeader(packet []byte) (EstablishedHeader, error) {
 
 func establishedNonce(packet []byte) []byte {
 	return packet[establishedHeaderSize-12 : establishedHeaderSize]
+}
+
+func validPairwiseCipher(protector cipher.AEAD) bool {
+	return protector != nil && protector.NonceSize() == 12 && protector.Overhead() == aeadTagSize
 }
 
 func appendUint64(destination []byte, value uint64) []byte {

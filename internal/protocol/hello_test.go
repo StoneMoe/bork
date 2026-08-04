@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
@@ -27,7 +28,8 @@ func TestHelloRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseHello() error = %v", err)
 	}
-	if string(hello.IdentityKey) != string(publicKey) || hello.RoomTag != roomTag || hello.Nonce != nonce || hello.EphemeralKey != ephemeralKey {
+	if !bytes.Equal(hello.IdentityKey, publicKey) || hello.RoomTag != roomTag ||
+		!bytes.Equal(hello.wire[prefixSize:prefixSize+16], nonce[:]) || hello.EphemeralKey != ephemeralKey {
 		t.Fatalf("hello = %#v", hello)
 	}
 	packet[0] ^= 0xff

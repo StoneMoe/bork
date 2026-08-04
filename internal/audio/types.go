@@ -9,6 +9,9 @@ const (
 	maxJitterFrames  = 16
 	streamIdleFrames = 100
 	maxPLCFrames     = 10
+
+	speakingThreshold     = 0.01
+	speakingReleaseFrames = 300 / FrameDuration
 )
 
 type Device struct {
@@ -21,6 +24,8 @@ type Status struct {
 	Available        bool     `json:"available"`
 	Running          bool     `json:"running"`
 	Muted            bool     `json:"muted"`
+	Speaking         bool     `json:"speaking"`
+	SpeakingPeerIDs  []string `json:"speakingPeerIds"`
 	CaptureDeviceID  string   `json:"captureDeviceId"`
 	PlaybackDeviceID string   `json:"playbackDeviceId"`
 	CaptureDevices   []Device `json:"captureDevices"`

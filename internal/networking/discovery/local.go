@@ -32,16 +32,28 @@ type localDatagram struct {
 	from *net.UDPAddr
 }
 
+type localAddressSet map[netip.Addr]struct{}
+
+type localNetworkSnapshot struct {
+	loopback  *net.Interface
+	addresses localAddressSet
+}
+
 type localDiscovery struct {
+	snapshotNetwork  func() (localNetworkSnapshot, error)
 	announceInterval time.Duration
 }
 
 func newLocalDiscovery() *localDiscovery {
-	return &localDiscovery{announceInterval: localAnnounceInterval}
+	return &localDiscovery{snapshotNetwork: snapshotLocalNetwork, announceInterval: localAnnounceInterval}
 }
 
-func (l *localDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddress netip.AddrPort, candidates chan<- netip.AddrPort) error {
-	address, err := loopbackAddress(listenAddress)
+func (l *localDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddress netip.AddrPort, hints chan<- Hint) error {
+	network, err := l.snapshotNetwork()
+	if err != nil {
+		return err
+	}
+	address, err := loopbackAddress(listenAddress, network.addresses)
 	if err != nil {
 		return err
 	}
@@ -49,14 +61,14 @@ func (l *localDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddres
 	if err != nil {
 		return err
 	}
-	announcement, err := marshalLocalAnnouncement(roomTag, peerHint, address)
+	announcement, err := marshalLocalAnnouncement(roomTag, peerHint, address, network.addresses)
 	if err != nil {
 		return err
 	}
-	loopback, err := ipv4LoopbackInterface()
-	if err != nil {
-		return err
+	if network.loopback == nil {
+		return errors.New("no active IPv4 loopback interface for local discovery")
 	}
+	loopback := network.loopback
 	group, err := net.ResolveUDPAddr("udp4", localMulticastAddress)
 	if err != nil {
 		return fmt.Errorf("resolve local discovery multicast address: %w", err)
@@ -95,13 +107,9 @@ func (l *localDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddres
 		return fmt.Errorf("announce local peer: %w", err)
 	}
 
-	interval := l.announceInterval
-	if interval <= 0 {
-		interval = localAnnounceInterval
-	}
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(l.announceInterval)
 	defer ticker.Stop()
-	known := make(map[string]struct{})
+	known := make(localSignatureCache)
 	for {
 		select {
 		case <-ctx.Done():
@@ -122,17 +130,18 @@ func (l *localDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddres
 			if datagram.from == nil || !datagram.from.IP.IsLoopback() {
 				continue
 			}
-			announced, err := parseLocalAnnouncement(datagram.data)
+			announced, err := parseLocalAnnouncement(datagram.data, network.addresses)
 			if err != nil || announced.roomTag != roomTag || announced.peerHint == peerHint {
 				continue
 			}
 			signature := announced.peerHint + "\x00" + announced.address.String()
-			if _, exists := known[signature]; exists || len(known) >= localMaxKnownPeers {
+			now := time.Now()
+			if known.seen(signature, now) {
 				continue
 			}
 			select {
-			case candidates <- announced.address:
-				known[signature] = struct{}{}
+			case hints <- Hint{Address: announced.address, Source: SourceLocal}:
+				known.add(signature, now)
 			case <-ctx.Done():
 				stopReader()
 				return nil
@@ -140,6 +149,31 @@ func (l *localDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddres
 			}
 		}
 	}
+}
+
+type localSignatureCache map[string]time.Time
+
+func (cache localSignatureCache) seen(signature string, now time.Time) bool {
+	if _, exists := cache[signature]; !exists {
+		return false
+	}
+	cache[signature] = now
+	return true
+}
+
+func (cache localSignatureCache) add(signature string, now time.Time) {
+	if len(cache) >= localMaxKnownPeers {
+		oldest := ""
+		var oldestAt time.Time
+		for candidate, lastSeen := range cache {
+			if oldest == "" || lastSeen.Before(oldestAt) {
+				oldest = candidate
+				oldestAt = lastSeen
+			}
+		}
+		delete(cache, oldest)
+	}
+	cache[signature] = now
 }
 
 func readLocalDatagrams(ctx context.Context, conn *net.UDPConn, incoming chan<- localDatagram, done chan<- error) {
@@ -164,14 +198,15 @@ func readLocalDatagrams(ctx context.Context, conn *net.UDPConn, incoming chan<- 
 	}
 }
 
-func ipv4LoopbackInterface() (*net.Interface, error) {
+func snapshotLocalNetwork() (localNetworkSnapshot, error) {
 	interfaces, err := net.Interfaces()
 	if err != nil {
-		return nil, fmt.Errorf("list network interfaces for local discovery: %w", err)
+		return localNetworkSnapshot{}, fmt.Errorf("list network interfaces for local discovery: %w", err)
 	}
+	snapshot := localNetworkSnapshot{addresses: make(localAddressSet)}
 	for index := range interfaces {
 		candidate := &interfaces[index]
-		if candidate.Flags&(net.FlagUp|net.FlagLoopback) != net.FlagUp|net.FlagLoopback {
+		if candidate.Flags&net.FlagUp == 0 {
 			continue
 		}
 		addresses, err := candidate.Addrs()
@@ -180,20 +215,35 @@ func ipv4LoopbackInterface() (*net.Interface, error) {
 		}
 		for _, address := range addresses {
 			ip, _, err := net.ParseCIDR(address.String())
-			if err == nil && ip.To4() != nil && ip.IsLoopback() {
+			if err != nil {
+				continue
+			}
+			parsed, ok := netip.AddrFromSlice(ip)
+			if !ok {
+				continue
+			}
+			parsed = parsed.Unmap().WithZone("")
+			if !parsed.IsValid() || parsed.IsUnspecified() || parsed.IsMulticast() {
+				continue
+			}
+			snapshot.addresses[parsed] = struct{}{}
+			if snapshot.loopback == nil && candidate.Flags&net.FlagLoopback != 0 && parsed.Is4() && parsed.IsLoopback() {
 				copy := *candidate
-				return &copy, nil
+				snapshot.loopback = &copy
 			}
 		}
 	}
-	return nil, errors.New("no active IPv4 loopback interface for local discovery")
+	if snapshot.loopback == nil {
+		return localNetworkSnapshot{}, errors.New("no active IPv4 loopback interface for local discovery")
+	}
+	return snapshot, nil
 }
 
-func marshalLocalAnnouncement(roomTag [16]byte, peerHint string, address netip.AddrPort) ([]byte, error) {
+func marshalLocalAnnouncement(roomTag [16]byte, peerHint string, address netip.AddrPort, localAddresses localAddressSet) ([]byte, error) {
 	if !validPeerHint(peerHint) {
 		return nil, errors.New("local discovery peer hint is invalid")
 	}
-	if !isLoopbackAddress(address) {
+	if !isLocalAddress(address, localAddresses) {
 		return nil, errors.New("local discovery address is not reachable from this host")
 	}
 	encodedAddress := address.String()
@@ -209,7 +259,7 @@ func marshalLocalAnnouncement(roomTag [16]byte, peerHint string, address netip.A
 	return packet, nil
 }
 
-func parseLocalAnnouncement(packet []byte) (localAnnouncement, error) {
+func parseLocalAnnouncement(packet []byte, localAddresses localAddressSet) (localAnnouncement, error) {
 	headerSize := len(localAnnouncementMagic) + 16 + 2
 	if len(packet) < headerSize || len(packet) > localAnnouncementSize() || string(packet[:len(localAnnouncementMagic)]) != localAnnouncementMagic {
 		return localAnnouncement{}, errors.New("local discovery packet header is invalid")
@@ -230,7 +280,7 @@ func parseLocalAnnouncement(packet []byte) (localAnnouncement, error) {
 	}
 	offset += peerLength
 	address, err := netip.ParseAddrPort(string(packet[offset:]))
-	if err != nil || !isLoopbackAddress(address) {
+	if err != nil || !isLocalAddress(address, localAddresses) {
 		return localAnnouncement{}, errors.New("local discovery address is invalid")
 	}
 	announcement.address = address
@@ -253,7 +303,7 @@ func localAnnouncementSize() int {
 	return len(localAnnouncementMagic) + 16 + 2 + localMaxPeerHint + localMaxAddress
 }
 
-func loopbackAddress(listenAddress netip.AddrPort) (netip.AddrPort, error) {
+func loopbackAddress(listenAddress netip.AddrPort, localAddresses localAddressSet) (netip.AddrPort, error) {
 	if !listenAddress.IsValid() || listenAddress.Port() == 0 {
 		return netip.AddrPort{}, errors.New("local discovery requires a valid UDP listen address")
 	}
@@ -266,13 +316,13 @@ func loopbackAddress(listenAddress netip.AddrPort) (netip.AddrPort, error) {
 		}
 	}
 	result := netip.AddrPortFrom(address, listenAddress.Port())
-	if !isLoopbackAddress(result) {
+	if !isLocalAddress(result, localAddresses) {
 		return netip.AddrPort{}, errors.New("UDP listen address is not reachable from this host")
 	}
 	return result, nil
 }
 
-func isLoopbackAddress(address netip.AddrPort) bool {
+func isLocalAddress(address netip.AddrPort, localAddresses localAddressSet) bool {
 	if !address.IsValid() || address.Port() == 0 || address.Addr().IsUnspecified() || address.Addr().IsMulticast() {
 		return false
 	}
@@ -280,28 +330,6 @@ func isLoopbackAddress(address netip.AddrPort) bool {
 		return true
 	}
 	want := address.Addr().Unmap().WithZone("")
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return false
-	}
-	for _, networkInterface := range interfaces {
-		if networkInterface.Flags&net.FlagUp == 0 {
-			continue
-		}
-		addresses, err := networkInterface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, candidate := range addresses {
-			ip, _, err := net.ParseCIDR(candidate.String())
-			if err != nil {
-				continue
-			}
-			parsed, ok := netip.AddrFromSlice(ip)
-			if ok && parsed.Unmap().WithZone("") == want {
-				return true
-			}
-		}
-	}
-	return false
+	_, exists := localAddresses[want]
+	return exists
 }

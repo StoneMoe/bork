@@ -2,12 +2,15 @@ package peer
 
 import (
 	"context"
+	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +19,7 @@ import (
 	"bork/internal/invite"
 	"bork/internal/media"
 	"bork/internal/networking"
+	"bork/internal/networking/discovery"
 	"bork/internal/networking/endpoint"
 	"bork/internal/protocol"
 )
@@ -24,12 +28,13 @@ type roomNetwork interface {
 	Run(context.Context) error
 	Snapshot() networking.RoomSnapshot
 	StateChanges() <-chan struct{}
-	DiscoveredPeers() <-chan netip.AddrPort
+	DiscoveredPeers() <-chan discovery.Hint
 	ControlPackets() <-chan endpoint.Datagram
-	VoicePackets() <-chan endpoint.Datagram
-	SendControl([]byte, netip.AddrPort) error
-	SendVoiceBatch(endpoint.VoiceBatch) error
-	InvalidateVoice(uint64)
+	AudioPackets() <-chan endpoint.Datagram
+	InteractivePackets() <-chan endpoint.Datagram
+	EnqueueControl([]byte, netip.AddrPort) error
+	SendRealtimeBatch(endpoint.RealtimeBatch) error
+	InvalidateRealtime(uint64)
 }
 
 type roomNetworkFactory func() roomNetwork
@@ -37,8 +42,18 @@ type roomNetworkFactory func() roomNetwork
 type ClientSnapshot struct {
 	Name         string
 	Phase        string
-	LocalAddress string
 	RemotePeers  []RemotePeerSnapshot
+	Connectivity ConnectivitySnapshot
+}
+
+type ConnectivitySnapshot struct {
+	KnownAddresses []KnownAddressSnapshot `json:"knownAddresses"`
+}
+
+type KnownAddressSnapshot struct {
+	Address   string `json:"address"`
+	Source    string `json:"source"`
+	ExpiresAt string `json:"expiresAt,omitempty"`
 }
 
 type Client struct {
@@ -47,37 +62,57 @@ type Client struct {
 	logger         *slog.Logger
 	networkFactory roomNetworkFactory
 
-	snapshotMu          sync.RWMutex
-	snapshot            ClientSnapshot
-	roomNetwork         roomNetwork
-	networkSnapshot     networking.RoomSnapshot
-	roomTag             [16]byte
-	admissionKey        [32]byte
-	ephemeralPrivateKey *ecdh.PrivateKey
-	localHello          protocol.HelloPacket
-	helloPacket         []byte
-	associations        map[[32]byte]*PeeringSession
-	discoveredAddresses map[netip.AddrPort]discoveredAddress
-	remotePeers         map[string]*RemotePeer
+	memberStateMu      sync.Mutex
+	desiredMemberState memberState
+	memberStateUpdates chan struct{}
+
+	snapshotMu                 sync.RWMutex
+	snapshot                   ClientSnapshot
+	roomNetwork                roomNetwork
+	networkSnapshot            networking.RoomSnapshot
+	roomTag                    [16]byte
+	admissionKey               [32]byte
+	ephemeralPrivateKey        *ecdh.PrivateKey
+	localHello                 protocol.HelloPacket
+	helloPacket                []byte
+	discoveredAddresses        map[netip.AddrPort]discoveredAddress
+	remotePeers                map[string]*RemotePeer
+	topologyGeneration         uint64
+	topology                   map[string]*topologyPeer
+	groupSenderID              [32]byte
+	groupStreamID              [16]byte
+	groupProtector             cipher.AEAD
+	groupSendSequence          uint64
+	groupStreamPendingTopology bool
+	groupReceivers             map[groupStreamKey]*groupReceiveState
+	fanout                     outboundFanout
+	fanoutDirty                bool
+	reliablePeerCursor         string
+	localMemberState           memberState
 
 	stateChanges chan struct{}
 	started      atomic.Bool
 }
 
-func NewClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, networkOptions endpoint.Options, logger *slog.Logger) *Client {
+func NewClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, networkOptions networking.Options, logger *slog.Logger) *Client {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return newClient(
 		localIdentity,
 		roomInvite,
-		func() roomNetwork { return networking.NewRoomNetwork(roomInvite.RoomTag(), networkOptions, logger) },
+		func() roomNetwork {
+			var trackerIdentity [32]byte
+			copy(trackerIdentity[:], localIdentity.PublicKey())
+			return networking.NewRoomNetwork(roomInvite.RoomTag(), roomInvite.TrackerHash(), trackerIdentity, networkOptions, logger)
+		},
 		logger,
 	)
 }
 
 func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, networkFactory roomNetworkFactory, logger *slog.Logger) *Client {
-	return &Client{
+	groupProtector := protocol.NewGroupDatagramCipher(roomInvite.GroupMediaKey())
+	client := &Client{
 		localIdentity:       localIdentity,
 		roomInvite:          roomInvite,
 		logger:              logger,
@@ -87,33 +122,43 @@ func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, 
 		admissionKey:        roomInvite.AdmissionKey(),
 		discoveredAddresses: make(map[netip.AddrPort]discoveredAddress),
 		remotePeers:         make(map[string]*RemotePeer),
-		associations:        make(map[[32]byte]*PeeringSession),
+		topology:            make(map[string]*topologyPeer),
 		stateChanges:        make(chan struct{}, 1),
+		memberStateUpdates:  make(chan struct{}, 1),
+		localMemberState:    memberState{generation: 1},
+		topologyGeneration:  1,
+		groupProtector:      groupProtector,
+		groupReceivers:      make(map[groupStreamKey]*groupReceiveState),
+		fanoutDirty:         true,
 	}
+	copy(client.groupSenderID[:], localIdentity.PublicKey())
+	return client
 }
 
-func (peerLocal *Client) StateChanges() <-chan struct{} {
-	return peerLocal.stateChanges
+func (c *Client) StateChanges() <-chan struct{} {
+	return c.stateChanges
 }
 
-func (peerLocal *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
-	if !peerLocal.started.CompareAndSwap(false, true) {
+func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
+	if !c.started.CompareAndSwap(false, true) {
 		return errors.New("peer client has already been started")
 	}
-	if err := peerLocal.rotateHelloEpoch(); err != nil {
+	if err := c.rotateHelloEpoch(); err != nil {
 		return err
 	}
+	c.initGroupStream()
+	c.applyDesiredMemberState()
 
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	roomNetwork := peerLocal.networkFactory()
-	peerLocal.roomNetwork = roomNetwork
+	roomNetwork := c.networkFactory()
+	c.roomNetwork = roomNetwork
 	if mediaPort != nil {
-		mediaPort.SetSendInvalidator(roomNetwork.InvalidateVoice)
+		mediaPort.SetSendInvalidator(roomNetwork.InvalidateRealtime)
 		defer mediaPort.SetSendInvalidator(nil)
 	}
 	defer func() {
-		peerLocal.roomNetwork = nil
+		c.roomNetwork = nil
 	}()
 
 	networkResult := make(chan error, 1)
@@ -121,10 +166,12 @@ func (peerLocal *Client) Loop(parent context.Context, mediaPort media.PeerPort) 
 	networkChanges := roomNetwork.StateChanges()
 	discoveredPeers := roomNetwork.DiscoveredPeers()
 	controlPackets := roomNetwork.ControlPackets()
-	voicePackets := roomNetwork.VoicePackets()
+	audioPackets := roomNetwork.AudioPackets()
+	interactivePackets := roomNetwork.InteractivePackets()
 	helloTicker := time.NewTicker(helloInterval)
 	pingTicker := time.NewTicker(pingInterval)
-	cleanupTicker := time.NewTicker(time.Second)
+	cleanupTicker := time.NewTicker(cleanupInterval)
+	reliableTicker := time.NewTicker(reliableInterval)
 	var sendReady <-chan struct{}
 	if mediaPort != nil {
 		sendReady = mediaPort.SendReady()
@@ -132,43 +179,99 @@ func (peerLocal *Client) Loop(parent context.Context, mediaPort media.PeerPort) 
 	defer helloTicker.Stop()
 	defer pingTicker.Stop()
 	defer cleanupTicker.Stop()
+	defer reliableTicker.Stop()
 
 	for {
+		realtimeEvents := 0
+		for realtimeEvents < maxRealtimeEventsPerTurn {
+			handled := false
+			select {
+			case packet, ok := <-audioPackets:
+				if !ok {
+					audioPackets = nil
+				} else {
+					c.handlePacket(packet, mediaPort)
+					realtimeEvents++
+				}
+				handled = true
+			case <-sendReady:
+				mediaPort.ConsumeSend(c.sendGroupMedia)
+				realtimeEvents++
+				handled = true
+			default:
+			}
+			if !handled {
+				break
+			}
+		}
+		if realtimeEvents == maxRealtimeEventsPerTurn {
+			select {
+			case packet, ok := <-controlPackets:
+				if !ok {
+					controlPackets = nil
+				} else {
+					c.handlePacket(packet, mediaPort)
+				}
+				continue
+			default:
+			}
+		}
 		select {
+		case <-c.memberStateUpdates:
+			c.applyDesiredMemberState()
 		case _, ok := <-networkChanges:
 			if !ok {
 				networkChanges = nil
 				continue
 			}
-			peerLocal.applyNetworkSnapshot(roomNetwork.Snapshot())
-		case address := <-discoveredPeers:
-			peerLocal.addDiscoveredAddress(address)
-			peerLocal.sendHello(address)
+			c.applyNetworkSnapshot(roomNetwork.Snapshot())
+		case hint, ok := <-discoveredPeers:
+			if !ok {
+				discoveredPeers = nil
+				continue
+			}
+			c.addDiscoveryHint(hint)
 		case packet, ok := <-controlPackets:
 			if !ok {
 				controlPackets = nil
 				continue
 			}
-			peerLocal.handlePacket(packet, mediaPort)
-		case packet, ok := <-voicePackets:
+			c.handlePacket(packet, mediaPort)
+		case packet, ok := <-audioPackets:
 			if !ok {
-				voicePackets = nil
+				audioPackets = nil
 				continue
 			}
-			peerLocal.handlePacket(packet, mediaPort)
+			c.handlePacket(packet, mediaPort)
+		case packet, ok := <-interactivePackets:
+			if !ok {
+				interactivePackets = nil
+				continue
+			}
+			c.handlePacket(packet, mediaPort)
 		case <-sendReady:
-			mediaPort.ConsumeSend(peerLocal.sendMedia)
-		case <-helloTicker.C:
-			peerLocal.sendHellos()
+			mediaPort.ConsumeSend(c.sendGroupMedia)
+		case now := <-helloTicker.C:
+			c.sendHellos(now)
+			c.sendBridgeHellos(now)
+			c.queueTopologySnapshots(now, false)
 		case <-pingTicker.C:
-			peerLocal.sendPings()
-		case <-cleanupTicker.C:
-			peerLocal.expireRemotePeers()
+			c.sendPings()
+		case now := <-reliableTicker.C:
+			c.queueMemberStates()
+			c.sendReliable(now)
+		case now := <-cleanupTicker.C:
+			c.expireRemotePeers()
+			if c.expireDiscoveryHints(now) {
+				c.publishStateChange()
+			}
+			c.expireTopology(now)
+			c.expireGroupStreams(now)
 		case err := <-networkResult:
 			if ctx.Err() != nil {
 				return nil
 			}
-			peerLocal.applyNetworkSnapshot(roomNetwork.Snapshot())
+			c.applyNetworkSnapshot(roomNetwork.Snapshot())
 			return err
 		case <-ctx.Done():
 			<-networkResult
@@ -177,7 +280,7 @@ func (peerLocal *Client) Loop(parent context.Context, mediaPort media.PeerPort) 
 	}
 }
 
-func (peerLocal *Client) rotateHelloEpoch() error {
+func (c *Client) rotateHelloEpoch() error {
 	privateKey, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return fmt.Errorf("generate X25519 key: %w", err)
@@ -188,98 +291,98 @@ func (peerLocal *Client) rotateHelloEpoch() error {
 	}
 	var publicKey [32]byte
 	copy(publicKey[:], privateKey.PublicKey().Bytes())
-	helloPacket, err := protocol.MarshalHello(peerLocal.roomTag, peerLocal.admissionKey, peerLocal.localIdentity, nonce, publicKey)
+	helloPacket, err := protocol.MarshalHello(c.roomTag, c.admissionKey, c.localIdentity, nonce, publicKey)
 	if err != nil {
 		return fmt.Errorf("marshal local hello: %w", err)
 	}
-	localHello, err := protocol.ParseHello(helloPacket, peerLocal.roomTag, peerLocal.admissionKey)
+	localHello, err := protocol.ParseHello(helloPacket, c.roomTag, c.admissionKey)
 	if err != nil {
 		return fmt.Errorf("parse local hello: %w", err)
 	}
-	peerLocal.ephemeralPrivateKey = privateKey
-	peerLocal.helloPacket = helloPacket
-	peerLocal.localHello = localHello
-
-	retained := make(map[[32]byte]*PeeringSession, len(peerLocal.remotePeers)*2)
-	for _, peerRemote := range peerLocal.remotePeers {
-		if peerRemote.peerSess != nil {
-			retained[peerRemote.peerSess.transcriptHash] = peerRemote.peerSess
-		}
-		if peerRemote.candidateSess != nil {
-			retained[peerRemote.candidateSess.transcriptHash] = peerRemote.candidateSess
-		}
-	}
-	peerLocal.associations = retained
+	c.ephemeralPrivateKey = privateKey
+	c.helloPacket = helloPacket
+	c.localHello = localHello
 	return nil
 }
 
-func (peerLocal *Client) Snapshot() ClientSnapshot {
-	snapshot, _ := peerLocal.StateSnapshot()
-	return snapshot
+func (c *Client) RemotePeerCount() int {
+	c.snapshotMu.RLock()
+	defer c.snapshotMu.RUnlock()
+	return len(c.snapshot.RemotePeers)
 }
 
-func (peerLocal *Client) NetworkSnapshot() networking.RoomSnapshot {
-	_, snapshot := peerLocal.StateSnapshot()
-	return snapshot
-}
-
-func (peerLocal *Client) StateSnapshot() (ClientSnapshot, networking.RoomSnapshot) {
-	peerLocal.snapshotMu.RLock()
-	defer peerLocal.snapshotMu.RUnlock()
-	snapshot := peerLocal.snapshot
+func (c *Client) StateSnapshot() (ClientSnapshot, networking.RoomSnapshot) {
+	c.snapshotMu.RLock()
+	defer c.snapshotMu.RUnlock()
+	snapshot := c.snapshot
 	snapshot.RemotePeers = append([]RemotePeerSnapshot{}, snapshot.RemotePeers...)
-	networkSnapshot := networking.RoomSnapshot{
-		Endpoint: endpoint.Snapshot{
-			ListenAddress: peerLocal.networkSnapshot.Endpoint.ListenAddress,
-			Candidates:    append([]endpoint.Candidate{}, peerLocal.networkSnapshot.Endpoint.Candidates...),
-			STUN:          append([]endpoint.STUNResult{}, peerLocal.networkSnapshot.Endpoint.STUN...),
-		},
-		NetworkError:   peerLocal.networkSnapshot.NetworkError,
-		DiscoveryError: peerLocal.networkSnapshot.DiscoveryError,
-	}
-	return snapshot, networkSnapshot
+	snapshot.Connectivity.KnownAddresses = append([]KnownAddressSnapshot{}, snapshot.Connectivity.KnownAddresses...)
+	return snapshot, c.networkSnapshot.Clone()
 }
 
-func (peerLocal *Client) EncodedInvite() string { return peerLocal.roomInvite.Encode() }
+func (c *Client) EncodedInvite() string { return c.roomInvite.Encode() }
 
-func (peerLocal *Client) applyNetworkSnapshot(snapshot networking.RoomSnapshot) {
-	peerLocal.snapshotMu.Lock()
-	peerLocal.networkSnapshot = snapshot
-	peerLocal.refreshSnapshotLocked()
-	peerLocal.snapshotMu.Unlock()
+func (c *Client) applyNetworkSnapshot(snapshot networking.RoomSnapshot) {
+	if !slices.Equal(c.networkSnapshot.Endpoint.Candidates, snapshot.Endpoint.Candidates) {
+		c.markTopologyDirty()
+	}
+	c.snapshotMu.Lock()
+	c.networkSnapshot = snapshot
+	c.refreshSnapshotLocked()
+	c.snapshotMu.Unlock()
 	select {
-	case peerLocal.stateChanges <- struct{}{}:
+	case c.stateChanges <- struct{}{}:
 	default:
 	}
 }
 
-func (peerLocal *Client) phase() string {
-	for _, peerRemote := range peerLocal.remotePeers {
-		if peerRemote.peerSess != nil && peerRemote.peerSess.authenticated {
+func (c *Client) phase() string {
+	for _, peer := range c.remotePeers {
+		if peer.session != nil && peer.session.authenticated {
 			return "connected"
 		}
 	}
-	if peerLocal.networkSnapshot.Endpoint.ListenAddress != "" {
+	if c.networkSnapshot.Endpoint.ListenAddress != "" {
 		return "discovering"
 	}
 	return "gathering"
 }
 
-func (peerLocal *Client) publishStateChange() {
-	peerLocal.snapshotMu.Lock()
-	peerLocal.refreshSnapshotLocked()
-	peerLocal.snapshotMu.Unlock()
+func (c *Client) publishStateChange() {
+	c.snapshotMu.Lock()
+	c.refreshSnapshotLocked()
+	c.snapshotMu.Unlock()
 	select {
-	case peerLocal.stateChanges <- struct{}{}:
+	case c.stateChanges <- struct{}{}:
 	default:
 	}
 }
 
-func (peerLocal *Client) refreshSnapshotLocked() {
-	peerLocal.snapshot = ClientSnapshot{
-		Name:         peerLocal.roomInvite.DisplayName,
-		Phase:        peerLocal.phase(),
-		LocalAddress: peerLocal.networkSnapshot.Endpoint.ListenAddress,
-		RemotePeers:  peerLocal.remotePeerSnapshots(),
+func (c *Client) refreshSnapshotLocked() {
+	c.snapshot = ClientSnapshot{
+		Name:         c.roomInvite.DisplayName,
+		Phase:        c.phase(),
+		RemotePeers:  c.remotePeerSnapshots(),
+		Connectivity: c.connectivitySnapshot(),
 	}
+}
+
+func (c *Client) connectivitySnapshot() ConnectivitySnapshot {
+	knownAddresses := make([]KnownAddressSnapshot, 0, len(c.discoveredAddresses))
+	for address, remembered := range c.discoveredAddresses {
+		expiresAt := ""
+		if !remembered.expiresAt.IsZero() {
+			expiresAt = remembered.expiresAt.UTC().Format(time.RFC3339)
+		}
+		knownAddresses = append(knownAddresses, KnownAddressSnapshot{
+			Address: address.String(), Source: string(remembered.source), ExpiresAt: expiresAt,
+		})
+	}
+	sort.Slice(knownAddresses, func(i, j int) bool {
+		if knownAddresses[i].Source != knownAddresses[j].Source {
+			return knownAddresses[i].Source < knownAddresses[j].Source
+		}
+		return knownAddresses[i].Address < knownAddresses[j].Address
+	})
+	return ConnectivitySnapshot{KnownAddresses: knownAddresses}
 }

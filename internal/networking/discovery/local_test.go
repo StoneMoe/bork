@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -21,7 +22,7 @@ func TestLocalDiscoverySeparatesRooms(t *testing.T) {
 	second := testLocalDiscovery()
 	firstRoom := testRoomTag(t)
 	secondRoom := testRoomTag(t)
-	found := make(chan netip.AddrPort, 2)
+	found := make(chan Hint, 2)
 	ctx, cancel := context.WithCancel(context.Background())
 	firstDone := make(chan error, 1)
 	secondDone := make(chan error, 1)
@@ -69,7 +70,7 @@ func TestLocalDiscoveryAcrossProcesses(t *testing.T) {
 	})
 
 	local := testLocalDiscovery()
-	found := make(chan netip.AddrPort, 2)
+	found := make(chan Hint, 2)
 	ctx, cancel := context.WithCancel(context.Background())
 	localDone := make(chan error, 1)
 	go func() {
@@ -107,14 +108,14 @@ func TestLocalDiscoveryHelper(t *testing.T) {
 	local := testLocalDiscovery()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	found := make(chan netip.AddrPort, 2)
+	found := make(chan Hint, 2)
 	done := make(chan error, 1)
 	go func() {
 		done <- local.Run(ctx, roomTag, netip.MustParseAddrPort("127.0.0.1:41002"), found)
 	}()
 	select {
 	case peer := <-found:
-		fmt.Printf("FOUND %s\n", peer)
+		fmt.Printf("FOUND %s\n", peer.Address)
 		time.Sleep(100 * time.Millisecond)
 		cancel()
 		if err := <-done; err != nil {
@@ -136,11 +137,11 @@ func TestLocalAnnouncementRoundTrip(t *testing.T) {
 		peerHint: "peer-a",
 		address:  netip.MustParseAddrPort("[::1]:41001"),
 	}
-	packet, err := marshalLocalAnnouncement(want.roomTag, want.peerHint, want.address)
+	packet, err := marshalLocalAnnouncement(want.roomTag, want.peerHint, want.address, nil)
 	if err != nil {
 		t.Fatalf("marshalLocalAnnouncement() error = %v", err)
 	}
-	got, err := parseLocalAnnouncement(packet)
+	got, err := parseLocalAnnouncement(packet, nil)
 	if err != nil {
 		t.Fatalf("parseLocalAnnouncement() error = %v", err)
 	}
@@ -160,7 +161,7 @@ func TestLocalAnnouncementRoundTrip(t *testing.T) {
 	invalidAddress[len(invalidAddress)-1] ^= 0xff
 	tests = append(tests, invalidAddress)
 	for index, malformed := range tests {
-		if _, err := parseLocalAnnouncement(malformed); err == nil {
+		if _, err := parseLocalAnnouncement(malformed, nil); err == nil {
 			t.Fatalf("parseLocalAnnouncement() error = nil for malformed packet %d", index)
 		}
 	}
@@ -201,7 +202,7 @@ func TestReadLocalDatagramsDropsOversizedDatagramAndContinues(t *testing.T) {
 	if _, err := sender.WriteToUDP(make([]byte, localAnnouncementSize()+2), destination); err != nil {
 		t.Fatalf("write oversized datagram: %v", err)
 	}
-	want, err := marshalLocalAnnouncement([16]byte{1}, "peer-a", netip.MustParseAddrPort("127.0.0.1:41001"))
+	want, err := marshalLocalAnnouncement([16]byte{1}, "peer-a", netip.MustParseAddrPort("127.0.0.1:41001"), nil)
 	if err != nil {
 		t.Fatalf("marshalLocalAnnouncement() error = %v", err)
 	}
@@ -223,24 +224,102 @@ func TestReadLocalDatagramsDropsOversizedDatagramAndContinues(t *testing.T) {
 }
 
 func TestLocalAnnouncementRejectsNonLocalAddress(t *testing.T) {
-	if _, err := marshalLocalAnnouncement([16]byte{1}, "peer-a", netip.MustParseAddrPort("192.0.2.1:41001")); err == nil {
+	if _, err := marshalLocalAnnouncement([16]byte{1}, "peer-a", netip.MustParseAddrPort("192.0.2.1:41001"), nil); err == nil {
 		t.Fatal("marshalLocalAnnouncement() error = nil for non-local address")
 	}
 }
 
 func TestLoopbackAddressUsesMatchingFamily(t *testing.T) {
-	ipv4, err := loopbackAddress(netip.MustParseAddrPort("0.0.0.0:7000"))
+	ipv4, err := loopbackAddress(netip.MustParseAddrPort("0.0.0.0:7000"), nil)
 	if err != nil || ipv4 != netip.MustParseAddrPort("127.0.0.1:7000") {
 		t.Fatalf("IPv4 loopbackAddress() = %v, %v", ipv4, err)
 	}
-	ipv6, err := loopbackAddress(netip.MustParseAddrPort("[::]:7000"))
+	ipv6, err := loopbackAddress(netip.MustParseAddrPort("[::]:7000"), nil)
 	if err != nil || ipv6 != netip.MustParseAddrPort("[::1]:7000") {
 		t.Fatalf("IPv6 loopbackAddress() = %v, %v", ipv6, err)
 	}
 }
 
+func TestLocalSignatureCacheEvictsOldestUnderChurn(t *testing.T) {
+	cache := make(localSignatureCache)
+	started := time.Unix(1000, 0)
+	for index := range localMaxKnownPeers {
+		cache.add(fmt.Sprintf("peer-%03d", index), started.Add(time.Duration(index)*time.Second))
+	}
+	if !cache.seen("peer-000", started.Add(time.Hour)) {
+		t.Fatal("existing signature was not recognized")
+	}
+	cache.add("new-peer", started.Add(2*time.Hour))
+	if len(cache) != localMaxKnownPeers {
+		t.Fatalf("signature cache size = %d, want %d", len(cache), localMaxKnownPeers)
+	}
+	if _, exists := cache["peer-001"]; exists {
+		t.Fatal("oldest signature was not evicted")
+	}
+	if _, exists := cache["peer-000"]; !exists {
+		t.Fatal("recently seen signature was evicted")
+	}
+	if _, exists := cache["new-peer"]; !exists {
+		t.Fatal("unseen signature was permanently rejected at capacity")
+	}
+}
+
+func TestLocalAddressSnapshotHandlesLoopbackAndLinkLocal(t *testing.T) {
+	assigned := localAddressSet{netip.MustParseAddr("fe80::1"): {}}
+	if !isLocalAddress(netip.MustParseAddrPort("127.0.0.1:41000"), nil) {
+		t.Fatal("loopback address required an interface snapshot")
+	}
+	if !isLocalAddress(netip.MustParseAddrPort("[fe80::1%test]:41000"), assigned) {
+		t.Fatal("assigned link-local address was rejected")
+	}
+	if isLocalAddress(netip.MustParseAddrPort("[fe80::2%test]:41000"), assigned) {
+		t.Fatal("unassigned link-local address was accepted")
+	}
+}
+
+func TestLocalDiscoverySnapshotsInterfacesOnceDuringAnnouncementChurn(t *testing.T) {
+	network, err := snapshotLocalNetwork()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	first := testLocalDiscovery()
+	first.snapshotNetwork = func() (localNetworkSnapshot, error) {
+		if calls.Add(1) != 1 {
+			return localNetworkSnapshot{}, errors.New("network interfaces changed")
+		}
+		return network, nil
+	}
+	second := testLocalDiscovery()
+	roomTag := testRoomTag(t)
+	firstFound := make(chan Hint, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() {
+		firstDone <- first.Run(ctx, roomTag, netip.MustParseAddrPort("127.0.0.1:41101"), firstFound)
+	}()
+	go func() {
+		secondDone <- second.Run(ctx, roomTag, netip.MustParseAddrPort("127.0.0.1:41102"), make(chan Hint, 2))
+	}()
+	waitForPeer(t, firstFound, netip.MustParseAddrPort("127.0.0.1:41102"))
+	time.Sleep(100 * time.Millisecond)
+	if calls.Load() != 1 {
+		t.Fatalf("interface snapshot calls = %d, want 1", calls.Load())
+	}
+	cancel()
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func testLocalDiscovery() *localDiscovery {
-	return &localDiscovery{announceInterval: 20 * time.Millisecond}
+	local := newLocalDiscovery()
+	local.announceInterval = 20 * time.Millisecond
+	return local
 }
 
 func testRoomTag(t *testing.T) [16]byte {
@@ -252,11 +331,11 @@ func testRoomTag(t *testing.T) [16]byte {
 	return roomTag
 }
 
-func waitForPeer(t *testing.T, found <-chan netip.AddrPort, address netip.AddrPort) {
+func waitForPeer(t *testing.T, found <-chan Hint, address netip.AddrPort) {
 	t.Helper()
 	select {
 	case peer := <-found:
-		if peer != address {
+		if peer.Address != address || peer.Source != SourceLocal || !peer.ExpiresAt.IsZero() {
 			t.Fatalf("found peer = %#v, want %s", peer, address)
 		}
 	case <-time.After(3 * time.Second):
@@ -265,13 +344,13 @@ func waitForPeer(t *testing.T, found <-chan netip.AddrPort, address netip.AddrPo
 }
 
 func FuzzParseLocalAnnouncement(f *testing.F) {
-	packet, err := marshalLocalAnnouncement([16]byte{1}, "peer-a", netip.MustParseAddrPort("127.0.0.1:41001"))
+	packet, err := marshalLocalAnnouncement([16]byte{1}, "peer-a", netip.MustParseAddrPort("127.0.0.1:41001"), nil)
 	if err != nil {
 		f.Fatal(err)
 	}
 	f.Add(packet)
 	f.Add([]byte("not-local-discovery"))
 	f.Fuzz(func(t *testing.T, packet []byte) {
-		_, _ = parseLocalAnnouncement(packet)
+		_, _ = parseLocalAnnouncement(packet, nil)
 	})
 }

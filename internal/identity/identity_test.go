@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -30,14 +31,8 @@ func TestLoadOrCreatePersistsIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sign() error = %v", err)
 	}
-	if !first.Verify(message, signature) {
+	if !ed25519.Verify(first.PublicKey(), message, signature) {
 		t.Fatal("signature did not verify")
-	}
-	if first.DataDir() != dir {
-		resolved, _ := filepath.Abs(dir)
-		if first.DataDir() != resolved {
-			t.Fatalf("DataDir() = %q, want %q", first.DataDir(), resolved)
-		}
 	}
 
 	if runtime.GOOS != "windows" {
@@ -97,6 +92,107 @@ func TestLoadOrCreateConcurrent(t *testing.T) {
 		}
 		if identity.PeerID() != peerID {
 			t.Fatalf("concurrent identity mismatch: %q != %q", identity.PeerID(), peerID)
+		}
+	}
+}
+
+func TestLoadOrCreateRejectsIdentitySymlinkWithoutChmodTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "target.key")
+	if err := os.WriteFile(target, []byte("not an identity"), 0o666); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(target, 0o666); err != nil {
+			t.Fatalf("Chmod() error = %v", err)
+		}
+	}
+	before, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, identityFilename)); err != nil {
+		t.Skipf("Symlink() unavailable: %v", err)
+	}
+
+	if _, err := LoadOrCreate(dir); err == nil || err.Error() != "user identity is not a regular file" {
+		t.Fatalf("LoadOrCreate() error = %v, want non-regular identity error", err)
+	}
+	after, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("Stat() after load error = %v", err)
+	}
+	if after.Mode().Perm() != before.Mode().Perm() {
+		t.Fatalf("symlink target permissions = %o, want unchanged %o", after.Mode().Perm(), before.Mode().Perm())
+	}
+}
+
+func TestLoadOrCreateRejectsDataDirectorySymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+	before, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	dataDir := filepath.Join(root, "data")
+	if err := os.Symlink(target, dataDir); err != nil {
+		t.Skipf("Symlink() unavailable: %v", err)
+	}
+
+	if _, err := LoadOrCreate(dataDir); err == nil || err.Error() != "data directory must not be a symbolic link" {
+		t.Fatalf("LoadOrCreate() error = %v, want data-directory symlink error", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, identityFilename)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("identity in symlink target Stat() error = %v, want not exist", err)
+	}
+	after, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("Stat() after load error = %v", err)
+	}
+	if after.Mode().Perm() != before.Mode().Perm() {
+		t.Fatalf("data-directory symlink target permissions = %o, want unchanged %o", after.Mode().Perm(), before.Mode().Perm())
+	}
+}
+
+func TestLoadRejectsReplacementBetweenInspectionAndOpen(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := LoadOrCreate(dir); err != nil {
+		t.Fatalf("LoadOrCreate() error = %v", err)
+	}
+	path := filepath.Join(dir, identityFilename)
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	replacedPath := filepath.Join(dir, "original.key")
+
+	_, err = loadFile(path, func(path string) (*os.File, error) {
+		if err := os.Rename(path, replacedPath); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(path, contents, 0o666); err != nil {
+			return nil, err
+		}
+		if runtime.GOOS != "windows" {
+			if err := os.Chmod(path, 0o666); err != nil {
+				return nil, err
+			}
+		}
+		return os.Open(path)
+	})
+	if !errors.Is(err, errIdentityChanged) {
+		t.Fatalf("loadFile() error = %v, want identity-changed error", err)
+	}
+	if runtime.GOOS != "windows" {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			t.Fatalf("Stat() error = %v", statErr)
+		}
+		if info.Mode().Perm()&0o077 == 0 {
+			t.Fatalf("replacement permissions = %o, want unchanged permissive mode", info.Mode().Perm())
 		}
 	}
 }

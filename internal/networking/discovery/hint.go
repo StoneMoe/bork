@@ -4,7 +4,25 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net/netip"
+	"time"
 )
+
+type Source string
+
+const (
+	SourceLocal         Source = "local"
+	SourceMDNS          Source = "mdns"
+	SourceTracker       Source = "tracker"
+	SourceTopology      Source = "topology"
+	SourceAuthenticated Source = "authenticated"
+)
+
+type Hint struct {
+	Address   netip.AddrPort
+	Source    Source
+	ExpiresAt time.Time
+}
 
 func newPeerHint() (string, error) {
 	var random [8]byte

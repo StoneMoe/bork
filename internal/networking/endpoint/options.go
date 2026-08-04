@@ -8,11 +8,6 @@ const (
 	defaultSTUNRefresh   = 5 * time.Minute
 )
 
-var defaultSTUNServers = []string{
-	"stun.cloudflare.com:3478",
-	"stun.l.google.com:19302",
-}
-
 type Options struct {
 	ListenAddress string
 	STUNServers   []string
@@ -33,10 +28,16 @@ type Snapshot struct {
 	STUN          []STUNResult `json:"stun"`
 }
 
+func (s Snapshot) Clone() Snapshot {
+	s.Candidates = append([]Candidate{}, s.Candidates...)
+	s.STUN = append([]STUNResult{}, s.STUN...)
+	return s
+}
+
 func DefaultOptions() Options {
 	return Options{
 		ListenAddress: defaultListenAddress,
-		STUNServers:   append([]string(nil), defaultSTUNServers...),
+		STUNServers:   []string{},
 		STUNTimeout:   defaultSTUNTimeout,
 		STUNRefresh:   defaultSTUNRefresh,
 	}
@@ -46,11 +47,7 @@ func normalizeOptions(options Options) Options {
 	if options.ListenAddress == "" {
 		options.ListenAddress = defaultListenAddress
 	}
-	if options.STUNServers == nil {
-		options.STUNServers = append([]string(nil), defaultSTUNServers...)
-	} else {
-		options.STUNServers = append([]string{}, options.STUNServers...)
-	}
+	options.STUNServers = append([]string{}, options.STUNServers...)
 	if options.STUNTimeout <= 0 {
 		options.STUNTimeout = defaultSTUNTimeout
 	}
@@ -58,10 +55,4 @@ func normalizeOptions(options Options) Options {
 		options.STUNRefresh = 0
 	}
 	return options
-}
-
-func cloneSnapshot(snapshot Snapshot) Snapshot {
-	snapshot.Candidates = append([]Candidate{}, snapshot.Candidates...)
-	snapshot.STUN = append([]STUNResult{}, snapshot.STUN...)
-	return snapshot
 }

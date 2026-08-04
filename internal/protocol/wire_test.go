@@ -13,7 +13,7 @@ func TestWireV1RejectsOtherVersionsAndZeroEstablishedSequence(t *testing.T) {
 	if _, _, err := ParsePrefix(wrongVersion); err == nil {
 		t.Fatal("ParsePrefix() accepted wire version 2")
 	}
-	packet := appendEstablishedHeader(nil, PacketVoice, [16]byte{1}, [16]byte{2}, 0)
+	packet := appendEstablishedHeader(nil, PacketPing, [16]byte{1}, [16]byte{2}, 0)
 	if _, err := ParseEstablishedHeader(packet); err == nil {
 		t.Fatal("ParseEstablishedHeader() accepted sequence zero")
 	}
@@ -22,7 +22,7 @@ func TestWireV1RejectsOtherVersionsAndZeroEstablishedSequence(t *testing.T) {
 func TestEstablishedHeaderKeepsRoomRoutingFieldsClear(t *testing.T) {
 	roomTag := [16]byte{1, 2}
 	sessionID := [16]byte{3, 4}
-	packet := appendEstablishedHeader(nil, PacketVoice, roomTag, sessionID, 9)
+	packet := appendEstablishedHeader(nil, PacketPing, roomTag, sessionID, 9)
 	header, err := ParseEstablishedHeader(packet)
 	if err != nil {
 		t.Fatal(err)
@@ -33,10 +33,10 @@ func TestEstablishedHeaderKeepsRoomRoutingFieldsClear(t *testing.T) {
 }
 
 func TestValidPacketSizeRejectsPrefixOnlyPackets(t *testing.T) {
-	if ValidPacketSize(PacketHello, prefixSize) || ValidPacketSize(PacketPing, prefixSize) || ValidPacketSize(PacketVoice, prefixSize) {
+	if ValidPacketSize(PacketHello, prefixSize) || ValidPacketSize(PacketPing, prefixSize) || ValidPacketSize(PacketBridgeControl, prefixSize) || ValidPacketSize(PacketGroupDatagram, prefixSize) {
 		t.Fatal("ValidPacketSize() accepted a prefix-only packet")
 	}
-	if !ValidPacketSize(PacketHello, helloPacketSize) || !ValidPacketSize(PacketPing, controlPacketSize) || !ValidPacketSize(PacketVoice, MaxVoicePacketSize) {
+	if !ValidPacketSize(PacketHello, helloPacketSize) || !ValidPacketSize(PacketPing, controlPacketSize) || !ValidPacketSize(PacketBridgeControl, bridgeMinPacketSize) || !ValidPacketSize(PacketGroupDatagram, MaxDatagramSize) {
 		t.Fatal("ValidPacketSize() rejected a valid packet size")
 	}
 }

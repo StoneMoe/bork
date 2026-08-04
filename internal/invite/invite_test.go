@@ -7,6 +7,43 @@ import (
 	"testing"
 )
 
+func TestInviteUsesCompactBase58Payload(t *testing.T) {
+	var roomSeed [RoomSeedSize]byte
+	for index := range roomSeed {
+		roomSeed[index] = byte(index + 1)
+	}
+	roomInvite := Invite{DisplayName: "room", roomSeed: roomSeed}
+	encoded := strings.TrimPrefix(roomInvite.Encode(), prefix)
+	for _, excluded := range "0OIl-_=" {
+		if strings.ContainsRune(encoded, excluded) {
+			t.Fatalf("Base58 invite contains %q: %s", excluded, encoded)
+		}
+	}
+	payload, err := decodeBase58(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) != 1+RoomSeedSize+len(roomInvite.DisplayName)+checksumSize {
+		t.Fatalf("compact payload length = %d", len(payload))
+	}
+	legacyPayloadSize := 1 + RoomSeedSize + 2 + len(roomInvite.DisplayName) + checksumSize
+	if len(encoded) >= base64.RawURLEncoding.EncodedLen(legacyPayloadSize) {
+		t.Fatalf("Base58 invite length %d did not improve on legacy Base64URL length %d", len(encoded), base64.RawURLEncoding.EncodedLen(legacyPayloadSize))
+	}
+}
+
+func TestBase58PreservesLeadingZeroes(t *testing.T) {
+	input := []byte{0, 0, 1, 2, 3, 255}
+	encoded := encodeBase58(input)
+	decoded, err := decodeBase58(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(decoded) != string(input) || !strings.HasPrefix(encoded, "11") {
+		t.Fatalf("Base58 round trip = %q, %v", encoded, decoded)
+	}
+}
+
 func TestInviteRoundTripAndDerivation(t *testing.T) {
 	created, err := New("  Night Shift  ")
 	if err != nil {
@@ -16,13 +53,13 @@ func TestInviteRoundTripAndDerivation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse() error = %v", err)
 	}
-	if !created.Equal(parsed) {
+	if created != parsed {
 		t.Fatalf("round trip changed invite: %#v != %#v", created, parsed)
 	}
 	if parsed.DisplayName != "Night Shift" {
 		t.Fatalf("parsed invite = %#v", parsed)
 	}
-	if created.TrackerHash() != parsed.TrackerHash() || created.AdmissionKey() != parsed.AdmissionKey() {
+	if created.TrackerHash() != parsed.TrackerHash() || created.AdmissionKey() != parsed.AdmissionKey() || created.GroupMediaKey() != parsed.GroupMediaKey() {
 		t.Fatal("derived values changed after round trip")
 	}
 }
@@ -46,7 +83,7 @@ func TestHKDFDerivationVector(t *testing.T) {
 	for index := range roomSeed {
 		roomSeed[index] = byte(index)
 	}
-	roomInvite := Invite{Version: Version, DisplayName: "vector", roomSeed: roomSeed}
+	roomInvite := Invite{DisplayName: "vector", roomSeed: roomSeed}
 	trackerHash := roomInvite.TrackerHash()
 	admissionKey := roomInvite.AdmissionKey()
 	roomTag := roomInvite.RoomTag()
@@ -71,19 +108,26 @@ func TestParseRejectsTamperedInvite(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	encoded := strings.TrimPrefix(created.Encode(), prefix)
-	payload, err := base64.RawURLEncoding.DecodeString(encoded)
+	payload, err := decodeBase58(encoded)
 	if err != nil {
 		t.Fatalf("DecodeString() error = %v", err)
 	}
 	payload[5] ^= 0xff
-	tampered := prefix + base64.RawURLEncoding.EncodeToString(payload)
+	tampered := prefix + encodeBase58(payload)
 	if _, err := Parse(tampered); err == nil || !strings.Contains(err.Error(), "checksum") {
 		t.Fatalf("Parse() error = %v, want checksum error", err)
 	}
 }
 
+func TestParseRejectsNonCanonicalRoomName(t *testing.T) {
+	roomInvite := Invite{DisplayName: " room "}
+	if _, err := Parse(roomInvite.Encode()); err == nil || !strings.Contains(err.Error(), "canonical") {
+		t.Fatalf("Parse() error = %v, want canonical name error", err)
+	}
+}
+
 func TestParseRejectsInvalidInvite(t *testing.T) {
-	tests := []string{"", "bork://join/", "not-base64", "bork://join/AQ"}
+	tests := []string{"", "bork://join/", "not-base58-0OIl", "bork://join/2"}
 	for _, encoded := range tests {
 		if _, err := Parse(encoded); err == nil {
 			t.Fatalf("Parse(%q) error = nil", encoded)
@@ -118,6 +162,18 @@ func TestNewRejectsInvalidDisplayName(t *testing.T) {
 	}
 }
 
+func TestMaximumUTF8RoomNameFitsInviteLimit(t *testing.T) {
+	roomInvite, err := New(strings.Repeat("😀", MaxDisplayRunes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if encoded := roomInvite.Encode(); len(encoded) > MaxEncodedSize {
+		t.Fatalf("maximum invite length = %d, limit %d", len(encoded), MaxEncodedSize)
+	} else if parsed, err := Parse(encoded); err != nil || parsed != roomInvite {
+		t.Fatalf("maximum invite did not round trip: %v", err)
+	}
+}
+
 func FuzzParseInvite(f *testing.F) {
 	roomInvite, err := New("fuzz seed")
 	if err != nil {
@@ -131,7 +187,7 @@ func FuzzParseInvite(f *testing.F) {
 			return
 		}
 		roundTrip, err := Parse(parsed.Encode())
-		if err != nil || !parsed.Equal(roundTrip) {
+		if err != nil || parsed != roundTrip {
 			t.Fatalf("valid invite did not round trip: %v", err)
 		}
 	})

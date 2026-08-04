@@ -1,6 +1,7 @@
 package media
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -18,6 +19,15 @@ func TestFlowBoundsReceivedPerSourceAndPreservesFairness(t *testing.T) {
 	second, ok := flow.TakeReceived()
 	if !ok || second.SourceID != "other" {
 		t.Fatalf("second frame = %#v, %v", second, ok)
+	}
+}
+
+func TestFlowAcceptsMoreThanSixteenSources(t *testing.T) {
+	flow := NewFlow()
+	for index := range 32 {
+		if !flow.SubmitReceived(ReceivedFrame{SourceID: fmt.Sprintf("peer-%d", index), Sequence: 1, Payload: []byte{1}}) {
+			t.Fatalf("source %d was rejected", index)
+		}
 	}
 }
 

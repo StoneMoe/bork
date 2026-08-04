@@ -6,6 +6,11 @@ import (
 	"github.com/thesyncim/gopus"
 )
 
+const (
+	defaultVoiceBitrate = 24000
+	minimumVoiceBitrate = 12000
+)
+
 type opusEncoder struct {
 	codec         *gopus.Encoder
 	maxFrameBytes int
@@ -25,7 +30,7 @@ func newOpusEncoder(maxFrameBytes int) (*opusEncoder, error) {
 		set  func() error
 	}{
 		{"frame size", func() error { return codec.SetFrameSize(FrameSamples) }},
-		{"bitrate", func() error { return codec.SetBitrate(24000) }},
+		{"bitrate", func() error { return codec.SetBitrate(defaultVoiceBitrate) }},
 		{"complexity", func() error { return codec.SetComplexity(5) }},
 		{"bitrate mode", func() error { return codec.SetBitrateMode(gopus.BitrateModeCVBR) }},
 		{"in-band FEC", func() error { return codec.SetInBandFEC(gopus.InBandFECEnabled) }},
@@ -46,10 +51,6 @@ func (e *opusEncoder) Encode(pcm []float32) ([]byte, error) {
 		return nil, err
 	}
 	return payload[:count:count], nil
-}
-
-func (e *opusEncoder) Reset() {
-	e.codec.Reset()
 }
 
 func newOpusDecoder(maxFrameBytes int) (*gopus.Decoder, error) {

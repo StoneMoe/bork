@@ -8,8 +8,6 @@ import (
 
 type ControlPacket struct {
 	Type      PacketType
-	SessionID [16]byte
-	Sequence  uint64
 	Challenge uint64
 }
 
@@ -20,7 +18,7 @@ func MarshalControl(packetType PacketType, roomTag, sessionID [16]byte, sequence
 	if sequence == 0 {
 		return nil, errors.New("control packet sequence is zero")
 	}
-	if protector == nil || protector.NonceSize() != 12 || protector.Overhead() != aeadTagSize {
+	if !validPairwiseCipher(protector) {
 		return nil, errors.New("control packet protector is invalid")
 	}
 	packet := make([]byte, 0, controlPacketSize)
@@ -35,7 +33,7 @@ func ParseControl(packet []byte, expectedRoomTag, expectedSessionID [16]byte, pr
 	if len(packet) != controlPacketSize {
 		return ControlPacket{}, errors.New("control packet length is invalid")
 	}
-	if protector == nil || protector.NonceSize() != 12 || protector.Overhead() != aeadTagSize {
+	if !validPairwiseCipher(protector) {
 		return ControlPacket{}, errors.New("control packet protector is invalid")
 	}
 	header, err := ParseEstablishedHeader(packet)
@@ -52,8 +50,6 @@ func ParseControl(packet []byte, expectedRoomTag, expectedSessionID [16]byte, pr
 	}
 	return ControlPacket{
 		Type:      header.Type,
-		SessionID: header.SessionID,
-		Sequence:  header.Sequence,
 		Challenge: binary.BigEndian.Uint64(opened),
 	}, nil
 }

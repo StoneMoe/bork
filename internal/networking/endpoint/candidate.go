@@ -11,6 +11,7 @@ type CandidateType string
 const (
 	CandidateHost            CandidateType = "host"
 	CandidateServerReflexive CandidateType = "server-reflexive"
+	CandidatePortMapped      CandidateType = "port-mapped"
 )
 
 type Candidate struct {

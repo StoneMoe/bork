@@ -7,10 +7,6 @@ APP_ARGS ?=
 BUILD_FLAGS ?=
 DEV_FLAGS ?=
 
-ifeq ($(OS),Windows_NT)
-OS_BUILD_FLAGS := -windowsconsole
-endif
-
 ifneq ($(strip $(PLATFORMS)),)
 PLATFORM_FLAGS := -platform "$(PLATFORMS)"
 endif
@@ -36,7 +32,7 @@ prepare-packaging:
 	cp frontend/packaging/darwin/Info.dev.plist build/darwin/Info.dev.plist
 
 build: prepare-packaging
-	$(WAILS) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" $(OS_BUILD_FLAGS) $(PLATFORM_FLAGS) $(BUILD_FLAGS)
+	$(WAILS) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" $(PLATFORM_FLAGS) $(BUILD_FLAGS)
 
 dev: prepare-packaging
 	$(WAILS) dev $(APP_FLAGS) $(DEV_FLAGS)

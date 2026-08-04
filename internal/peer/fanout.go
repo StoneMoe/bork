@@ -1,0 +1,286 @@
+package peer
+
+import (
+	"crypto/ed25519"
+	"encoding/binary"
+	"errors"
+	"sort"
+	"time"
+
+	"bork/internal/identity"
+	"bork/internal/networking/endpoint"
+	"bork/internal/protocol"
+)
+
+const (
+	reliableChannelFanout = 2
+	fanoutMessageVersion  = 1
+	fanoutActivationDelay = time.Second
+)
+
+type fanoutAssignment struct {
+	generation uint64
+	listeners  []string
+}
+
+type outboundFanout struct {
+	generation   uint64
+	activateAt   time.Time
+	destinations []string
+	assignments  map[string][]string
+}
+
+func (c *Client) refreshFanout(now time.Time) {
+	if !c.fanoutDirty {
+		return
+	}
+	direct := make(map[string]struct{})
+	listeners := make([]string, 0, len(c.remotePeers))
+	for peerID, peer := range c.remotePeers {
+		if peer.session == nil || !peer.session.authenticated {
+			continue
+		}
+		listeners = append(listeners, peerID)
+		if peer.session.path.IsDirect() {
+			direct[peerID] = struct{}{}
+		}
+	}
+	plan := buildFanoutPlan(listeners, direct, c.topology, now)
+	plan.generation = c.fanout.generation + 1
+	if plan.generation == 0 {
+		plan.generation = 1
+	}
+	type deployment struct {
+		session *PeeringSession
+		payload []byte
+	}
+	deployments := make([]deployment, 0, len(plan.assignments)+len(c.fanout.assignments))
+	for _, peerID := range plan.destinations {
+		peer := c.remotePeers[peerID]
+		if peer == nil || peer.session == nil || !peer.session.authenticated || !peer.session.path.IsDirect() || peer.session.reliable == nil {
+			return
+		}
+		payload, err := marshalFanoutAssignment(plan.generation, plan.assignments[peerID], c.remotePeers)
+		if err != nil || peer.session.reliable.canQueue(reliableChannelFanout, true, len(payload)) != nil {
+			return
+		}
+		deployments = append(deployments, deployment{session: peer.session, payload: payload})
+	}
+	oldOnly := make([]string, 0, len(c.fanout.assignments))
+	for peerID := range c.fanout.assignments {
+		if _, current := plan.assignments[peerID]; !current {
+			oldOnly = append(oldOnly, peerID)
+		}
+	}
+	sort.Strings(oldOnly)
+	for _, peerID := range oldOnly {
+		peer := c.remotePeers[peerID]
+		if peer == nil || peer.session == nil || !peer.session.authenticated || !peer.session.path.IsDirect() || peer.session.reliable == nil {
+			continue
+		}
+		payload, err := marshalFanoutAssignment(plan.generation, nil, c.remotePeers)
+		if err != nil || peer.session.reliable.canQueue(reliableChannelFanout, true, len(payload)) != nil {
+			return
+		}
+		deployments = append(deployments, deployment{session: peer.session, payload: payload})
+	}
+	for _, deployment := range deployments {
+		// Preflight above is atomic under the client's single-owner loop.
+		_ = deployment.session.reliable.queue(reliableChannelFanout, true, deployment.payload)
+	}
+	plan.activateAt = now.Add(fanoutActivationDelay)
+	c.fanout = plan
+	c.fanoutDirty = false
+}
+
+func (c *Client) fanoutReady(now time.Time) bool {
+	if c.fanout.destinations == nil || now.Before(c.fanout.activateAt) {
+		return false
+	}
+	for _, forwarderID := range c.fanout.destinations {
+		forwarder := c.remotePeers[forwarderID]
+		if forwarder == nil || forwarder.session == nil || !forwarder.session.authenticated || forwarder.session.reliable == nil || forwarder.session.reliable.pendingChannel(reliableChannelFanout) {
+			return false
+		}
+	}
+	return true
+}
+
+func buildFanoutPlan(listeners []string, direct map[string]struct{}, topology map[string]*topologyPeer, now time.Time) outboundFanout {
+	sort.Strings(listeners)
+	uncovered := make(map[string]struct{}, len(listeners))
+	for _, peerID := range listeners {
+		uncovered[peerID] = struct{}{}
+	}
+	plan := outboundFanout{assignments: make(map[string][]string)}
+	for len(uncovered) > 0 {
+		var selected string
+		var coverage []string
+		forwarders := make([]string, 0, len(direct))
+		for peerID := range direct {
+			forwarders = append(forwarders, peerID)
+		}
+		sort.Strings(forwarders)
+		for _, forwarder := range forwarders {
+			candidate := make([]string, 0)
+			if _, exists := uncovered[forwarder]; exists {
+				candidate = append(candidate, forwarder)
+			}
+			if peer := topology[forwarder]; peer != nil {
+				for neighbor, expiresAt := range peer.neighbors {
+					if _, exists := uncovered[neighbor]; exists && expiresAt.After(now) {
+						candidate = append(candidate, neighbor)
+					}
+				}
+			}
+			sort.Strings(candidate)
+			if len(candidate) > len(coverage) {
+				selected, coverage = forwarder, candidate
+			}
+		}
+		if selected == "" || len(coverage) == 0 {
+			break
+		}
+		plan.destinations = append(plan.destinations, selected)
+		for _, listener := range coverage {
+			delete(uncovered, listener)
+			if listener != selected {
+				plan.assignments[selected] = append(plan.assignments[selected], listener)
+			}
+		}
+		if _, exists := plan.assignments[selected]; !exists {
+			plan.assignments[selected] = nil
+		}
+	}
+	return plan
+}
+
+func marshalFanoutAssignment(generation uint64, listeners []string, peers map[string]*RemotePeer) ([]byte, error) {
+	if generation == 0 {
+		return nil, errors.New("fanout generation is zero")
+	}
+	payload := make([]byte, 1+8+4+len(listeners)*32)
+	payload[0] = fanoutMessageVersion
+	binary.BigEndian.PutUint64(payload[1:9], generation)
+	binary.BigEndian.PutUint32(payload[9:13], uint32(len(listeners)))
+	offset := 13
+	for _, peerID := range listeners {
+		peer := peers[peerID]
+		if peer == nil {
+			return nil, errors.New("fanout listener is unknown")
+		}
+		copy(payload[offset:offset+32], peer.identity.PublicKey())
+		offset += 32
+	}
+	return payload, nil
+}
+
+func parseFanoutAssignment(payload []byte) (uint64, [][32]byte, error) {
+	if len(payload) < 13 || payload[0] != fanoutMessageVersion {
+		return 0, nil, errors.New("fanout assignment header is invalid")
+	}
+	generation := binary.BigEndian.Uint64(payload[1:9])
+	count := int(binary.BigEndian.Uint32(payload[9:13]))
+	if generation == 0 || count > (len(payload)-13)/32 || len(payload) != 13+count*32 {
+		return 0, nil, errors.New("fanout assignment length is invalid")
+	}
+	listeners := make([][32]byte, count)
+	for index := range listeners {
+		copy(listeners[index][:], payload[13+index*32:13+(index+1)*32])
+		if zeroRawIdentity(listeners[index]) {
+			return 0, nil, errors.New("fanout listener is zero")
+		}
+	}
+	return generation, listeners, nil
+}
+
+func (c *Client) handleReliableMessage(sender *RemotePeer, message deliveredReliableMessage) {
+	if sender == nil {
+		return
+	}
+	if message.channel == reliableChannelTopology {
+		c.handleTopologySnapshot(sender, message.payload)
+		return
+	}
+	if message.channel == reliableChannelMemberState {
+		c.handleMemberState(sender, message.payload)
+		return
+	}
+	if message.channel != reliableChannelFanout {
+		return
+	}
+	if sender.session == nil {
+		return
+	}
+	generation, encodedListeners, err := parseFanoutAssignment(message.payload)
+	if err != nil {
+		return
+	}
+	if generation <= sender.session.inboundFanout.generation {
+		return
+	}
+	listeners := make([]string, 0, len(encodedListeners))
+	seen := make(map[string]struct{}, len(encodedListeners))
+	for _, encoded := range encodedListeners {
+		listener, identityErr := identityFromRaw(encoded)
+		if identityErr != nil || listener.PeerID() == c.localIdentity.PeerID() {
+			continue
+		}
+		peerID := listener.PeerID()
+		if _, duplicate := seen[peerID]; duplicate {
+			continue
+		}
+		seen[peerID] = struct{}{}
+		listeners = append(listeners, peerID)
+	}
+	sender.session.inboundFanout = fanoutAssignment{generation: generation, listeners: listeners}
+}
+
+func (c *Client) forwardGroupDatagram(senderID string, class protocol.TrafficClass, packet endpoint.Datagram, deadline time.Time) {
+	if c.roomNetwork == nil {
+		return
+	}
+	sender := c.remotePeers[senderID]
+	if sender == nil || sender.session == nil || !sender.session.authenticated || !sender.session.path.IsDirect() || sender.session.path.Address() != packet.From {
+		return
+	}
+	assignment := sender.session.inboundFanout
+	if assignment.generation == 0 {
+		return
+	}
+	c.sendRealtimeToPeers(class, packet.Data, assignment.listeners, deadline, 0)
+}
+
+func (c *Client) sendRealtimeToPeers(class protocol.TrafficClass, packet []byte, peerIDs []string, deadline time.Time, generation uint64) {
+	if c.roomNetwork == nil {
+		return
+	}
+	batch := endpoint.RealtimeBatch{
+		Class: class, Deadline: deadline, Generation: generation,
+		Datagrams: make([]endpoint.RealtimeDatagram, 0, endpoint.MaxRealtimeBatchDatagrams),
+	}
+	for _, peerID := range peerIDs {
+		peer := c.remotePeers[peerID]
+		if peer == nil || peer.session == nil || !peer.session.authenticated || !peer.session.path.IsDirect() {
+			continue
+		}
+		batch.Datagrams = append(batch.Datagrams, endpoint.RealtimeDatagram{
+			Data: packet, Destination: peer.session.path.Address(),
+		})
+		if len(batch.Datagrams) == endpoint.MaxRealtimeBatchDatagrams {
+			_ = c.roomNetwork.SendRealtimeBatch(batch)
+			batch.Datagrams = make([]endpoint.RealtimeDatagram, 0, endpoint.MaxRealtimeBatchDatagrams)
+		}
+	}
+	if len(batch.Datagrams) > 0 {
+		_ = c.roomNetwork.SendRealtimeBatch(batch)
+	}
+}
+
+func identityFromRaw(raw [32]byte) (identity.Identity, error) {
+	return identity.FromPublicKey(ed25519.PublicKey(raw[:]))
+}
+
+func zeroRawIdentity(raw [32]byte) bool {
+	return raw == ([32]byte{})
+}

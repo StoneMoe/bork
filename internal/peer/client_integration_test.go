@@ -15,6 +15,7 @@ import (
 	"bork/internal/identity"
 	"bork/internal/invite"
 	"bork/internal/media"
+	"bork/internal/networking"
 	"bork/internal/networking/endpoint"
 	"bork/internal/protocol"
 
@@ -36,8 +37,14 @@ func TestClientsDiscoverAuthenticateAndExchangeVoiceOnSameHost(t *testing.T) {
 		t.Fatalf("invite.New() error = %v", err)
 	}
 	options := endpoint.Options{ListenAddress: "[::]:0", STUNServers: []string{}, STUNRefresh: 0}
-	firstClient := NewClient(firstDevice, room, options, logger)
-	secondClient := NewClient(secondDevice, room, options, logger)
+	firstClient := NewClient(firstDevice, room, networking.Options{Endpoint: options}, logger)
+	secondClient := NewClient(secondDevice, room, networking.Options{Endpoint: options}, logger)
+	if err := firstClient.SetLocalMemberState("Alice", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := secondClient.SetLocalMemberState("Bob", false); err != nil {
+		t.Fatal(err)
+	}
 	firstFlow := media.NewFlow()
 	secondFlow := media.NewFlow()
 	firstChanges := firstClient.StateChanges()
@@ -50,6 +57,12 @@ func TestClientsDiscoverAuthenticateAndExchangeVoiceOnSameHost(t *testing.T) {
 
 	waitForAuthenticatedRemotePeer(t, firstClient, firstChanges, secondDevice.PeerID())
 	waitForAuthenticatedRemotePeer(t, secondClient, secondChanges, firstDevice.PeerID())
+	waitForRemoteMemberState(t, firstClient, firstChanges, secondDevice.PeerID(), "Bob", false)
+	waitForRemoteMemberState(t, secondClient, secondChanges, firstDevice.PeerID(), "Alice", true)
+	if err := secondClient.SetLocalMemberState("Robert", true); err != nil {
+		t.Fatal(err)
+	}
+	waitForRemoteMemberState(t, firstClient, firstChanges, secondDevice.PeerID(), "Robert", true)
 	encoder, err := gopus.NewEncoder(gopus.EncoderConfig{SampleRate: 48000, Channels: 1, Application: gopus.ApplicationVoIP})
 	if err != nil {
 		t.Fatalf("gopus.NewEncoder() error = %v", err)
@@ -61,7 +74,7 @@ func TestClientsDiscoverAuthenticateAndExchangeVoiceOnSameHost(t *testing.T) {
 	for index := range pcm {
 		pcm[index] = float32(math.Sin(float64(index)*0.03)) * 0.1
 	}
-	voiceBuffer := make([]byte, protocol.MaxVoicePayload)
+	voiceBuffer := make([]byte, protocol.MaxGroupDatagramPayload)
 	voiceLength, err := encoder.Encode(pcm, voiceBuffer)
 	if err != nil {
 		t.Fatalf("Encode() error = %v", err)
@@ -73,18 +86,27 @@ func TestClientsDiscoverAuthenticateAndExchangeVoiceOnSameHost(t *testing.T) {
 	}
 	voiceCtx, stopVoice := context.WithTimeout(context.Background(), 3*time.Second)
 	defer stopVoice()
+	retryVoice := time.NewTicker(50 * time.Millisecond)
+	defer retryVoice.Stop()
 	var frame media.ReceivedFrame
 	var ok bool
-	select {
-	case <-voiceCtx.Done():
-	case <-secondFlow.ReceivedReady():
-		frame, ok = secondFlow.TakeReceived()
+
+voiceWait:
+	for !ok {
+		select {
+		case <-voiceCtx.Done():
+			break voiceWait
+		case <-retryVoice.C:
+			firstFlow.SubmitSend(media.SendFrame{Timestamp: 960, Payload: voicePayload, Deadline: time.Now().Add(time.Second), Generation: generation})
+		case <-secondFlow.ReceivedReady():
+			frame, ok = secondFlow.TakeReceived()
+		}
 	}
 	if ok {
 		if frame.SourceID != firstDevice.PeerID() || frame.Timestamp != 960 || !bytes.Equal(frame.Payload, voicePayload) {
 			t.Fatalf("received voice frame = %#v", frame)
 		}
-		decoder, err := gopus.NewDecoder(gopus.DecoderConfig{SampleRate: 48000, Channels: 1, MaxPacketSamples: 480, MaxPacketBytes: protocol.MaxVoicePayload})
+		decoder, err := gopus.NewDecoder(gopus.DecoderConfig{SampleRate: 48000, Channels: 1, MaxPacketSamples: 480, MaxPacketBytes: protocol.MaxGroupDatagramPayload})
 		if err != nil {
 			t.Fatalf("gopus.NewDecoder() error = %v", err)
 		}
@@ -178,7 +200,7 @@ func TestClientDiscoveryHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	client := NewClient(localIdentity, room, endpoint.Options{ListenAddress: "[::]:0", STUNServers: []string{}, STUNRefresh: 0}, logger)
+	client := NewClient(localIdentity, room, networking.Options{Endpoint: endpoint.Options{ListenAddress: "[::]:0", STUNServers: []string{}, STUNRefresh: 0}}, logger)
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
@@ -189,7 +211,8 @@ func TestClientDiscoveryHelper(t *testing.T) {
 	for {
 		select {
 		case <-ticker.C:
-			if !connected && len(client.Snapshot().RemotePeers) > 0 {
+			snapshot, _ := client.StateSnapshot()
+			if !connected && len(snapshot.RemotePeers) > 0 {
 				if err := os.WriteFile(os.Getenv("BORK_NODE_DISCOVERY_OWN_MARKER"), []byte("connected"), 0o600); err != nil {
 					t.Fatal(err)
 				}
@@ -208,10 +231,12 @@ func TestClientDiscoveryHelper(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Fatalf("client stopped before both processes connected; state = %#v", client.Snapshot())
+			snapshot, _ := client.StateSnapshot()
+			t.Fatalf("client stopped before both processes connected; state = %#v", snapshot)
 		case <-ctx.Done():
 			<-done
-			t.Fatalf("timed out waiting for both processes to connect; state = %#v", client.Snapshot())
+			snapshot, _ := client.StateSnapshot()
+			t.Fatalf("timed out waiting for both processes to connect; state = %#v", snapshot)
 		}
 	}
 }
@@ -222,13 +247,32 @@ func waitForAuthenticatedRemotePeer(t *testing.T, client *Client, changes <-chan
 	for {
 		select {
 		case <-changes:
-			for _, remotePeer := range client.Snapshot().RemotePeers {
+			snapshot, _ := client.StateSnapshot()
+			for _, remotePeer := range snapshot.RemotePeers {
 				if remotePeer.PeerID == peerID && remotePeer.RTTMillis > 0 {
 					return
 				}
 			}
 		case <-deadline:
 			t.Fatalf("timed out waiting for authenticated peer %s", peerID)
+		}
+	}
+}
+
+func waitForRemoteMemberState(t *testing.T, client *Client, changes <-chan struct{}, peerID, nickname string, muted bool) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		snapshot, _ := client.StateSnapshot()
+		for _, remotePeer := range snapshot.RemotePeers {
+			if remotePeer.PeerID == peerID && remotePeer.Nickname == nickname && remotePeer.Muted == muted {
+				return
+			}
+		}
+		select {
+		case <-changes:
+		case <-deadline:
+			t.Fatalf("timed out waiting for member state %q/%t from %s", nickname, muted, peerID)
 		}
 	}
 }

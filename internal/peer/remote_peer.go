@@ -3,14 +3,17 @@ package peer
 import "bork/internal/identity"
 
 type RemotePeer struct {
-	identity      identity.Identity
-	peerSess      *PeeringSession
-	candidateSess *PeeringSession
+	identity         identity.Identity
+	session          *PeeringSession
+	candidateSession *PeeringSession
 }
 
 type RemotePeerSnapshot struct {
-	PeerID    string `json:"peerId"`
-	Address   string `json:"address"`
-	SessionID string `json:"sessionId"`
-	RTTMillis int64  `json:"rttMillis"`
+	PeerID    string
+	Address   string
+	SessionID string
+	RTTMillis int64
+	Transport string
+	Nickname  string
+	Muted     bool
 }

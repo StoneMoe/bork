@@ -8,9 +8,9 @@ import (
 	"bork/internal/peer"
 )
 
-func (a *App) GetSnapshot() (AppSnapshot, error) {
+func (a *App) GetSnapshot() AppSnapshot {
 	<-a.startupDone
-	return a.snapshot(), nil
+	return a.snapshot()
 }
 
 func (a *App) GetInvite() (string, error) {
@@ -62,6 +62,8 @@ func (a *App) joinRoom(encodedInvite string) error {
 func (a *App) createRoom(roomInvite invite.Invite) error {
 	a.stateMu.RLock()
 	localIdentity := a.localIdentity
+	nickname := a.nickname
+	audioEngine := a.audioEngine
 	hasRoom := a.room != nil
 	shuttingDown := a.shuttingDown
 	a.stateMu.RUnlock()
@@ -75,6 +77,13 @@ func (a *App) createRoom(roomInvite invite.Invite) error {
 		return errors.New("leave the current room before joining another")
 	}
 	client := peer.NewClient(localIdentity, roomInvite, a.config.NetworkOptions(), a.logger)
+	muted := false
+	if audioEngine != nil {
+		muted = audioEngine.Status().Muted
+	}
+	if err := client.SetLocalMemberState(nickname, muted); err != nil {
+		return err
+	}
 	if err := a.activateRoom(client); err != nil {
 		return err
 	}
@@ -123,6 +132,52 @@ func (a *App) SetMuted(muted bool) error {
 		return err
 	}
 	audioEngine.SetMuted(muted)
+	a.stateMu.RLock()
+	nickname := a.nickname
+	room := a.room
+	a.stateMu.RUnlock()
+	if room != nil && !room.stopping {
+		if err := room.client.SetLocalMemberState(nickname, muted); err != nil {
+			return err
+		}
+	}
+	a.markStateChanged()
+	return nil
+}
+
+func (a *App) SetNickname(nickname string) error {
+	if err := a.waitForStartup(); err != nil {
+		return err
+	}
+	nickname, err := peer.NormalizeNickname(nickname)
+	if err != nil {
+		return err
+	}
+	a.commandMu.Lock()
+	defer a.commandMu.Unlock()
+	if a.isShuttingDown() {
+		return errors.New("application is shutting down")
+	}
+	a.stateMu.RLock()
+	current := a.nickname
+	room := a.room
+	audioEngine := a.audioEngine
+	a.stateMu.RUnlock()
+	if current == nickname {
+		return nil
+	}
+	muted := false
+	if audioEngine != nil {
+		muted = audioEngine.Status().Muted
+	}
+	if room != nil && !room.stopping {
+		if err := room.client.SetLocalMemberState(nickname, muted); err != nil {
+			return err
+		}
+	}
+	a.stateMu.Lock()
+	a.nickname = nickname
+	a.stateMu.Unlock()
 	a.markStateChanged()
 	return nil
 }
@@ -140,7 +195,7 @@ func (a *App) SetAudioDevices(captureID, playbackID string) error {
 	if err != nil {
 		return err
 	}
-	if _, err = audioEngine.SetDevices(captureID, playbackID); err != nil {
+	if err = audioEngine.SetDevices(captureID, playbackID); err != nil {
 		return err
 	}
 	a.stateMu.RLock()
@@ -179,7 +234,7 @@ func (a *App) RefreshAudioDevices() error {
 		a.stateMu.RUnlock()
 		a.startAudioWatcher(ctx)
 	}
-	if _, err = audioEngine.RefreshDevices(); err != nil {
+	if err = audioEngine.RefreshDevices(); err != nil {
 		return err
 	}
 	a.stateMu.RLock()

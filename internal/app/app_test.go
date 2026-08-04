@@ -12,20 +12,27 @@ import (
 	"time"
 
 	"bork/internal/config"
+	"bork/internal/peer"
 )
 
 func TestAppRoomLifecycle(t *testing.T) {
 	application := testApp(t)
-	initial, err := application.GetSnapshot()
-	if err != nil || initial.PeerID == "" || initial.Room != nil {
-		t.Fatalf("initial snapshot = %#v, %v", initial, err)
+	initial := application.GetSnapshot()
+	if initial.PeerID == "" || initial.Room != nil {
+		t.Fatalf("initial snapshot = %#v", initial)
+	}
+	if err := application.SetNickname("  Alice  "); err != nil {
+		t.Fatal(err)
+	}
+	if nickname := application.GetSnapshot().Nickname; nickname != "Alice" {
+		t.Fatalf("nickname = %q, want Alice", nickname)
 	}
 	if err := application.CreateRoom("Night Shift"); err != nil {
 		t.Fatalf("CreateRoom() error = %v", err)
 	}
-	created, err := application.GetSnapshot()
-	if err != nil || created.Room == nil || created.Room.Name != "Night Shift" {
-		t.Fatalf("created snapshot = %#v, %v", created, err)
+	created := application.GetSnapshot()
+	if created.Room == nil || created.Room.Name != "Night Shift" {
+		t.Fatalf("created snapshot = %#v", created)
 	}
 	encodedInvite, err := application.GetInvite()
 	if err != nil || encodedInvite == "" {
@@ -34,14 +41,14 @@ func TestAppRoomLifecycle(t *testing.T) {
 	if err := application.LeaveRoom(); err != nil {
 		t.Fatal(err)
 	}
-	left, _ := application.GetSnapshot()
+	left := application.GetSnapshot()
 	if left.Room != nil {
 		t.Fatalf("left snapshot = %#v", left)
 	}
 	if err := application.JoinRoom(encodedInvite); err != nil {
 		t.Fatalf("JoinRoom() error = %v", err)
 	}
-	joined, _ := application.GetSnapshot()
+	joined := application.GetSnapshot()
 	if joined.Room == nil || joined.Room.Name != "Night Shift" {
 		t.Fatalf("joined snapshot = %#v", joined)
 	}
@@ -51,25 +58,22 @@ func TestAppRoomLifecycle(t *testing.T) {
 }
 
 func TestGetSnapshotWaitsForStartup(t *testing.T) {
-	application := NewApp(config.Config{Mode: config.ModeGUI, DataDir: t.TempDir(), STUNServers: []string{}}, testLogger())
+	application := NewApp(config.Config{DataDir: t.TempDir(), STUNServers: []string{}}, testLogger())
 	application.emit = func(context.Context, string, ...interface{}) {}
-	result := make(chan error, 1)
+	result := make(chan struct{})
 	go func() {
-		_, err := application.GetSnapshot()
-		result <- err
+		application.GetSnapshot()
+		close(result)
 	}()
 	select {
-	case err := <-result:
-		t.Fatalf("GetSnapshot() returned before startup: %v", err)
+	case <-result:
+		t.Fatal("GetSnapshot() returned before startup")
 	case <-time.After(30 * time.Millisecond):
 	}
 	application.startup(context.Background())
 	defer application.shutdown(context.Background())
 	select {
-	case err := <-result:
-		if err != nil {
-			t.Fatal(err)
-		}
+	case <-result:
 	case <-time.After(3 * time.Second):
 		t.Fatal("GetSnapshot() remained blocked after startup")
 	}
@@ -80,13 +84,13 @@ func TestStartupFailureIsReturnedBySnapshot(t *testing.T) {
 	if err := os.WriteFile(dataDir, []byte("occupied"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	application := NewApp(config.Config{Mode: config.ModeGUI, DataDir: dataDir}, testLogger())
+	application := NewApp(config.Config{DataDir: dataDir}, testLogger())
 	application.emit = func(context.Context, string, ...interface{}) {}
 	application.startup(context.Background())
 	defer application.shutdown(context.Background())
-	snapshot, err := application.GetSnapshot()
-	if err != nil || snapshot.Error == nil || snapshot.PeerID != "" {
-		t.Fatalf("startup failure snapshot = %#v, %v", snapshot, err)
+	snapshot := application.GetSnapshot()
+	if snapshot.Error == nil || snapshot.PeerID != "" {
+		t.Fatalf("startup failure snapshot = %#v", snapshot)
 	}
 }
 
@@ -160,10 +164,17 @@ func TestEmptySnapshotSerializesCollectionsAsArrays(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(encoded)
-	for _, want := range []string{`"captureDevices":[]`, `"playbackDevices":[]`, `"candidates":[]`, `"stun":[]`} {
+	for _, want := range []string{`"speakingPeerIds":[]`, `"captureDevices":[]`, `"playbackDevices":[]`, `"candidates":[]`, `"stun":[]`, `"knownAddresses":[]`} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("snapshot JSON %s does not contain %s", text, want)
 		}
+	}
+}
+
+func TestRemoteMemberPresentationProjection(t *testing.T) {
+	projected := projectRemotePeer(peer.RemotePeerSnapshot{PeerID: "peer", Nickname: "Bob", Muted: true})
+	if projected.Nickname != "Bob" || !projected.Muted {
+		t.Fatalf("projected remote peer = %#v", projected)
 	}
 }
 
@@ -236,6 +247,9 @@ func TestOldRoomCannotChangeCurrentSnapshot(t *testing.T) {
 	if err := application.CreateRoom("First"); err != nil {
 		t.Fatal(err)
 	}
+	application.stateMu.RLock()
+	oldRoom := application.room
+	application.stateMu.RUnlock()
 	oldClient, _ := application.activeClient()
 	if err := application.LeaveRoom(); err != nil {
 		t.Fatal(err)
@@ -246,7 +260,8 @@ func TestOldRoomCannotChangeCurrentSnapshot(t *testing.T) {
 	if current, _ := application.activeClient(); current == oldClient {
 		t.Fatal("old client remained active")
 	}
-	state, _ := application.GetSnapshot()
+	application.publishRoomChange(roomStateChange{room: oldRoom})
+	state := application.GetSnapshot()
 	if state.Room == nil || state.Room.Name != "Second" {
 		t.Fatalf("old room changed current snapshot: %#v", state)
 	}
@@ -257,7 +272,6 @@ func TestOldRoomCannotChangeCurrentSnapshot(t *testing.T) {
 
 func TestRoomGathersNetworkAndStops(t *testing.T) {
 	application := testAppWithConfig(t, config.Config{
-		Mode:        config.ModeGUI,
 		DataDir:     t.TempDir(),
 		UDPListen:   "127.0.0.1:0",
 		STUNServers: []string{},
@@ -267,7 +281,7 @@ func TestRoomGathersNetworkAndStops(t *testing.T) {
 	}
 	deadline := time.After(3 * time.Second)
 	for {
-		snapshot, _ := application.GetSnapshot()
+		snapshot := application.GetSnapshot()
 		if snapshot.Diagnostics.ListenAddress != "" {
 			break
 		}
@@ -284,7 +298,6 @@ func TestRoomGathersNetworkAndStops(t *testing.T) {
 
 func TestNetworkFailureDetachesRoomAndKeepsDiagnostics(t *testing.T) {
 	application := testAppWithConfig(t, config.Config{
-		Mode:        config.ModeGUI,
 		DataDir:     t.TempDir(),
 		UDPListen:   "invalid-listen-address",
 		STUNServers: []string{},
@@ -294,7 +307,7 @@ func TestNetworkFailureDetachesRoomAndKeepsDiagnostics(t *testing.T) {
 	}
 	deadline := time.After(time.Second)
 	for {
-		state, _ := application.GetSnapshot()
+		state := application.GetSnapshot()
 		if state.Room == nil && state.Error != nil {
 			if state.Diagnostics.NetworkError == "" || !strings.Contains(state.Error.Message, "invalid-listen-address") {
 				t.Fatalf("terminal snapshot = %#v", state)
@@ -311,7 +324,7 @@ func TestNetworkFailureDetachesRoomAndKeepsDiagnostics(t *testing.T) {
 
 func testApp(t *testing.T) *App {
 	t.Helper()
-	return testAppWithConfig(t, config.Config{Mode: config.ModeGUI, DataDir: t.TempDir(), STUNServers: []string{}})
+	return testAppWithConfig(t, config.Config{DataDir: t.TempDir(), STUNServers: []string{}})
 }
 
 func testAppWithConfig(t *testing.T, cfg config.Config) *App {

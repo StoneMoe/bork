@@ -10,67 +10,208 @@ import (
 
 	"bork/internal/identity"
 	"bork/internal/media"
+	"bork/internal/networking/discovery"
 	"bork/internal/networking/endpoint"
-	"bork/internal/networking/link"
 	"bork/internal/protocol"
 )
 
 const (
-	helloInterval          = 2 * time.Second
-	pingInterval           = 2 * time.Second
-	remotePeerTimeout      = 8 * time.Second
-	maxDiscoveredAddresses = 64
-	maxSessions            = 16
-	maxAssociations        = 64
-	maxCandidatePaths      = 4
+	helloInterval             = 2 * time.Second
+	maxHelloInterval          = 8 * time.Second
+	pingInterval              = time.Second
+	remotePeerTimeout         = 8 * time.Second
+	pathFailoverTimeout       = 2500 * time.Millisecond
+	cleanupInterval           = 250 * time.Millisecond
+	reliableInterval          = 20 * time.Millisecond
+	maxReliablePacketsPerTick = 32
+	maxRealtimeEventsPerTurn  = 8
+	// maxDiscoveryHints is an untrusted-input safety budget, not a room member limit.
+	maxDiscoveryHints = 2048
+	topologyHintTTL   = 30 * time.Second
+
+	likeForLikeMargin = 5
 )
 
 type discoveredAddress struct {
-	lastSeen time.Time
+	source        discovery.Source
+	lastSeen      time.Time
+	expiresAt     time.Time
+	nextProbe     time.Time
+	probeInterval time.Duration
 }
 
-func (peerLocal *Client) addDiscoveredAddress(address netip.AddrPort) {
-	peerLocal.rememberDiscoveredAddress(address, time.Now())
+func (c *Client) addDiscoveryHint(hint discovery.Hint) {
+	c.addDiscoveryHintAt(hint, time.Now())
 }
 
-func (peerLocal *Client) rememberDiscoveredAddress(address netip.AddrPort, now time.Time) {
+func (c *Client) addDiscoveryHintAt(hint discovery.Hint, now time.Time) {
+	address, added, changed := c.rememberDiscoveryHint(hint, now)
+	if added {
+		c.sendHello(address)
+	}
+	if changed {
+		c.publishStateChange()
+	}
+}
+
+func (c *Client) rememberDiscoveryHint(hint discovery.Hint, now time.Time) (netip.AddrPort, bool, bool) {
+	address, valid := normalizeDiscoveryAddress(hint.Address)
+	if !valid || !validDiscoverySource(hint.Source) || discoveryExpired(hint.ExpiresAt, now) ||
+		((hint.Source == discovery.SourceTracker || hint.Source == discovery.SourceTopology) && hint.ExpiresAt.IsZero()) || c.isSelfAddress(address) {
+		return netip.AddrPort{}, false, false
+	}
+	if c.discoveredAddresses == nil {
+		c.discoveredAddresses = make(map[netip.AddrPort]discoveredAddress)
+	}
+	if remembered, exists := c.discoveredAddresses[address]; exists && discoveryExpired(remembered.expiresAt, now) {
+		delete(c.discoveredAddresses, address)
+	} else if exists {
+		previous := remembered
+		remembered.lastSeen = now
+		// Never downgrade an authenticated or room-lifetime record to an expiring hint.
+		if hint.Source == discovery.SourceAuthenticated || (remembered.source != discovery.SourceAuthenticated && (!remembered.expiresAt.IsZero() || hint.ExpiresAt.IsZero())) {
+			remembered.source = hint.Source
+			remembered.expiresAt = hint.ExpiresAt
+		}
+		c.discoveredAddresses[address] = remembered
+		return address, false, remembered != previous
+	}
+	if len(c.discoveredAddresses) >= maxDiscoveryHints {
+		victim, found := c.discoveryEvictionCandidate(now, hint.Source)
+		if !found {
+			return netip.AddrPort{}, false, false
+		}
+		delete(c.discoveredAddresses, victim)
+	}
+	c.discoveredAddresses[address] = discoveredAddress{
+		source:        hint.Source,
+		lastSeen:      now,
+		expiresAt:     hint.ExpiresAt,
+		nextProbe:     now.Add(helloInterval),
+		probeInterval: helloInterval,
+	}
+	return address, true, true
+}
+
+func normalizeDiscoveryAddress(address netip.AddrPort) (netip.AddrPort, bool) {
 	if !address.IsValid() || address.Port() == 0 {
-		return
+		return netip.AddrPort{}, false
 	}
-	if _, exists := peerLocal.discoveredAddresses[address]; exists {
-		peerLocal.discoveredAddresses[address] = discoveredAddress{lastSeen: now}
-		return
+	peerAddress := address.Addr().Unmap()
+	if peerAddress.IsUnspecified() || peerAddress.IsMulticast() || (peerAddress.IsLinkLocalUnicast() && peerAddress.Zone() == "") {
+		return netip.AddrPort{}, false
 	}
-	if len(peerLocal.discoveredAddresses) >= maxDiscoveredAddresses {
-		var oldest netip.AddrPort
-		var oldestAt time.Time
-		for candidate, discovered := range peerLocal.discoveredAddresses {
-			if peerLocal.addressInUse(candidate) {
-				continue
-			}
-			if !oldest.IsValid() || discovered.lastSeen.Before(oldestAt) {
-				oldest = candidate
-				oldestAt = discovered.lastSeen
-			}
-		}
-		if !oldest.IsValid() {
-			return
-		}
-		delete(peerLocal.discoveredAddresses, oldest)
-	}
-	peerLocal.discoveredAddresses[address] = discoveredAddress{lastSeen: now}
+	return netip.AddrPortFrom(peerAddress, address.Port()), true
 }
 
-func (peerLocal *Client) addressInUse(address netip.AddrPort) bool {
-	for _, peerRemote := range peerLocal.remotePeers {
-		for _, session := range []*PeeringSession{peerRemote.peerSess, peerRemote.candidateSess} {
+func validDiscoverySource(source discovery.Source) bool {
+	switch source {
+	case discovery.SourceLocal, discovery.SourceMDNS, discovery.SourceTracker, discovery.SourceTopology, discovery.SourceAuthenticated:
+		return true
+	default:
+		return false
+	}
+}
+
+func discoveryExpired(expiresAt, now time.Time) bool {
+	return !expiresAt.IsZero() && !expiresAt.After(now)
+}
+
+func (c *Client) isSelfAddress(address netip.AddrPort) bool {
+	c.snapshotMu.RLock()
+	endpointSnapshot := c.networkSnapshot.Endpoint
+	c.snapshotMu.RUnlock()
+	if endpointHasAddress(endpointSnapshot, address) {
+		return true
+	}
+	if c.roomNetwork != nil {
+		return endpointHasAddress(c.roomNetwork.Snapshot().Endpoint, address)
+	}
+	return false
+}
+
+func endpointHasAddress(snapshot endpoint.Snapshot, address netip.AddrPort) bool {
+	if local, err := netip.ParseAddrPort(snapshot.ListenAddress); err == nil {
+		if normalized, valid := normalizeDiscoveryAddress(local); valid && normalized == address {
+			return true
+		}
+	}
+	for _, candidate := range snapshot.Candidates {
+		local, err := netip.ParseAddrPort(candidate.Address)
+		if err != nil {
+			continue
+		}
+		if normalized, valid := normalizeDiscoveryAddress(local); valid && normalized == address {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) discoveryEvictionCandidate(now time.Time, incoming discovery.Source) (netip.AddrPort, bool) {
+	var selected netip.AddrPort
+	selectedRank := 6
+	var selectedAt time.Time
+	maximumRank := 1
+	if incoming == discovery.SourceLocal || incoming == discovery.SourceMDNS {
+		maximumRank = 2
+	} else if incoming == discovery.SourceAuthenticated {
+		maximumRank = 5
+	}
+	for address, remembered := range c.discoveredAddresses {
+		active := c.addressInUse(address)
+		rank := 5
+		switch {
+		case discoveryExpired(remembered.expiresAt, now):
+			rank = 0
+		case !active && (remembered.source == discovery.SourceTracker || remembered.source == discovery.SourceTopology):
+			rank = 1
+		case !active && remembered.source != discovery.SourceAuthenticated:
+			rank = 2
+		case !active:
+			rank = 3
+		case remembered.source != discovery.SourceAuthenticated:
+			rank = 4
+		}
+		if rank > maximumRank {
+			continue
+		}
+		if !selected.IsValid() || rank < selectedRank || (rank == selectedRank && (remembered.lastSeen.Before(selectedAt) || (remembered.lastSeen.Equal(selectedAt) && address.String() < selected.String()))) {
+			selected = address
+			selectedRank = rank
+			selectedAt = remembered.lastSeen
+		}
+	}
+	return selected, selected.IsValid()
+}
+
+func (c *Client) expireDiscoveryHints(now time.Time) bool {
+	changed := false
+	for address, remembered := range c.discoveredAddresses {
+		if discoveryExpired(remembered.expiresAt, now) {
+			delete(c.discoveredAddresses, address)
+			changed = true
+		}
+	}
+	return changed
+}
+
+func (c *Client) rememberAuthenticatedPath(path Path, now time.Time) {
+	if path.IsDirect() {
+		_, _, _ = c.rememberDiscoveryHint(discovery.Hint{Address: path.Address(), Source: discovery.SourceAuthenticated}, now)
+	}
+}
+
+func (c *Client) addressInUse(address netip.AddrPort) bool {
+	for _, peer := range c.remotePeers {
+		for _, session := range []*PeeringSession{peer.session, peer.candidateSession} {
 			if session == nil {
 				continue
 			}
 			if session.path.Address() == address {
 				return true
 			}
-			if _, exists := session.candidatePaths[address]; exists {
+			if session.candidatePath != nil && session.candidatePath.path.Address() == address {
 				return true
 			}
 		}
@@ -78,304 +219,319 @@ func (peerLocal *Client) addressInUse(address netip.AddrPort) bool {
 	return false
 }
 
-func (peerLocal *Client) rememberCandidatePath(session *PeeringSession, path link.Path, now time.Time) {
-	address := path.Address()
-	if session.candidatePaths == nil {
-		session.candidatePaths = make(map[netip.AddrPort]*pathProbe)
+func (c *Client) addressHasActivePath(address netip.AddrPort) bool {
+	for _, peer := range c.remotePeers {
+		if peer.session != nil {
+			if peer.session.authenticated && peer.session.path.Address() == address {
+				return true
+			}
+			if peer.session.candidatePath != nil && peer.session.candidatePath.path.Address() == address {
+				return true
+			}
+		}
+		if peer.candidateSession != nil {
+			if peer.candidateSession.path.Address() == address {
+				return true
+			}
+			if peer.candidateSession.candidatePath != nil && peer.candidateSession.candidatePath.path.Address() == address {
+				return true
+			}
+		}
 	}
-	if _, exists := session.candidatePaths[address]; exists {
+	return false
+}
+
+func (c *Client) rememberCandidatePath(session *PeeringSession, path Path, now time.Time) bool {
+	if session.path.SameRoute(path) {
+		return false
+	}
+	if session.candidatePath != nil {
+		if session.candidatePath.path.SameRoute(path) {
+			session.candidatePath.path = path
+			return false
+		}
+		if session.candidatePath.path.IsDirect() && !path.IsDirect() {
+			return false
+		}
+	}
+	session.candidatePath = &pathProbe{path: path, startedAt: now}
+	return true
+}
+
+func (c *Client) sendHello(destination netip.AddrPort) {
+	path, err := NewPath(destination)
+	if err != nil {
 		return
 	}
-	if len(session.candidatePaths) >= maxCandidatePaths {
-		_, newWasDiscovered := peerLocal.discoveredAddresses[address]
-		var victim netip.AddrPort
-		var victimAt time.Time
-		for candidate, probe := range session.candidatePaths {
-			_, candidateWasDiscovered := peerLocal.discoveredAddresses[candidate]
-			if candidateWasDiscovered {
-				continue
-			}
-			if !victim.IsValid() || probe.startedAt.Before(victimAt) {
-				victim = candidate
-				victimAt = probe.startedAt
-			}
-		}
-		if !victim.IsValid() && newWasDiscovered {
-			for candidate, probe := range session.candidatePaths {
-				if !victim.IsValid() || probe.startedAt.Before(victimAt) {
-					victim = candidate
-					victimAt = probe.startedAt
-				}
-			}
-		}
-		if !victim.IsValid() {
-			return
-		}
-		delete(session.candidatePaths, victim)
-	}
-	session.candidatePaths[address] = &pathProbe{path: path, startedAt: now}
+	c.sendHelloOnPath(path)
 }
 
-func (peerLocal *Client) sendHello(destination netip.AddrPort) {
-	if len(peerLocal.helloPacket) == 0 {
+func (c *Client) sendHelloOnPath(path Path) {
+	if len(c.helloPacket) == 0 {
 		return
 	}
-	roomNetwork := peerLocal.roomNetwork
-	if roomNetwork != nil {
-		_ = roomNetwork.SendControl(peerLocal.helloPacket, destination)
+	_ = c.sendControlOnPath(path, c.helloPacket)
+}
+
+func (c *Client) sendHellos(now time.Time) {
+	for address, remembered := range c.discoveredAddresses {
+		if discoveryExpired(remembered.expiresAt, now) || c.addressHasActivePath(address) || now.Before(remembered.nextProbe) {
+			continue
+		}
+		remembered.probeInterval = nextHelloInterval(remembered.probeInterval)
+		remembered.nextProbe = now.Add(remembered.probeInterval)
+		c.discoveredAddresses[address] = remembered
+		c.sendHello(address)
 	}
 }
 
-func (peerLocal *Client) sendHellos() {
-	addresses := make([]netip.AddrPort, 0, len(peerLocal.discoveredAddresses))
-	for address := range peerLocal.discoveredAddresses {
-		addresses = append(addresses, address)
+func nextHelloInterval(interval time.Duration) time.Duration {
+	if interval < helloInterval {
+		return helloInterval
 	}
-	for _, address := range addresses {
-		peerLocal.sendHello(address)
+	if interval >= maxHelloInterval || interval > maxHelloInterval/2 {
+		return maxHelloInterval
+	}
+	return interval * 2
+}
+
+func (c *Client) markTopologyDirty() {
+	c.topologyGeneration++
+	if c.topologyGeneration == 0 {
+		c.topologyGeneration = 1
 	}
 }
 
-func (peerLocal *Client) handlePacket(packet endpoint.Datagram, mediaPort media.PeerPort) {
+func (c *Client) markPeerGraphDirty(topologyChanged bool) {
+	c.fanoutDirty = true
+	if topologyChanged {
+		c.markTopologyDirty()
+	}
+}
+
+func shouldPromotePath(current Path, currentAuthenticated bool, currentRTT int64, currentLastAuthenticated, now time.Time, candidate Path, candidateRTT int64) bool {
+	if !currentAuthenticated || currentLastAuthenticated.Before(now.Add(-pathFailoverTimeout)) {
+		return true
+	}
+	if current.IsDirect() && !candidate.IsDirect() {
+		return false
+	}
+	if !current.IsDirect() && candidate.IsDirect() {
+		return true
+	}
+	return candidateRTT+likeForLikeMargin <= currentRTT
+}
+
+func rawPeerIdentity(peerIdentity identity.Identity) [32]byte {
+	var encoded [32]byte
+	copy(encoded[:], peerIdentity.PublicKey())
+	return encoded
+}
+
+func usableTopologyAddress(address, source netip.AddrPort) bool {
+	address, valid := normalizeDiscoveryAddress(address)
+	if !valid {
+		return false
+	}
+	ip := address.Addr().Unmap()
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	return !ip.IsPrivate() || source.Addr().Unmap().IsPrivate()
+}
+
+func (c *Client) handlePacket(packet endpoint.Datagram, mediaPort media.PeerPort) {
 	packetType, roomTag, err := protocol.ParsePrefix(packet.Data)
-	if err != nil || roomTag != peerLocal.roomTag {
+	if err != nil || roomTag != c.roomTag {
 		return
 	}
 	switch packetType {
 	case protocol.PacketHello:
-		peerLocal.handleHello(packet)
+		c.handleHello(packet)
 	case protocol.PacketPing, protocol.PacketPong:
-		peerLocal.handleSessionPacket(packet)
-	case protocol.PacketVoice:
-		peerLocal.handleVoicePacket(packet, mediaPort)
+		c.handleSessionPacket(packet)
+	case protocol.PacketReliable:
+		path, pathErr := NewPath(packet.From)
+		if pathErr == nil {
+			c.handleReliablePacketOnPath(packet.Data, path)
+		}
+	case protocol.PacketGroupDatagram:
+		c.handleGroupDatagram(packet, mediaPort)
+	case protocol.PacketBridgeControl:
+		c.handleBridgePacket(packet)
 	}
 }
 
-func (peerLocal *Client) sendMedia(frame media.SendFrame) {
-	if len(frame.Payload) == 0 || len(frame.Payload) > protocol.MaxVoicePayload {
-		return
-	}
-	if !frame.Deadline.IsZero() && time.Now().After(frame.Deadline) {
-		return
-	}
-	roomNetwork := peerLocal.roomNetwork
-	batch := endpoint.VoiceBatch{
-		Datagrams:  make([]endpoint.VoiceDatagram, 0, len(peerLocal.remotePeers)),
-		Deadline:   frame.Deadline,
-		Generation: frame.Generation,
-	}
-	stateChanged := false
-	for _, peerRemote := range peerLocal.remotePeers {
-		peerSess := peerRemote.peerSess
-		if peerSess == nil || !peerSess.authenticated {
-			continue
+func (c *Client) sendReliable(now time.Time) {
+	peerIDs := make([]string, 0, len(c.remotePeers))
+	for peerID, peer := range c.remotePeers {
+		if peer.session != nil && peer.session.authenticated && peer.session.reliable != nil {
+			peerIDs = append(peerIDs, peerID)
 		}
-		sequence, err := peerSess.media.NextSendSequence()
-		if err != nil {
-			if peerSess.authenticated {
-				peerSess.authenticated = false
-				stateChanged = true
+	}
+	if len(peerIDs) == 0 {
+		return
+	}
+	sort.Strings(peerIDs)
+	start := sort.Search(len(peerIDs), func(index int) bool { return peerIDs[index] > c.reliablePeerCursor })
+	if start == len(peerIDs) {
+		start = 0
+	}
+
+	remaining := maxReliablePacketsPerTick
+	for remaining > 0 {
+		progress := false
+		for offset := range len(peerIDs) {
+			peerID := peerIDs[(start+offset)%len(peerIDs)]
+			peer := c.remotePeers[peerID]
+			session := peer.session
+			if session == nil || !session.authenticated || session.reliable == nil {
+				continue
 			}
-			continue
-		}
-		packet, err := protocol.MarshalVoice(peerLocal.roomTag, peerSess.sessionID, sequence, frame.Timestamp, frame.Payload, peerSess.ciphers.VoiceSend)
-		if err != nil {
-			continue
-		}
-		batch.Datagrams = append(batch.Datagrams, endpoint.VoiceDatagram{Data: packet, Destination: peerSess.path.Address()})
-	}
-	if roomNetwork != nil && len(batch.Datagrams) > 0 {
-		_ = roomNetwork.SendVoiceBatch(batch)
-	}
-	if stateChanged {
-		peerLocal.publishStateChange()
-	}
-}
-
-func (peerLocal *Client) handleVoicePacket(packet endpoint.Datagram, mediaPort media.PeerPort) {
-	header, err := protocol.ParseEstablishedHeader(packet.Data)
-	if err != nil || header.Type != protocol.PacketVoice || header.RoomTag != peerLocal.roomTag {
-		return
-	}
-	peerSess := peerLocal.sessionForVoiceHeader(header, packet.From)
-	if peerSess == nil || !peerSess.authenticated {
-		return
-	}
-	peerRemote := peerLocal.remotePeerForSession(peerSess)
-	if peerRemote == nil || !peerSess.media.MayReceive(header.Sequence) {
-		return
-	}
-	decoded, err := protocol.ParseVoice(packet.Data, peerLocal.roomTag, peerSess.sessionID, peerSess.ciphers.VoiceRecv)
-	if err != nil || !peerSess.media.CommitReceived(decoded.Sequence) {
-		return
-	}
-	receivedAt := packet.ReceivedAt
-	if receivedAt.IsZero() {
-		receivedAt = time.Now()
-	}
-	if !peerSess.media.AllowReceived(receivedAt) {
-		return
-	}
-	peerSess.lastAuthenticatedPacketAt = time.Now()
-	peerRemoteID := peerRemote.identity.PeerID()
-	if mediaPort == nil {
-		return
-	}
-	mediaPort.SubmitReceived(media.ReceivedFrame{
-		SourceID:   peerRemoteID,
-		StreamID:   peerSess.sessionID,
-		Sequence:   decoded.Sequence,
-		Timestamp:  decoded.Timestamp,
-		Payload:    decoded.Payload,
-		ReceivedAt: receivedAt,
-	})
-}
-
-func (peerLocal *Client) handleHello(packet endpoint.Datagram) {
-	hello, err := protocol.ParseHello(packet.Data, peerLocal.roomTag, peerLocal.admissionKey)
-	if err != nil {
-		return
-	}
-	peerRemoteIdentity, err := identity.FromPublicKey(hello.IdentityKey)
-	if err != nil || peerRemoteIdentity.PeerID() == peerLocal.localIdentity.PeerID() {
-		return
-	}
-	path, err := link.NewPath(packet.From)
-	if err != nil {
-		return
-	}
-	peerRemoteID := peerRemoteIdentity.PeerID()
-	material, err := protocol.DeriveSession(peerLocal.ephemeralPrivateKey, peerLocal.localHello, hello)
-	if err != nil {
-		return
-	}
-
-	peerRemote := peerLocal.remotePeers[peerRemoteID]
-	if peerRemote == nil {
-		if len(peerLocal.remotePeers) >= maxSessions && !peerLocal.evictInactiveRemotePeer() {
-			return
-		}
-		peerRemote = &RemotePeer{identity: peerRemoteIdentity}
-		peerLocal.remotePeers[peerRemoteID] = peerRemote
-	}
-	var activeSession *PeeringSession
-	activeSession = peerRemote.peerSess
-	if activeSession != nil && activeSession.transcriptHash == material.TranscriptHash {
-		if activeSession.path.Address() != packet.From {
-			peerLocal.rememberCandidatePath(activeSession, path, time.Now())
-		}
-		peerLocal.sendPing(peerRemoteID, false)
-		return
-	}
-
-	candidateSession := peerLocal.associations[material.TranscriptHash]
-	created := candidateSession == nil
-	if created {
-		if len(peerLocal.associations) >= maxAssociations {
-			if err := peerLocal.rotateHelloEpoch(); err != nil {
-				return
+			packet, reservation, ok := session.reliable.nextPacket(now)
+			if !ok {
+				packet, reservation, ok = session.reliable.nextAck()
 			}
-			material, err = protocol.DeriveSession(peerLocal.ephemeralPrivateKey, peerLocal.localHello, hello)
+			if !ok {
+				continue
+			}
+			sequence, err := session.control.nextSendSequence()
 			if err != nil {
+				session.authenticated = false
+				c.markPeerGraphDirty(session.path.IsDirect())
+				continue
+			}
+			encoded, err := protocol.MarshalReliable(c.roomTag, session.sessionID, sequence, packet, session.ciphers.ControlSend)
+			if err != nil || c.sendControlOnPath(session.path, encoded) != nil {
+				continue
+			}
+			session.reliable.commit(reservation)
+			c.reliablePeerCursor = peerID
+			remaining--
+			progress = true
+			if remaining == 0 {
 				return
 			}
-			candidateSession = peerLocal.associations[material.TranscriptHash]
-			created = candidateSession == nil
 		}
-	}
-	attached := peerRemote.candidateSess != candidateSession
-	if created {
-		candidateSession, err = newPeeringSession(path, material, time.Now())
-		if err != nil {
+		if !progress {
 			return
 		}
-		peerLocal.associations[material.TranscriptHash] = candidateSession
-	} else if candidateSession != activeSession && attached {
-		candidateSession.path = path
-		candidateSession.clearCandidatePaths()
-		candidateSession.pendingPing = pendingPing{}
-		candidateSession.authenticated = false
-		candidateSession.lastAuthenticatedPacketAt = time.Now()
-	}
-	peerRemote.candidateSess = candidateSession
-	shouldPing := attached || candidateSession.pendingPing.challenge == 0
-	if created || attached {
-		peerLocal.sendHello(packet.From)
-	}
-	if shouldPing {
-		peerLocal.sendPing(peerRemoteID, true)
 	}
 }
 
-func (peerLocal *Client) evictInactiveRemotePeer() bool {
-	var selectedID string
-	var selectedAt time.Time
-	for peerID, peerRemote := range peerLocal.remotePeers {
-		if peerRemote.candidateSess != nil || (peerRemote.peerSess != nil && peerRemote.peerSess.authenticated) {
-			continue
-		}
-		lastSeen := time.Time{}
-		if peerRemote.peerSess != nil {
-			lastSeen = peerRemote.peerSess.lastAuthenticatedPacketAt
-		}
-		if selectedID == "" || lastSeen.Before(selectedAt) {
-			selectedID = peerID
-			selectedAt = lastSeen
-		}
+func (c *Client) handleReliablePacketOnPath(data []byte, path Path) {
+	header, err := protocol.ParseEstablishedHeader(data)
+	if err != nil || header.Type != protocol.PacketReliable || header.RoomTag != c.roomTag {
+		return
 	}
-	if selectedID == "" {
-		return false
+	sender, session, candidate := c.sessionForControlHeader(header, path)
+	if session == nil || candidate || !session.authenticated || !session.acceptsDataPath(path) || !session.control.mayReceive(header.Sequence) {
+		return
 	}
-	peerRemote := peerLocal.remotePeers[selectedID]
-	if peerRemote.peerSess != nil {
-		delete(peerLocal.discoveredAddresses, peerRemote.peerSess.path.Address())
+	decoded, err := protocol.ParseReliable(data, c.roomTag, session.sessionID, session.ciphers.ControlRecv)
+	if err != nil || !session.control.commitReceived(header.Sequence) {
+		return
 	}
-	delete(peerLocal.remotePeers, selectedID)
-	return true
+	now := time.Now()
+	session.lastAuthenticatedPacketAt = now
+	c.rememberAuthenticatedPath(path, now)
+	for _, message := range session.reliable.receive(decoded, now) {
+		c.handleReliableMessage(sender, message)
+	}
 }
 
-func (peerLocal *Client) sendPings() {
+func (c *Client) handleHello(packet endpoint.Datagram) {
+	path, err := NewPath(packet.From)
+	if err != nil {
+		return
+	}
+	c.handleHelloOnPath(packet.Data, path)
+}
+
+func (c *Client) handleHelloOnPath(data []byte, path Path) {
+	hello, err := protocol.ParseHello(data, c.roomTag, c.admissionKey)
+	if err != nil {
+		return
+	}
+	remotePeerIdentity, err := identity.FromPublicKey(hello.IdentityKey)
+	if err != nil || remotePeerIdentity.PeerID() == c.localIdentity.PeerID() {
+		return
+	}
+	remotePeerID := remotePeerIdentity.PeerID()
+	material, err := protocol.DeriveSession(c.ephemeralPrivateKey, c.localHello, hello)
+	if err != nil {
+		return
+	}
+
+	remotePeer := c.remotePeers[remotePeerID]
+	if remotePeer == nil {
+		remotePeer = &RemotePeer{identity: remotePeerIdentity}
+		c.remotePeers[remotePeerID] = remotePeer
+	}
+	now := time.Now()
+	activeSession := remotePeer.session
+	if activeSession != nil && activeSession.sessionID == material.SessionID {
+		if c.rememberCandidatePath(activeSession, path, now) {
+			c.sendHelloOnPath(path)
+		}
+		c.sendPing(remotePeerID, false)
+		return
+	}
+
+	candidateSession := remotePeer.candidateSession
+	if candidateSession == nil || candidateSession.sessionID != material.SessionID {
+		candidateSession = newPeeringSession(path, material, now)
+		remotePeer.candidateSession = candidateSession
+		c.sendHelloOnPath(path)
+		c.sendPing(remotePeerID, true)
+		return
+	}
+	if c.rememberCandidatePath(candidateSession, path, now) {
+		c.sendHelloOnPath(path)
+	}
+	c.sendPing(remotePeerID, true)
+}
+
+func (c *Client) sendPings() {
 	type target struct {
 		peerID           string
 		candidateSession bool
 	}
-	targets := make([]target, 0, len(peerLocal.remotePeers)*2)
-	for peerID, peerRemote := range peerLocal.remotePeers {
-		if peerRemote.peerSess != nil {
+	targets := make([]target, 0, len(c.remotePeers)*2)
+	for peerID, peer := range c.remotePeers {
+		if peer.session != nil {
 			targets = append(targets, target{peerID: peerID})
 		}
-		if peerRemote.candidateSess != nil {
+		if peer.candidateSession != nil {
 			targets = append(targets, target{peerID: peerID, candidateSession: true})
 		}
 	}
 	for _, target := range targets {
-		peerLocal.sendPing(target.peerID, target.candidateSession)
+		c.sendPing(target.peerID, target.candidateSession)
 	}
 }
 
-func (peerLocal *Client) sendPing(peerID string, candidateSession bool) {
+func (c *Client) sendPing(peerID string, candidateSession bool) {
 	var peerSess *PeeringSession
-	peerRemote := peerLocal.remotePeers[peerID]
-	if peerRemote == nil {
+	peer := c.remotePeers[peerID]
+	if peer == nil {
 		return
 	}
 	if candidateSession {
-		peerSess = peerRemote.candidateSess
+		peerSess = peer.candidateSession
 	} else {
-		peerSess = peerRemote.peerSess
+		peerSess = peer.session
 	}
 	if peerSess == nil {
 		return
 	}
-	peerLocal.sendPingOnPath(peerSess, peerSess.path, &peerSess.pendingPing)
-	if !candidateSession {
-		for _, probe := range peerSess.candidatePaths {
-			peerLocal.sendPingOnPath(peerSess, probe.path, &probe.pendingPing)
-		}
+	c.sendPingOnPath(peerSess, peerSess.path, &peerSess.pendingPing)
+	if peerSess.candidatePath != nil {
+		c.sendPingOnPath(peerSess, peerSess.candidatePath.path, &peerSess.candidatePath.pendingPing)
 	}
 }
 
-func (peerLocal *Client) sendPingOnPath(peerSess *PeeringSession, path link.Path, pending *pendingPing) {
+func (c *Client) sendPingOnPath(peerSess *PeeringSession, path Path, pending *pendingPing) {
 	now := time.Now()
 	if pending.challenge != 0 && now.Sub(pending.sentAt) < pingInterval {
 		return
@@ -384,174 +540,188 @@ func (peerLocal *Client) sendPingOnPath(peerSess *PeeringSession, path link.Path
 	if err != nil {
 		return
 	}
-	sequence, err := peerSess.control.NextSendSequence()
+	sequence, err := peerSess.control.nextSendSequence()
 	if err != nil {
-		peerSess.authenticated = false
+		if peerSess.authenticated {
+			peerSess.authenticated = false
+			c.markPeerGraphDirty(peerSess.path.IsDirect())
+		}
 		return
 	}
 	*pending = pendingPing{challenge: challenge, path: path, sentAt: now}
-	packet, err := protocol.MarshalControl(protocol.PacketPing, peerLocal.roomTag, peerSess.sessionID, sequence, challenge, peerSess.ciphers.ControlSend)
-	roomNetwork := peerLocal.roomNetwork
-	if err == nil && roomNetwork != nil {
-		_ = roomNetwork.SendControl(packet, path.Address())
+	packet, err := protocol.MarshalControl(protocol.PacketPing, c.roomTag, peerSess.sessionID, sequence, challenge, peerSess.ciphers.ControlSend)
+	if err == nil {
+		_ = c.sendControlOnPath(path, packet)
 	}
 }
 
-func (peerLocal *Client) handleSessionPacket(packet endpoint.Datagram) {
-	packetPath, err := link.NewPath(packet.From)
+func (c *Client) handleSessionPacket(packet endpoint.Datagram) {
+	packetPath, err := NewPath(packet.From)
 	if err != nil {
 		return
 	}
-	header, err := protocol.ParseEstablishedHeader(packet.Data)
-	if err != nil || (header.Type != protocol.PacketPing && header.Type != protocol.PacketPong) || header.RoomTag != peerLocal.roomTag {
+	c.handleSessionPacketOnPath(packet.Data, packetPath)
+}
+
+func (c *Client) handleSessionPacketOnPath(data []byte, packetPath Path) {
+	header, err := protocol.ParseEstablishedHeader(data)
+	if err != nil || (header.Type != protocol.PacketPing && header.Type != protocol.PacketPong) || header.RoomTag != c.roomTag {
 		return
 	}
-	peerSess, candidateSession := peerLocal.sessionForControlHeader(header, packetPath)
-	if peerSess == nil || !peerSess.control.MayReceive(header.Sequence) {
+	remotePeer, peerSess, candidateSession := c.sessionForControlHeader(header, packetPath)
+	if peerSess == nil || !peerSess.control.mayReceive(header.Sequence) {
 		return
 	}
-	decoded, err := protocol.ParseControl(packet.Data, peerLocal.roomTag, peerSess.sessionID, peerSess.ciphers.ControlRecv)
-	if err != nil || !peerSess.control.CommitReceived(decoded.Sequence) {
+	decoded, err := protocol.ParseControl(data, c.roomTag, peerSess.sessionID, peerSess.ciphers.ControlRecv)
+	if err != nil || !peerSess.control.commitReceived(header.Sequence) {
 		return
 	}
-	candidatePath := peerSess.candidatePath(packet.From)
-	onCandidatePath := !candidateSession && candidatePath != nil
+	candidatePath := peerSess.candidateProbe(packetPath)
+	onCandidatePath := candidatePath != nil
 	pending := &peerSess.pendingPing
 	if onCandidatePath {
 		pending = &candidatePath.pendingPing
 	}
 	if decoded.Type == protocol.PacketPong {
-		if pending.challenge == 0 || decoded.Challenge != pending.challenge || pending.path.Address() != packet.From {
+		if pending.challenge == 0 || decoded.Challenge != pending.challenge || !pending.path.SameRoute(packetPath) {
 			return
 		}
 	}
 	wasAuthenticated := peerSess.authenticated
+	beforeDirectPath, hadDirectPath := authenticatedDirectPath(remotePeer)
 	promoted := false
 	pathChanged := false
 	now := time.Now()
 	if decoded.Type == protocol.PacketPong {
-		peerSess.lastAuthenticatedPacketAt = now
-		peerSess.authenticated = true
-		peerSess.everAuthenticated = true
-		peerSess.rttMillis = max(1, now.Sub(pending.sentAt).Milliseconds())
+		rttMillis := max(1, now.Sub(pending.sentAt).Milliseconds())
 		*pending = pendingPing{}
-		peerRemote := peerLocal.remotePeerForSession(peerSess)
-		if peerRemote == nil {
-			return
+		if onCandidatePath {
+			c.rememberAuthenticatedPath(packetPath, now)
+			if shouldPromotePath(peerSess.path, peerSess.authenticated, peerSess.rttMillis, peerSess.lastAuthenticatedPacketAt, now, packetPath, rttMillis) {
+				peerSess.clearCandidatePath()
+				peerSess.path = packetPath
+				peerSess.lastAuthenticatedPacketAt = now
+				peerSess.rttMillis = rttMillis
+				peerSess.authenticated = true
+				peerSess.everAuthenticated = true
+				peerSess.pendingPing = pendingPing{}
+				pathChanged = true
+			} else {
+				peerSess.clearCandidatePath()
+			}
+		} else {
+			if peerSess.path.SameRoute(packetPath) {
+				peerSess.path = packetPath
+			}
+			peerSess.lastAuthenticatedPacketAt = now
+			peerSess.authenticated = true
+			peerSess.everAuthenticated = true
+			c.rememberAuthenticatedPath(packetPath, now)
+			peerSess.rttMillis = rttMillis
 		}
 		if candidateSession {
-			if peerRemote.peerSess != nil && peerRemote.peerSess != peerSess {
-				delete(peerLocal.discoveredAddresses, peerRemote.peerSess.path.Address())
-				peerRemote.peerSess.authenticated = false
+			if remotePeer.session != nil && remotePeer.session != peerSess {
+				remotePeer.session.authenticated = false
 			}
-			peerRemote.peerSess = peerSess
-			peerRemote.candidateSess = nil
-			peerLocal.rememberDiscoveredAddress(peerSess.path.Address(), now)
+			remotePeer.session = peerSess
+			remotePeer.candidateSession = nil
 			promoted = true
-		} else if onCandidatePath {
-			oldAddress := peerSess.path.Address()
-			peerSess.path = packetPath
-			peerSess.clearCandidatePaths()
-			peerSess.pendingPing = pendingPing{}
-			delete(peerLocal.discoveredAddresses, oldAddress)
-			peerLocal.rememberDiscoveredAddress(packet.From, now)
-			pathChanged = true
 		}
 	} else if decoded.Type == protocol.PacketPing && peerSess.everAuthenticated && !onCandidatePath {
+		if peerSess.path.SameRoute(packetPath) {
+			peerSess.path = packetPath
+		}
 		peerSess.lastAuthenticatedPacketAt = now
+		c.rememberAuthenticatedPath(packetPath, now)
 	}
 	if decoded.Type == protocol.PacketPing {
-		sequence, sequenceErr := peerSess.control.NextSendSequence()
-		response, marshalErr := protocol.MarshalControl(protocol.PacketPong, peerLocal.roomTag, peerSess.sessionID, sequence, decoded.Challenge, peerSess.ciphers.ControlSend)
-		roomNetwork := peerLocal.roomNetwork
-		if sequenceErr == nil && marshalErr == nil && roomNetwork != nil {
-			_ = roomNetwork.SendControl(response, packet.From)
+		sequence, sequenceErr := peerSess.control.nextSendSequence()
+		response, marshalErr := protocol.MarshalControl(protocol.PacketPong, c.roomTag, peerSess.sessionID, sequence, decoded.Challenge, peerSess.ciphers.ControlSend)
+		if sequenceErr == nil && marshalErr == nil {
+			_ = c.sendControlOnPath(packetPath, response)
 		}
 		return
 	}
 	remotePeerChanged := wasAuthenticated != peerSess.authenticated || promoted || pathChanged
 	snapshotChanged := remotePeerChanged || decoded.Type == protocol.PacketPong
+	if peerSess.authenticated && (!wasAuthenticated || promoted) {
+		c.queueMemberStates()
+	}
 	if remotePeerChanged {
-		peerLocal.logger.Info("authenticated remote peers changed", "count", peerLocal.authenticatedRemotePeerCount())
+		c.rememberTopologyPeer(remotePeer.identity, now)
+		afterDirectPath, hasDirectPath := authenticatedDirectPath(remotePeer)
+		c.markPeerGraphDirty(hadDirectPath != hasDirectPath || (hasDirectPath && beforeDirectPath != afterDirectPath))
+		c.queueTopologySnapshots(now, true)
+		c.logger.Info("authenticated remote peers changed", "count", c.authenticatedRemotePeerCount())
 	}
 	if snapshotChanged {
-		peerLocal.publishStateChange()
+		c.publishStateChange()
 	}
 }
 
-func (peerLocal *Client) sessionForControlHeader(header protocol.EstablishedHeader, path link.Path) (*PeeringSession, bool) {
-	for _, peerRemote := range peerLocal.remotePeers {
-		peerSess := peerRemote.peerSess
+func (c *Client) sessionForControlHeader(header protocol.EstablishedHeader, path Path) (*RemotePeer, *PeeringSession, bool) {
+	for _, peer := range c.remotePeers {
+		peerSess := peer.session
 		if peerSess != nil && peerSess.sessionID == header.SessionID && peerSess.acceptsPath(path) {
-			return peerSess, false
+			return peer, peerSess, false
 		}
 	}
-	for _, peerRemote := range peerLocal.remotePeers {
-		peerSess := peerRemote.candidateSess
-		if peerSess != nil && peerSess.path.Address() == path.Address() && peerSess.sessionID == header.SessionID {
-			return peerSess, true
+	for _, peer := range c.remotePeers {
+		peerSess := peer.candidateSession
+		if peerSess != nil && peerSess.acceptsPath(path) && peerSess.sessionID == header.SessionID {
+			return peer, peerSess, true
 		}
 	}
-	return nil, false
+	return nil, nil, false
 }
 
-func (peerLocal *Client) sessionForVoiceHeader(header protocol.EstablishedHeader, from netip.AddrPort) *PeeringSession {
-	for _, peerRemote := range peerLocal.remotePeers {
-		peerSess := peerRemote.peerSess
-		if peerSess != nil && peerSess.path.Address() == from && peerSess.sessionID == header.SessionID {
-			return peerSess
-		}
-	}
-	return nil
-}
-
-func (peerLocal *Client) remotePeerForSession(peerSess *PeeringSession) *RemotePeer {
-	for _, peerRemote := range peerLocal.remotePeers {
-		if peerRemote.peerSess == peerSess || peerRemote.candidateSess == peerSess {
-			return peerRemote
-		}
-	}
-	return nil
-}
-
-func (peerLocal *Client) expireRemotePeers() {
-	cutoff := time.Now().Add(-remotePeerTimeout)
+func (c *Client) expireRemotePeers() {
+	now := time.Now()
+	cutoff := now.Add(-remotePeerTimeout)
+	failoverCutoff := now.Add(-pathFailoverTimeout)
 	changed := false
-	for peerID, peerRemote := range peerLocal.remotePeers {
-		peerSess := peerRemote.peerSess
+	topologyChanged := false
+	for peerID, peer := range c.remotePeers {
+		peerSess := peer.session
 		if peerSess != nil {
-			for address, probe := range peerSess.candidatePaths {
+			if probe := peerSess.candidatePath; probe != nil {
 				if probe.startedAt.Before(cutoff) {
-					delete(peerSess.candidatePaths, address)
+					peerSess.clearCandidatePath()
 				}
+			}
+			if peerSess.authenticated && peerSess.lastAuthenticatedPacketAt.Before(failoverCutoff) {
+				topologyChanged = topologyChanged || peerSess.path.IsDirect()
+				peerSess.authenticated = false
+				peerSess.pendingPing = pendingPing{}
+				peerSess.clearCandidatePath()
+				changed = true
 			}
 		}
-		if peerSess != nil && peerSess.lastAuthenticatedPacketAt.Before(cutoff) {
-			if peerSess.everAuthenticated {
-				if peerSess.authenticated {
-					peerSess.authenticated = false
-					peerSess.pendingPing = pendingPing{}
-					changed = true
-				}
-			} else {
-				delete(peerLocal.remotePeers, peerID)
-				delete(peerLocal.discoveredAddresses, peerSess.path.Address())
-			}
+		if peerSess != nil && !peerSess.everAuthenticated && peerSess.lastAuthenticatedPacketAt.Before(cutoff) {
+			delete(c.remotePeers, peerID)
 		}
 	}
-	for peerID, peerRemote := range peerLocal.remotePeers {
-		peerSess := peerRemote.candidateSess
+	for peerID, peer := range c.remotePeers {
+		peerSess := peer.candidateSession
 		if peerSess != nil && peerSess.lastAuthenticatedPacketAt.Before(cutoff) {
-			peerRemote.candidateSess = nil
-			if peerRemote.peerSess == nil {
-				delete(peerLocal.remotePeers, peerID)
+			peer.candidateSession = nil
+			if peer.session == nil {
+				delete(c.remotePeers, peerID)
 			}
 		}
 	}
 	if changed {
-		peerLocal.logger.Info("authenticated remote peers changed", "count", peerLocal.authenticatedRemotePeerCount())
-		peerLocal.publishStateChange()
+		c.markPeerGraphDirty(topologyChanged)
+		c.logger.Info("authenticated remote peers changed", "count", c.authenticatedRemotePeerCount())
+		c.publishStateChange()
 	}
+}
+
+func authenticatedDirectPath(peer *RemotePeer) (Path, bool) {
+	if peer == nil || peer.session == nil || !peer.session.authenticated || !peer.session.path.IsDirect() {
+		return Path{}, false
+	}
+	return peer.session.path, true
 }
 
 func randomUint64() (uint64, error) {
@@ -566,28 +736,35 @@ func randomUint64() (uint64, error) {
 	return value, nil
 }
 
-func (peerLocal *Client) remotePeerSnapshots() []RemotePeerSnapshot {
-	remotePeers := make([]RemotePeerSnapshot, 0, len(peerLocal.remotePeers))
-	for _, peerRemote := range peerLocal.remotePeers {
-		peerSess := peerRemote.peerSess
+func (c *Client) remotePeerSnapshots() []RemotePeerSnapshot {
+	remotePeers := make([]RemotePeerSnapshot, 0, len(c.remotePeers))
+	for _, peer := range c.remotePeers {
+		peerSess := peer.session
 		if peerSess == nil || !peerSess.authenticated {
 			continue
 		}
+		transport := "direct"
+		if !peerSess.path.IsDirect() {
+			transport = "bridge"
+		}
 		remotePeers = append(remotePeers, RemotePeerSnapshot{
-			PeerID:    peerRemote.identity.PeerID(),
+			PeerID:    peer.identity.PeerID(),
 			Address:   peerSess.path.Address().String(),
 			SessionID: hex.EncodeToString(peerSess.sessionID[:]),
 			RTTMillis: peerSess.rttMillis,
+			Transport: transport,
+			Nickname:  peerSess.remoteMemberState.nickname,
+			Muted:     peerSess.remoteMemberState.muted,
 		})
 	}
 	sort.Slice(remotePeers, func(i, j int) bool { return remotePeers[i].PeerID < remotePeers[j].PeerID })
 	return remotePeers
 }
 
-func (peerLocal *Client) authenticatedRemotePeerCount() int {
+func (c *Client) authenticatedRemotePeerCount() int {
 	count := 0
-	for _, peerRemote := range peerLocal.remotePeers {
-		if peerRemote.peerSess != nil && peerRemote.peerSess.authenticated {
+	for _, peer := range c.remotePeers {
+		if peer.session != nil && peer.session.authenticated {
 			count++
 		}
 	}
