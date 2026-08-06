@@ -168,8 +168,8 @@ func TestEndpointUsesOneSocketForSTUN(t *testing.T) {
 	if snapshot.STUN[0].MappedAddress != client.String() {
 		t.Fatalf("mapped address = %q, want %q", snapshot.STUN[0].MappedAddress, client)
 	}
-	if !hasCandidate(snapshot.Candidates, CandidateServerReflexive, client.String()) {
-		t.Fatalf("server-reflexive candidate missing: %#v", snapshot.Candidates)
+	if !hasCandidate(snapshot.Candidates, CandidateSTUN, client.String()) {
+		t.Fatalf("STUN candidate missing: %#v", snapshot.Candidates)
 	}
 
 	cancel()
@@ -709,7 +709,7 @@ func testReliablePacket(t testing.TB, roomTag [16]byte) []byte {
 
 func testBridgePacket(t testing.TB, roomTag [16]byte) []byte {
 	t.Helper()
-	packet, err := protocol.MarshalBridge(roomTag, [16]byte{1}, 1, [32]byte{2}, [32]byte{3}, testControlPacket(t, protocol.PacketPing, roomTag), testPairwiseCipher(t))
+	packet, err := protocol.MarshalBridge(roomTag, [16]byte{1}, 1, [32]byte{2}, [32]byte{3}, false, testControlPacket(t, protocol.PacketPing, roomTag), testPairwiseCipher(t))
 	if err != nil {
 		t.Fatal(err)
 	}

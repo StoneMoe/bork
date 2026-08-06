@@ -33,6 +33,7 @@ type roomNetwork interface {
 	AudioPackets() <-chan endpoint.Datagram
 	InteractivePackets() <-chan endpoint.Datagram
 	EnqueueControl([]byte, netip.AddrPort) error
+	EnqueueBackground([]byte, netip.AddrPort) error
 	SendRealtimeBatch(endpoint.RealtimeBatch) error
 	InvalidateRealtime(uint64)
 }
@@ -40,17 +41,21 @@ type roomNetwork interface {
 type roomNetworkFactory func() roomNetwork
 
 type ClientSnapshot struct {
-	Name         string
-	Phase        string
-	RemotePeers  []RemotePeerSnapshot
-	Connectivity ConnectivitySnapshot
+	Name             string
+	Phase            string
+	ScreenSharing    bool
+	RemotePeers      []RemotePeerSnapshot
+	Transfers        []FileTransferSnapshot
+	VirtualLAN       VirtualLANSnapshot
+	RemoteVirtualLAN []RemoteVirtualLANSnapshot
+	Connectivity     ConnectivitySnapshot
 }
 
 type ConnectivitySnapshot struct {
-	KnownAddresses []KnownAddressSnapshot `json:"knownAddresses"`
+	DiscoveryHints []DiscoveryHintSnapshot `json:"discoveryHints"`
 }
 
-type KnownAddressSnapshot struct {
+type DiscoveryHintSnapshot struct {
 	Address   string `json:"address"`
 	Source    string `json:"source"`
 	ExpiresAt string `json:"expiresAt,omitempty"`
@@ -65,6 +70,16 @@ type Client struct {
 	memberStateMu      sync.Mutex
 	desiredMemberState memberState
 	memberStateUpdates chan struct{}
+	screenCommands     chan screenCommand
+	screenVideoChunks  chan ScreenVideoChunk
+	fileCommands       chan fileCommand
+	fileWorkResults    chan fileWorkResult
+	virtualLANCommands chan virtualLANCommand
+	virtualLANEvents   chan virtualLANEvent
+	loopReady          chan struct{}
+	loopDone           chan struct{}
+	fileContext        context.Context
+	fileWorkers        sync.WaitGroup
 
 	snapshotMu                 sync.RWMutex
 	snapshot                   ClientSnapshot
@@ -85,10 +100,25 @@ type Client struct {
 	groupSendSequence          uint64
 	groupStreamPendingTopology bool
 	groupReceivers             map[groupStreamKey]*groupReceiveState
+	screenVideoReceivers       map[groupStreamKey]*screenVideoReceiveState
+	screenVideoRetainedBytes   int
 	fanout                     outboundFanout
 	fanoutDirty                bool
 	reliablePeerCursor         string
 	localMemberState           memberState
+	localScreenState           screenState
+	screenVideoSendSequence    uint64
+	screenVideoChunkID         uint32
+	fileTransfers              map[[16]byte]*fileTransfer
+	localVirtualLAN            virtualLANState
+	virtualLANSendSequence     uint64
+	virtualLANStatus           string
+	virtualLANError            string
+	virtualLANInterface        string
+	virtualLANWorker           *virtualLANWorker
+	virtualLANPending          chan error
+	virtualLANCreate           virtualLANCreate
+	virtualLANConfigure        virtualLANConfigure
 
 	stateChanges chan struct{}
 	started      atomic.Bool
@@ -113,23 +143,38 @@ func NewClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, 
 func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, networkFactory roomNetworkFactory, logger *slog.Logger) *Client {
 	groupProtector := protocol.NewGroupDatagramCipher(roomInvite.GroupMediaKey())
 	client := &Client{
-		localIdentity:       localIdentity,
-		roomInvite:          roomInvite,
-		logger:              logger,
-		networkFactory:      networkFactory,
-		snapshot:            ClientSnapshot{Name: roomInvite.DisplayName, Phase: "gathering", RemotePeers: []RemotePeerSnapshot{}},
-		roomTag:             roomInvite.RoomTag(),
-		admissionKey:        roomInvite.AdmissionKey(),
-		discoveredAddresses: make(map[netip.AddrPort]discoveredAddress),
-		remotePeers:         make(map[string]*RemotePeer),
-		topology:            make(map[string]*topologyPeer),
-		stateChanges:        make(chan struct{}, 1),
-		memberStateUpdates:  make(chan struct{}, 1),
-		localMemberState:    memberState{generation: 1},
-		topologyGeneration:  1,
-		groupProtector:      groupProtector,
-		groupReceivers:      make(map[groupStreamKey]*groupReceiveState),
-		fanoutDirty:         true,
+		localIdentity:        localIdentity,
+		roomInvite:           roomInvite,
+		logger:               logger,
+		networkFactory:       networkFactory,
+		snapshot:             ClientSnapshot{Name: roomInvite.DisplayName, Phase: "gathering", RemotePeers: []RemotePeerSnapshot{}, RemoteVirtualLAN: []RemoteVirtualLANSnapshot{}},
+		roomTag:              roomInvite.RoomTag(),
+		admissionKey:         roomInvite.AdmissionKey(),
+		discoveredAddresses:  make(map[netip.AddrPort]discoveredAddress),
+		remotePeers:          make(map[string]*RemotePeer),
+		topology:             make(map[string]*topologyPeer),
+		stateChanges:         make(chan struct{}, 1),
+		memberStateUpdates:   make(chan struct{}, 1),
+		screenCommands:       make(chan screenCommand),
+		screenVideoChunks:    make(chan ScreenVideoChunk, maxCompletedScreenVideoChunks),
+		fileCommands:         make(chan fileCommand),
+		fileWorkResults:      make(chan fileWorkResult, 64),
+		virtualLANCommands:   make(chan virtualLANCommand),
+		virtualLANEvents:     make(chan virtualLANEvent, maxVirtualLANEvents),
+		loopReady:            make(chan struct{}),
+		loopDone:             make(chan struct{}),
+		localMemberState:     memberState{generation: 1},
+		localScreenState:     screenState{generation: 1},
+		topologyGeneration:   1,
+		groupProtector:       groupProtector,
+		groupReceivers:       make(map[groupStreamKey]*groupReceiveState),
+		screenVideoReceivers: make(map[groupStreamKey]*screenVideoReceiveState),
+		fileTransfers:        make(map[[16]byte]*fileTransfer),
+		localVirtualLAN:      virtualLANState{generation: 1},
+		virtualLANStatus:     "disabled",
+		virtualLANCreate:     createVirtualLANDevice,
+		virtualLANConfigure:  configureVirtualLANPlatform,
+		fanoutDirty:          true,
 	}
 	copy(client.groupSenderID[:], localIdentity.PublicKey())
 	return client
@@ -139,10 +184,13 @@ func (c *Client) StateChanges() <-chan struct{} {
 	return c.stateChanges
 }
 
+func (c *Client) Ready() <-chan struct{} { return c.loopReady }
+
 func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	if !c.started.CompareAndSwap(false, true) {
 		return errors.New("peer client has already been started")
 	}
+	defer close(c.loopDone)
 	if err := c.rotateHelloEpoch(); err != nil {
 		return err
 	}
@@ -150,9 +198,17 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	c.applyDesiredMemberState()
 
 	ctx, cancel := context.WithCancel(parent)
-	defer cancel()
+	c.fileContext = ctx
+	defer func() {
+		c.stopVirtualLAN()
+		c.stopFileTransfers()
+		cancel()
+		c.fileWorkers.Wait()
+		c.discardFileWorkResults()
+	}()
 	roomNetwork := c.networkFactory()
 	c.roomNetwork = roomNetwork
+	close(c.loopReady)
 	if mediaPort != nil {
 		mediaPort.SetSendInvalidator(roomNetwork.InvalidateRealtime)
 		defer mediaPort.SetSendInvalidator(nil)
@@ -219,6 +275,16 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 		select {
 		case <-c.memberStateUpdates:
 			c.applyDesiredMemberState()
+		case command := <-c.screenCommands:
+			c.handleScreenCommand(command)
+		case command := <-c.fileCommands:
+			c.handleFileCommand(command)
+		case result := <-c.fileWorkResults:
+			c.handleFileWorkResult(result)
+		case command := <-c.virtualLANCommands:
+			c.handleVirtualLANCommand(command)
+		case event := <-c.virtualLANEvents:
+			c.handleVirtualLANEvent(event)
 		case _, ok := <-networkChanges:
 			if !ok {
 				networkChanges = nil
@@ -259,14 +325,18 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 			c.sendPings()
 		case now := <-reliableTicker.C:
 			c.queueMemberStates()
+			c.queueScreenStates()
+			c.queueVirtualLANStates()
 			c.sendReliable(now)
 		case now := <-cleanupTicker.C:
 			c.expireRemotePeers()
+			c.expireFileTransfers(now)
 			if c.expireDiscoveryHints(now) {
 				c.publishStateChange()
 			}
 			c.expireTopology(now)
 			c.expireGroupStreams(now)
+			c.expireScreenVideoChunks(now)
 		case err := <-networkResult:
 			if ctx.Err() != nil {
 				return nil
@@ -316,7 +386,9 @@ func (c *Client) StateSnapshot() (ClientSnapshot, networking.RoomSnapshot) {
 	defer c.snapshotMu.RUnlock()
 	snapshot := c.snapshot
 	snapshot.RemotePeers = append([]RemotePeerSnapshot{}, snapshot.RemotePeers...)
-	snapshot.Connectivity.KnownAddresses = append([]KnownAddressSnapshot{}, snapshot.Connectivity.KnownAddresses...)
+	snapshot.Transfers = append([]FileTransferSnapshot{}, snapshot.Transfers...)
+	snapshot.RemoteVirtualLAN = append([]RemoteVirtualLANSnapshot{}, snapshot.RemoteVirtualLAN...)
+	snapshot.Connectivity.DiscoveryHints = append([]DiscoveryHintSnapshot{}, snapshot.Connectivity.DiscoveryHints...)
 	return snapshot, c.networkSnapshot.Clone()
 }
 
@@ -360,29 +432,33 @@ func (c *Client) publishStateChange() {
 
 func (c *Client) refreshSnapshotLocked() {
 	c.snapshot = ClientSnapshot{
-		Name:         c.roomInvite.DisplayName,
-		Phase:        c.phase(),
-		RemotePeers:  c.remotePeerSnapshots(),
-		Connectivity: c.connectivitySnapshot(),
+		Name:             c.roomInvite.DisplayName,
+		Phase:            c.phase(),
+		ScreenSharing:    c.localScreenState.active,
+		RemotePeers:      c.remotePeerSnapshots(),
+		Transfers:        c.fileTransferSnapshots(),
+		VirtualLAN:       c.virtualLANSnapshot(),
+		RemoteVirtualLAN: c.remoteVirtualLANSnapshots(),
+		Connectivity:     c.connectivitySnapshot(),
 	}
 }
 
 func (c *Client) connectivitySnapshot() ConnectivitySnapshot {
-	knownAddresses := make([]KnownAddressSnapshot, 0, len(c.discoveredAddresses))
+	discoveryHints := make([]DiscoveryHintSnapshot, 0, len(c.discoveredAddresses))
 	for address, remembered := range c.discoveredAddresses {
 		expiresAt := ""
 		if !remembered.expiresAt.IsZero() {
 			expiresAt = remembered.expiresAt.UTC().Format(time.RFC3339)
 		}
-		knownAddresses = append(knownAddresses, KnownAddressSnapshot{
+		discoveryHints = append(discoveryHints, DiscoveryHintSnapshot{
 			Address: address.String(), Source: string(remembered.source), ExpiresAt: expiresAt,
 		})
 	}
-	sort.Slice(knownAddresses, func(i, j int) bool {
-		if knownAddresses[i].Source != knownAddresses[j].Source {
-			return knownAddresses[i].Source < knownAddresses[j].Source
+	sort.Slice(discoveryHints, func(i, j int) bool {
+		if discoveryHints[i].Source != discoveryHints[j].Source {
+			return discoveryHints[i].Source < discoveryHints[j].Source
 		}
-		return knownAddresses[i].Address < knownAddresses[j].Address
+		return discoveryHints[i].Address < discoveryHints[j].Address
 	})
-	return ConnectivitySnapshot{KnownAddresses: knownAddresses}
+	return ConnectivitySnapshot{DiscoveryHints: discoveryHints}
 }

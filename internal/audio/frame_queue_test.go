@@ -9,13 +9,17 @@ func TestPCMFrameQueueTransfersSlotOwnershipWithoutCopying(t *testing.T) {
 		t.Fatal("AcquireWrite() failed")
 	}
 	write.Samples[0] = 0.25
+	write.Reference[0] = 0.5
 	write.Timestamp = 480
+	write.LocalOnly = true
+	write.Muted = true
+	write.ReferenceValid = true
 	queue.CommitWrite()
 	read, ok := queue.AcquireRead()
 	if !ok {
 		t.Fatal("AcquireRead() failed")
 	}
-	if read != write || read.Samples[0] != 0.25 || read.Timestamp != 480 {
+	if read != write || read.Samples[0] != 0.25 || read.Reference[0] != 0.5 || read.Timestamp != 480 || !read.LocalOnly || !read.Muted || !read.ReferenceValid {
 		t.Fatalf("read slot = %#v", read)
 	}
 	queue.ReleaseRead()

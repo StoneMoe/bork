@@ -46,6 +46,7 @@ func (c *Client) refreshFanout(now time.Time) {
 		}
 	}
 	plan := buildFanoutPlan(listeners, direct, c.topology, now)
+	plan = constrainFanoutToActivePaths(plan, c.remotePeers)
 	plan.generation = c.fanout.generation + 1
 	if plan.generation == 0 {
 		plan.generation = 1
@@ -91,6 +92,50 @@ func (c *Client) refreshFanout(now time.Time) {
 	plan.activateAt = now.Add(fanoutActivationDelay)
 	c.fanout = plan
 	c.fanoutDirty = false
+}
+
+func constrainFanoutToActivePaths(plan outboundFanout, peers map[string]*RemotePeer) outboundFanout {
+	forced := make(map[string]string)
+	targets := make([]string, 0)
+	for targetID, peer := range peers {
+		if peer == nil || peer.session == nil || !peer.session.authenticated || peer.session.path.IsDirect() {
+			continue
+		}
+		intermediary, err := identityFromRaw(peer.session.path.Intermediary())
+		if err != nil {
+			continue
+		}
+		forwarder := peers[intermediary.PeerID()]
+		if forwarder == nil || forwarder.session == nil || !forwarder.session.authenticated || !forwarder.session.path.IsDirect() || forwarder.session.path.Address() != peer.session.path.Address() {
+			continue
+		}
+		forced[targetID] = intermediary.PeerID()
+		targets = append(targets, targetID)
+	}
+	if len(forced) == 0 {
+		return plan
+	}
+	for forwarderID, assigned := range plan.assignments {
+		filtered := assigned[:0]
+		for _, targetID := range assigned {
+			if _, replace := forced[targetID]; !replace {
+				filtered = append(filtered, targetID)
+			}
+		}
+		plan.assignments[forwarderID] = filtered
+	}
+	sort.Strings(targets)
+	for _, targetID := range targets {
+		forwarderID := forced[targetID]
+		if !containsPeerID(plan.destinations, forwarderID) {
+			plan.destinations = append(plan.destinations, forwarderID)
+		}
+		if !containsPeerID(plan.assignments[forwarderID], targetID) {
+			plan.assignments[forwarderID] = append(plan.assignments[forwarderID], targetID)
+			sort.Strings(plan.assignments[forwarderID])
+		}
+	}
+	return plan
 }
 
 func (c *Client) fanoutReady(now time.Time) bool {
@@ -206,6 +251,18 @@ func (c *Client) handleReliableMessage(sender *RemotePeer, message deliveredReli
 		c.handleMemberState(sender, message.payload)
 		return
 	}
+	if message.channel == reliableChannelScreenState {
+		c.handleScreenState(sender, message.payload)
+		return
+	}
+	if message.channel == reliableChannelVirtualLAN {
+		c.handleVirtualLANState(sender, message.payload)
+		return
+	}
+	if message.channel == reliableChannelFileControl || message.channel == reliableChannelFileData {
+		c.handleFileMessage(sender, message)
+		return
+	}
 	if message.channel != reliableChannelFanout {
 		return
 	}
@@ -236,6 +293,34 @@ func (c *Client) handleReliableMessage(sender *RemotePeer, message deliveredReli
 	sender.session.inboundFanout = fanoutAssignment{generation: generation, listeners: listeners}
 }
 
+func (c *Client) sendRealtimePacketsToPeers(class protocol.TrafficClass, packets [][]byte, peerIDs []string, deadline time.Time, generation uint64) bool {
+	if c.roomNetwork == nil || len(packets) == 0 {
+		return false
+	}
+	admitted := false
+	batch := endpoint.RealtimeBatch{
+		Class: class, Deadline: deadline, Generation: generation,
+		Datagrams: make([]endpoint.RealtimeDatagram, 0, endpoint.MaxRealtimeBatchDatagrams),
+	}
+	for _, peerID := range peerIDs {
+		peer := c.remotePeers[peerID]
+		if peer == nil || peer.session == nil || !peer.session.authenticated || !peer.session.path.IsDirect() {
+			continue
+		}
+		for _, packet := range packets {
+			batch.Datagrams = append(batch.Datagrams, endpoint.RealtimeDatagram{Data: packet, Destination: peer.session.path.Address()})
+			if len(batch.Datagrams) == endpoint.MaxRealtimeBatchDatagrams {
+				admitted = c.roomNetwork.SendRealtimeBatch(batch) == nil || admitted
+				batch.Datagrams = make([]endpoint.RealtimeDatagram, 0, endpoint.MaxRealtimeBatchDatagrams)
+			}
+		}
+	}
+	if len(batch.Datagrams) > 0 {
+		admitted = c.roomNetwork.SendRealtimeBatch(batch) == nil || admitted
+	}
+	return admitted
+}
+
 func (c *Client) forwardGroupDatagram(senderID string, class protocol.TrafficClass, packet endpoint.Datagram, deadline time.Time) {
 	if c.roomNetwork == nil {
 		return
@@ -252,29 +337,7 @@ func (c *Client) forwardGroupDatagram(senderID string, class protocol.TrafficCla
 }
 
 func (c *Client) sendRealtimeToPeers(class protocol.TrafficClass, packet []byte, peerIDs []string, deadline time.Time, generation uint64) {
-	if c.roomNetwork == nil {
-		return
-	}
-	batch := endpoint.RealtimeBatch{
-		Class: class, Deadline: deadline, Generation: generation,
-		Datagrams: make([]endpoint.RealtimeDatagram, 0, endpoint.MaxRealtimeBatchDatagrams),
-	}
-	for _, peerID := range peerIDs {
-		peer := c.remotePeers[peerID]
-		if peer == nil || peer.session == nil || !peer.session.authenticated || !peer.session.path.IsDirect() {
-			continue
-		}
-		batch.Datagrams = append(batch.Datagrams, endpoint.RealtimeDatagram{
-			Data: packet, Destination: peer.session.path.Address(),
-		})
-		if len(batch.Datagrams) == endpoint.MaxRealtimeBatchDatagrams {
-			_ = c.roomNetwork.SendRealtimeBatch(batch)
-			batch.Datagrams = make([]endpoint.RealtimeDatagram, 0, endpoint.MaxRealtimeBatchDatagrams)
-		}
-	}
-	if len(batch.Datagrams) > 0 {
-		_ = c.roomNetwork.SendRealtimeBatch(batch)
-	}
+	c.sendRealtimePacketsToPeers(class, [][]byte{packet}, peerIDs, deadline, generation)
 }
 
 func identityFromRaw(raw [32]byte) (identity.Identity, error) {

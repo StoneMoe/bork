@@ -9,9 +9,9 @@ import (
 type CandidateType string
 
 const (
-	CandidateHost            CandidateType = "host"
-	CandidateServerReflexive CandidateType = "server-reflexive"
-	CandidatePortMapped      CandidateType = "port-mapped"
+	CandidateNIC        CandidateType = "nic"
+	CandidateSTUN       CandidateType = "stun"
+	CandidatePortMapped CandidateType = "port-mapped"
 )
 
 type Candidate struct {
@@ -22,14 +22,14 @@ type Candidate struct {
 	Source    string        `json:"source,omitempty"`
 }
 
-func hostCandidates(boundAddress netip.Addr, port uint16) ([]Candidate, error) {
+func nicCandidates(boundAddress netip.Addr, port uint16) ([]Candidate, error) {
 	boundAddress = boundAddress.Unmap()
 	if boundAddress.IsValid() && !boundAddress.IsUnspecified() {
-		if !isUsableHostAddress(boundAddress) {
+		if !isUsableNICAddress(boundAddress) {
 			return []Candidate{}, nil
 		}
 		return []Candidate{{
-			Type:    CandidateHost,
+			Type:    CandidateNIC,
 			Address: netip.AddrPortFrom(boundAddress, port).String(),
 			Family:  addressFamily(boundAddress),
 		}}, nil
@@ -61,7 +61,7 @@ func hostCandidates(boundAddress netip.Addr, port uint16) ([]Candidate, error) {
 			if boundAddress.Is4() && !parsed.Is4() {
 				continue
 			}
-			if !isUsableHostAddress(parsed) {
+			if !isUsableNICAddress(parsed) {
 				continue
 			}
 			if _, exists := seen[parsed]; exists {
@@ -69,7 +69,7 @@ func hostCandidates(boundAddress netip.Addr, port uint16) ([]Candidate, error) {
 			}
 			seen[parsed] = struct{}{}
 			candidates = append(candidates, Candidate{
-				Type:      CandidateHost,
+				Type:      CandidateNIC,
 				Address:   netip.AddrPortFrom(parsed, port).String(),
 				Family:    addressFamily(parsed),
 				Interface: networkInterface.Name,
@@ -88,7 +88,7 @@ func hostCandidates(boundAddress netip.Addr, port uint16) ([]Candidate, error) {
 	return candidates, nil
 }
 
-func isUsableHostAddress(address netip.Addr) bool {
+func isUsableNICAddress(address netip.Addr) bool {
 	return address.IsValid() &&
 		!address.IsUnspecified() &&
 		!address.IsLoopback() &&

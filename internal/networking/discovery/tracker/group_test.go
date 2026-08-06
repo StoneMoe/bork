@@ -86,6 +86,27 @@ func TestGroupAnnouncesBoundedActualEndpointCandidates(t *testing.T) {
 	}
 }
 
+func TestGroupSnapshotKeepsStatusPerCandidate(t *testing.T) {
+	group, err := New([]string{"https://tracker.example/announce"}, [20]byte{1}, testTrackerIdentity, nil, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := AnnounceCandidate{Address: netip.MustParseAddr("8.8.8.8"), Port: 41001}
+	second := AnnounceCandidate{Address: netip.MustParseAddr("1.1.1.1"), Port: 41002}
+	group.UpdateCandidates([]AnnounceCandidate{first, second})
+	firstChild, _ := newAnnouncerFromProviders(group.providers, group.infoHash, group.identityKey, first, nil, group.logger)
+	secondChild, _ := newAnnouncerFromProviders(group.providers, group.infoHash, group.identityKey, second, nil, group.logger)
+	firstChild.recordStatus(group.providers[0], ProviderStatus{PeerCount: 3})
+	secondChild.recordStatus(group.providers[0], ProviderStatus{Error: "second failed"})
+	group.setChildren(map[AnnounceCandidate]*Announcer{first: firstChild, second: secondChild})
+
+	statuses := group.Snapshot()
+	if len(statuses) != 2 || statuses[0].Candidate != first.String() || statuses[0].PeerCount != 3 || statuses[0].Error != "" ||
+		statuses[1].Candidate != second.String() || statuses[1].PeerCount != 0 || statuses[1].Error != "second failed" {
+		t.Fatalf("candidate statuses = %#v", statuses)
+	}
+}
+
 func TestGroupCandidateNormalizationIsBoundedAndStable(t *testing.T) {
 	input := []AnnounceCandidate{
 		{Address: netip.MustParseAddr("8.8.8.8"), Port: 1},

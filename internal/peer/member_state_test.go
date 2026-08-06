@@ -29,12 +29,12 @@ func TestMemberStateCodecAndNicknameValidation(t *testing.T) {
 		})
 	}
 
-	payload, err := encodeMemberState(memberState{generation: 42, nickname: " Alice ", muted: true})
+	payload, err := encodeMemberState(memberState{generation: 42, nickname: " Alice ", muted: true, playbackMuted: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	decoded, err := decodeMemberState(payload)
-	if err != nil || decoded.generation != 42 || decoded.nickname != "Alice" || !decoded.muted || binary.BigEndian.Uint64(payload[1:9]) != 42 || payload[9] != 1 {
+	if err != nil || decoded.generation != 42 || decoded.nickname != "Alice" || !decoded.muted || !decoded.playbackMuted || binary.BigEndian.Uint64(payload[1:9]) != 42 || payload[9] != 3 {
 		t.Fatalf("decoded member state = %#v, %v", decoded, err)
 	}
 
@@ -42,13 +42,13 @@ func TestMemberStateCodecAndNicknameValidation(t *testing.T) {
 	badVersion[0]++
 	zeroGeneration := append([]byte(nil), payload...)
 	clear(zeroGeneration[1:9])
-	badMuted := append([]byte(nil), payload...)
-	badMuted[9] = 2
+	badFlags := append([]byte(nil), payload...)
+	badFlags[9] = 4
 	for name, malformed := range map[string][]byte{
 		"short":                  payload[:9],
 		"version":                badVersion,
 		"zero generation":        zeroGeneration,
-		"non-canonical muted":    badMuted,
+		"unknown flags":          badFlags,
 		"non-canonical nickname": append(append([]byte(nil), payload...), ' '),
 		"invalid nickname":       append(append([]byte(nil), payload[:10]...), 0xff),
 	} {
@@ -72,29 +72,29 @@ func TestMemberStateGenerationReplacementIsSessionScoped(t *testing.T) {
 	session.authenticated = true
 	remote := &RemotePeer{identity: remoteIdentity, session: session}
 	client.remotePeers[remoteIdentity.PeerID()] = remote
-	message := func(generation uint64, nickname string, muted bool) []byte {
-		payload, encodeErr := encodeMemberState(memberState{generation: generation, nickname: nickname, muted: muted})
+	message := func(generation uint64, nickname string, muted, playbackMuted bool) []byte {
+		payload, encodeErr := encodeMemberState(memberState{generation: generation, nickname: nickname, muted: muted, playbackMuted: playbackMuted})
 		if encodeErr != nil {
 			t.Fatal(encodeErr)
 		}
 		return payload
 	}
 
-	client.handleReliableMessage(remote, deliveredReliableMessage{channel: reliableChannelMemberState, payload: message(2, "Alice", true)})
-	client.handleReliableMessage(remote, deliveredReliableMessage{channel: reliableChannelMemberState, payload: message(1, "stale", false)})
-	client.handleReliableMessage(remote, deliveredReliableMessage{channel: reliableChannelMemberState, payload: message(2, "duplicate", false)})
-	if session.remoteMemberState.nickname != "Alice" || !session.remoteMemberState.muted || len(client.stateChanges) != 1 {
+	client.handleReliableMessage(remote, deliveredReliableMessage{channel: reliableChannelMemberState, payload: message(2, "Alice", true, true)})
+	client.handleReliableMessage(remote, deliveredReliableMessage{channel: reliableChannelMemberState, payload: message(1, "stale", false, false)})
+	client.handleReliableMessage(remote, deliveredReliableMessage{channel: reliableChannelMemberState, payload: message(2, "duplicate", false, false)})
+	if session.remoteMemberState.nickname != "Alice" || !session.remoteMemberState.muted || !session.remoteMemberState.playbackMuted || len(client.stateChanges) != 1 {
 		t.Fatalf("session member state = %#v, changes=%d", session.remoteMemberState, len(client.stateChanges))
 	}
 	snapshot, _ := client.StateSnapshot()
-	if len(snapshot.RemotePeers) != 1 || snapshot.RemotePeers[0].Nickname != "Alice" || !snapshot.RemotePeers[0].Muted {
+	if len(snapshot.RemotePeers) != 1 || snapshot.RemotePeers[0].Nickname != "Alice" || !snapshot.RemotePeers[0].Muted || !snapshot.RemotePeers[0].PlaybackMuted {
 		t.Fatalf("remote peer snapshot = %#v", snapshot.RemotePeers)
 	}
 
 	replacement := testPeeringSession(t, path)
 	replacement.authenticated = true
 	remote.session = replacement
-	client.handleReliableMessage(remote, deliveredReliableMessage{channel: reliableChannelMemberState, payload: message(1, "Bob", false)})
+	client.handleReliableMessage(remote, deliveredReliableMessage{channel: reliableChannelMemberState, payload: message(1, "Bob", false, false)})
 	if replacement.remoteMemberState.generation != 1 || replacement.remoteMemberState.nickname != "Bob" || len(client.stateChanges) != 2 {
 		t.Fatalf("replacement session member state = %#v, changes=%d", replacement.remoteMemberState, len(client.stateChanges))
 	}
@@ -126,10 +126,10 @@ func TestMemberStateQueueRetriesAndCoalescesDesiredUpdates(t *testing.T) {
 		t.Fatal("unchanged member state was queued twice")
 	}
 
-	if err := client.SetLocalMemberState("first", false); err != nil {
+	if err := client.SetLocalMemberState("first", false, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.SetLocalMemberState(" second ", true); err != nil {
+	if err := client.SetLocalMemberState(" second ", true, true); err != nil {
 		t.Fatal(err)
 	}
 	if len(client.memberStateUpdates) != 1 {
@@ -137,15 +137,15 @@ func TestMemberStateQueueRetriesAndCoalescesDesiredUpdates(t *testing.T) {
 	}
 	<-client.memberStateUpdates
 	client.applyDesiredMemberState()
-	if client.localMemberState.generation != 2 || client.localMemberState.nickname != "second" || !client.localMemberState.muted ||
+	if client.localMemberState.generation != 2 || client.localMemberState.nickname != "second" || !client.localMemberState.muted || !client.localMemberState.playbackMuted ||
 		session.memberStateSentGeneration != 2 || len(session.reliable.outbound) != 2 {
 		t.Fatalf("local state = %#v, sent=%d, queued=%d", client.localMemberState, session.memberStateSentGeneration, len(session.reliable.outbound))
 	}
 	queued, err := decodeMemberState(session.reliable.outbound[1].payload)
-	if err != nil || queued.generation != 2 || queued.nickname != "second" || !queued.muted {
+	if err != nil || queued.generation != 2 || queued.nickname != "second" || !queued.muted || !queued.playbackMuted {
 		t.Fatalf("queued member state = %#v, %v", queued, err)
 	}
-	if err := client.SetLocalMemberState("second", true); err != nil {
+	if err := client.SetLocalMemberState("second", true, true); err != nil {
 		t.Fatal(err)
 	}
 	client.applyDesiredMemberState()

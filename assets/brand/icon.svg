@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">Bork discrete peer-to-peer network mark</title>
+  <defs>
+    <linearGradient id="background" x1="112" y1="88" x2="912" y2="936" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#151B2D"/>
+      <stop offset="1" stop-color="#080A11"/>
+    </linearGradient>
+    <g id="peer">
+      <path d="M0-55 48-26 44 29 0 56-48 27-44-29Z" fill="currentColor"/>
+      <path d="M0-55 48-26 0 2-44-29Z" fill="#FFFFFF" opacity=".16"/>
+      <path d="m0 2 44 27L0 56Z" fill="#050711" opacity=".16"/>
+    </g>
+  </defs>
+  <rect x="48" y="48" width="928" height="928" rx="224" fill="url(#background)"/>
+  <path d="M512 96 874 304 830 786 512 928 194 786 150 304Z" fill="#111726"/>
+  <g fill="none" stroke="#303A76" stroke-width="28" stroke-linecap="square" stroke-linejoin="bevel">
+    <path d="m292 244 244 18 184 130-184 118-244 2Z"/>
+    <path d="m292 512 244-2 184 142-184 116-244 12Z"/>
+  </g>
+  <path d="m536 262 184 130" fill="none" stroke="#4A58B8" stroke-width="28"/>
+  <path d="m536 510 184 142" fill="none" stroke="#3B8D9E" stroke-width="28"/>
+  <use href="#peer" transform="translate(292 244) rotate(-8)" color="#7281ED"/>
+  <use href="#peer" transform="translate(292 512) rotate(7)" color="#5969D7"/>
+  <use href="#peer" transform="translate(292 780) rotate(-5)" color="#4050AE"/>
+  <use href="#peer" transform="translate(536 262) rotate(9)" color="#6474E4"/>
+  <use href="#peer" transform="translate(720 392) rotate(-6)" color="#67DDE8"/>
+  <use href="#peer" transform="translate(536 510) rotate(5)" color="#6B79E7"/>
+  <use href="#peer" transform="translate(720 652) rotate(8)" color="#4F60C9"/>
+  <use href="#peer" transform="translate(536 768) rotate(-9)" color="#394791"/>
+</svg>

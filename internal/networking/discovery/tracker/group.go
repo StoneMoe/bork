@@ -79,7 +79,7 @@ func (g *Group) Snapshot() []ProviderStatus {
 		}
 		for _, configured := range g.providers {
 			statuses = append(statuses, ProviderStatus{
-				Provider: configured.display, Candidate: candidate.String(),
+				Provider: configured.display, Candidate: candidate.String(), PeerAddresses: []string{},
 			})
 		}
 	}

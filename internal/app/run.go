@@ -9,6 +9,7 @@ import (
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/mac"
 )
 
 func RunGUI(cfg config.Config, assets embed.FS, logger *slog.Logger) error {
@@ -19,6 +20,8 @@ func RunGUI(cfg config.Config, assets embed.FS, logger *slog.Logger) error {
 		Height:    620,
 		MinWidth:  800,
 		MinHeight: 600,
+		Frameless: true,
+		Mac:       &mac.Options{},
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},

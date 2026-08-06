@@ -30,19 +30,22 @@ type jitterStream struct {
 	losses            int
 	pcm               []float32
 	speaking          speakingHold
+	normalizer        loudnessNormalizer
 }
 
 type mixer struct {
-	streams         map[string]*jitterStream
-	maxFrameBytes   int
-	speakingPeerIDs []string
+	streams               map[string]*jitterStream
+	maxFrameBytes         int
+	speakingPeerIDs       []string
+	loudnessNormalization bool
 }
 
 func newMixer(maxFrameBytes int) *mixer {
 	return &mixer{
-		streams:         make(map[string]*jitterStream),
-		maxFrameBytes:   maxFrameBytes,
-		speakingPeerIDs: []string{},
+		streams:               make(map[string]*jitterStream),
+		maxFrameBytes:         maxFrameBytes,
+		speakingPeerIDs:       []string{},
+		loudnessNormalization: true,
 	}
 }
 
@@ -59,6 +62,7 @@ func (m *mixer) Add(frame media.ReceivedFrame) error {
 			frames:   make(map[uint32]jitterFrame),
 			pcm:      make([]float32, FrameSamples),
 		}
+		stream.normalizer.reset()
 		m.streams[frame.SourceID] = stream
 	}
 	if frame.StreamID != stream.streamID {
@@ -129,6 +133,7 @@ func resetJitterStream(stream *jitterStream, streamID [16]byte, sequenceFloor ui
 	stream.hasLatest = false
 	stream.started = false
 	stream.losses = 0
+	stream.normalizer.reset()
 }
 
 func (m *mixer) NextInto(destination []float32) (bool, error) {
@@ -148,6 +153,7 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 			start, ok := contiguousStart(stream.frames)
 			if !ok {
 				stream.speaking.update(false)
+				stream.normalizer.process(nil, 0, false, m.loudnessNormalization)
 				continue
 			}
 			stream.expectedTimestamp = start
@@ -166,6 +172,7 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 				stream.started = false
 				stream.losses = 0
 				stream.speaking.update(false)
+				stream.normalizer.reset()
 				continue
 			}
 		}
@@ -197,6 +204,7 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 		stream.expectedTimestamp += FrameSamples
 		level := pcmRMS(stream.pcm)
 		stream.speaking.update(level > speakingThreshold)
+		stream.normalizer.process(stream.pcm, level, exists, m.loudnessNormalization)
 		if !(level > 0.0001) {
 			continue
 		}
@@ -266,6 +274,44 @@ func pcmRMS(pcm []float32) float64 {
 		energy += float64(sample * sample)
 	}
 	return math.Sqrt(energy / float64(len(pcm)))
+}
+
+type loudnessNormalizer struct {
+	measuredRMS float64
+	gain        float64
+	holdFrames  int
+}
+
+func (n *loudnessNormalizer) reset() {
+	*n = loudnessNormalizer{gain: 1}
+}
+
+func (n *loudnessNormalizer) process(pcm []float32, rawRMS float64, measured, enabled bool) {
+	if n.gain == 0 {
+		n.gain = 1
+	}
+	if measured && rawRMS > speakingThreshold {
+		if n.measuredRMS == 0 {
+			n.measuredRMS = rawRMS
+		} else {
+			coefficient := 1.0 / float64(normalizationReleaseFrames)
+			if rawRMS > n.measuredRMS {
+				coefficient = 1.0 / float64(normalizationAttackFrames)
+			}
+			n.measuredRMS += (rawRMS - n.measuredRMS) * coefficient
+		}
+		n.holdFrames = normalizationHoldFrames
+	} else if n.holdFrames > 0 {
+		n.holdFrames--
+	}
+
+	target := 1.0
+	if enabled && n.holdFrames > 0 && n.measuredRMS > 0 {
+		target = max(normalizationMinimumGain, min(normalizationMaximumGain, normalizationTargetRMS/n.measuredRMS))
+	}
+	nextGain := n.gain + (target-n.gain)/float64(normalizationSmoothingFrames)
+	applyGainRamp(pcm, float32(n.gain), float32(nextGain))
+	n.gain = nextGain
 }
 
 type speakingHold struct {

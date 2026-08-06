@@ -402,7 +402,7 @@ func (c *Client) sendReliable(now time.Time) {
 				continue
 			}
 			encoded, err := protocol.MarshalReliable(c.roomTag, session.sessionID, sequence, packet, session.ciphers.ControlSend)
-			if err != nil || c.sendControlOnPath(session.path, encoded) != nil {
+			if err != nil || c.sendPacketOnPath(session.path, encoded, packet.Channel == reliableChannelFileData) != nil {
 				continue
 			}
 			session.reliable.commit(reservation)
@@ -482,11 +482,13 @@ func (c *Client) handleHelloOnPath(data []byte, path Path) {
 	if candidateSession == nil || candidateSession.sessionID != material.SessionID {
 		candidateSession = newPeeringSession(path, material, now)
 		remotePeer.candidateSession = candidateSession
+		candidateSession.lastHelloSentAt = now
 		c.sendHelloOnPath(path)
 		c.sendPing(remotePeerID, true)
 		return
 	}
 	if c.rememberCandidatePath(candidateSession, path, now) {
+		candidateSession.lastHelloSentAt = now
 		c.sendHelloOnPath(path)
 	}
 	c.sendPing(remotePeerID, true)
@@ -524,6 +526,13 @@ func (c *Client) sendPing(peerID string, candidateSession bool) {
 	}
 	if peerSess == nil {
 		return
+	}
+	if candidateSession {
+		now := time.Now()
+		if now.Sub(peerSess.lastHelloSentAt) >= helloInterval {
+			peerSess.lastHelloSentAt = now
+			c.sendHelloOnPath(peerSess.path)
+		}
 	}
 	c.sendPingOnPath(peerSess, peerSess.path, &peerSess.pendingPing)
 	if peerSess.candidatePath != nil {
@@ -621,6 +630,7 @@ func (c *Client) handleSessionPacketOnPath(data []byte, packetPath Path) {
 		}
 		if candidateSession {
 			if remotePeer.session != nil && remotePeer.session != peerSess {
+				c.removeVirtualLANPeer(remotePeer.identity.PeerID())
 				remotePeer.session.authenticated = false
 			}
 			remotePeer.session = peerSess
@@ -646,6 +656,8 @@ func (c *Client) handleSessionPacketOnPath(data []byte, packetPath Path) {
 	snapshotChanged := remotePeerChanged || decoded.Type == protocol.PacketPong
 	if peerSess.authenticated && (!wasAuthenticated || promoted) {
 		c.queueMemberStates()
+		c.queueScreenStates()
+		c.queueVirtualLANStates()
 	}
 	if remotePeerChanged {
 		c.rememberTopologyPeer(remotePeer.identity, now)
@@ -690,6 +702,7 @@ func (c *Client) expireRemotePeers() {
 				}
 			}
 			if peerSess.authenticated && peerSess.lastAuthenticatedPacketAt.Before(failoverCutoff) {
+				c.removeVirtualLANPeer(peerID)
 				topologyChanged = topologyChanged || peerSess.path.IsDirect()
 				peerSess.authenticated = false
 				peerSess.pendingPing = pendingPing{}
@@ -748,13 +761,17 @@ func (c *Client) remotePeerSnapshots() []RemotePeerSnapshot {
 			transport = "bridge"
 		}
 		remotePeers = append(remotePeers, RemotePeerSnapshot{
-			PeerID:    peer.identity.PeerID(),
-			Address:   peerSess.path.Address().String(),
-			SessionID: hex.EncodeToString(peerSess.sessionID[:]),
-			RTTMillis: peerSess.rttMillis,
-			Transport: transport,
-			Nickname:  peerSess.remoteMemberState.nickname,
-			Muted:     peerSess.remoteMemberState.muted,
+			PeerID:           peer.identity.PeerID(),
+			Address:          peerSess.path.Address().String(),
+			SessionID:        hex.EncodeToString(peerSess.sessionID[:]),
+			RTTMillis:        peerSess.rttMillis,
+			Transport:        transport,
+			Nickname:         peerSess.remoteMemberState.nickname,
+			Muted:            peerSess.remoteMemberState.muted,
+			PlaybackMuted:    peerSess.remoteMemberState.playbackMuted,
+			ScreenSharing:    peerSess.remoteScreenState.active,
+			ScreenGeneration: peerSess.remoteScreenState.generation,
+			ScreenStreamID:   hex.EncodeToString(peerSess.remoteScreenState.streamID[:]),
 		})
 	}
 	sort.Slice(remotePeers, func(i, j int) bool { return remotePeers[i].PeerID < remotePeers[j].PeerID })

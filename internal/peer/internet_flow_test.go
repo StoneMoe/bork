@@ -49,7 +49,7 @@ func newInternetTestNetwork(hub *restrictedNATHub, address netip.AddrPort, track
 		changes: make(chan struct{}, 1), discovered: make(chan discovery.Hint, 64), control: make(chan endpoint.Datagram, 256),
 		snapshot: networking.RoomSnapshot{Endpoint: endpoint.Snapshot{
 			ListenAddress: address.String(),
-			Candidates:    []endpoint.Candidate{{Type: endpoint.CandidateHost, Address: address.String(), Family: "ipv4"}},
+			Candidates:    []endpoint.Candidate{{Type: endpoint.CandidateNIC, Address: address.String(), Family: "ipv4"}},
 		}},
 	}
 	hub.mu.Lock()
@@ -94,6 +94,10 @@ func (n *internetTestNetwork) EnqueueControl(packet []byte, destination netip.Ad
 	}
 	receiver.control <- endpoint.Datagram{Data: append([]byte(nil), packet...), From: n.address, ReceivedAt: time.Now()}
 	return nil
+}
+
+func (n *internetTestNetwork) EnqueueBackground(packet []byte, destination netip.AddrPort) error {
+	return n.EnqueueControl(packet, destination)
 }
 
 func TestInternetStartupPunchesRestrictedNATAfterLatePeerAnnounce(t *testing.T) {

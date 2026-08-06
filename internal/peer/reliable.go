@@ -17,6 +17,9 @@ const (
 	maximumReliableRTO         = 5 * time.Second
 	maxQueuedReliableBytes     = 4 << 20
 	maxReassemblyReliableBytes = 4 << 20
+	maxReliableChannels        = 64
+	maxReliableAssemblies      = 4096
+	maxReliableFragments       = 8192
 )
 
 type deliveredReliableMessage struct {
@@ -32,6 +35,8 @@ type reliableTransport struct {
 	queuedBytes     int
 	bytesInFlight   int
 	reassemblyBytes int
+	reassemblyCount int
+	reassemblyParts int
 	cwnd            int
 	ssthresh        int
 	rto             time.Duration
@@ -192,6 +197,9 @@ func (r *reliableTransport) receive(packet protocol.ReliablePacket, now time.Tim
 		return nil
 	}
 	if state == nil {
+		if len(r.channels) >= maxReliableChannels {
+			return nil
+		}
 		state = r.addChannel(packet.Channel)
 	}
 	// Rejected repeats still trigger the current ACK, but only retained data is
@@ -216,17 +224,25 @@ func (r *reliableTransport) receive(packet protocol.ReliablePacket, now time.Tim
 	if len(packet.Payload) > maxReassemblyReliableBytes-r.reassemblyBytes {
 		return nil
 	}
+	if r.reassemblyParts >= maxReliableFragments {
+		return nil
+	}
 	assembly = state.reassemblies[packet.MessageSequence]
 	if assembly == nil {
+		if r.reassemblyCount >= maxReliableAssemblies {
+			return nil
+		}
 		assembly = &reliableAssembly{
 			fragmentCount: packet.FragmentCount,
 			fragments:     make(map[uint16][]byte),
 		}
 		state.reassemblies[packet.MessageSequence] = assembly
+		r.reassemblyCount++
 	}
 	assembly.fragments[packet.FragmentIndex] = append([]byte(nil), packet.Payload...)
 	assembly.bytes += len(packet.Payload)
 	r.reassemblyBytes += len(packet.Payload)
+	r.reassemblyParts++
 	state.modeSet = true
 	state.ordered = ordered
 	state.received.accept(packet.FragmentSequence)
@@ -268,6 +284,31 @@ func (r *reliableTransport) pendingChannel(channel uint16) bool {
 		}
 	}
 	return false
+}
+
+func (r *reliableTransport) discardOutboundChannel(channel uint16) {
+	remaining := r.outbound[:0]
+	for _, fragment := range r.outbound {
+		if fragment.channel != channel {
+			remaining = append(remaining, fragment)
+			continue
+		}
+		r.queuedBytes -= len(fragment.payload)
+		if fragment.transmissions != 0 {
+			r.bytesInFlight -= len(fragment.payload)
+		}
+	}
+	r.outbound = remaining
+}
+
+func (r *reliableTransport) discardInboundChannel(channel uint16) {
+	state := r.channels[channel]
+	if state == nil {
+		return
+	}
+	for sequence := range state.reassemblies {
+		r.removeAssembly(state, sequence)
+	}
 }
 
 func (r *reliableTransport) addChannel(channel uint16) *reliableChannel {
@@ -384,6 +425,8 @@ func (r *reliableTransport) removeAssembly(state *reliableChannel, sequence uint
 		return
 	}
 	r.reassemblyBytes -= assembly.bytes
+	r.reassemblyCount--
+	r.reassemblyParts -= len(assembly.fragments)
 	delete(state.reassemblies, sequence)
 }
 

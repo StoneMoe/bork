@@ -1,0 +1,127 @@
+.room-view {
+  width: 100%;
+  height: 100%;
+}
+
+.room-content {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.voice-stage {
+  position: relative;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.voice-caption { text-align: center; }
+.voice-caption strong { display: block; font-size: 17px; font-weight: 580; }
+.voice-caption p { max-width: 420px; margin: 10px auto 0; color: var(--muted); font-size: 14px; line-height: 1.65; }
+
+.room-peers {
+  width: min(100%, 900px);
+  height: 100%;
+  min-height: 0;
+  max-height: 560px;
+  display: flex;
+  flex-direction: column;
+  padding: 32px clamp(22px, 3vw, 34px) 24px;
+  overflow: hidden;
+}
+
+.room-member-area {
+  min-height: 0;
+  max-height: min(48%, 420px);
+  flex: 0 1 auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.room-member-area .waiting-state {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 11px;
+  text-align: left;
+}
+
+.room-member-area .waiting-state strong { flex: 0 0 auto; color: #cbd3e8; font-size: 12px; animation: waiting-breathe 2.4s ease-in-out infinite; }
+.room-member-area .waiting-state p { min-width: 0; max-width: none; margin: 0; color: #858da1; font-size: 11px; line-height: 1.45; }
+
+@keyframes waiting-breathe {
+  50% { opacity: 0.58; text-shadow: 0 0 12px rgba(145, 167, 232, 0.3); }
+}
+
+.screen-stage {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 12;
+  width: min(680px, calc(100vw - 48px));
+  max-height: calc(100vh - 96px);
+  max-height: calc(100dvh - 96px);
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+  padding: 8px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid rgba(145, 167, 232, 0.2);
+  border-radius: 12px;
+  background: rgba(13, 16, 23, 0.96);
+  box-shadow: 0 18px 55px rgba(0, 0, 0, 0.46);
+  animation: ui-enter 170ms ease-out;
+}
+.screen-stage.single { width: min(380px, calc(100vw - 48px)); grid-template-columns: minmax(0, 1fr); }
+
+.screen-preview {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid rgba(145, 167, 232, 0.14);
+  border-radius: 10px;
+  background: rgba(8, 10, 15, 0.72);
+}
+
+.screen-preview figcaption {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 11px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.065);
+  color: #858da1;
+  font-size: 10px;
+}
+
+.screen-preview figcaption b { overflow: hidden; color: #b8c2dc; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.local-screen { border-color: rgba(103, 225, 174, 0.2); }
+.local-screen figcaption b { color: #83dfba; }
+.screen-preview select { max-width: 70%; border: 0; color: #b8c2dc; background-color: transparent; font: 650 10px/1 var(--font-ui); text-overflow: ellipsis; }
+.screen-preview select:hover:not(:disabled),
+.screen-preview select:focus-visible { color: #eef1fa; background-color: rgba(145, 167, 232, 0.06); }
+.screen-preview video,
+.screen-preview canvas { width: 100%; aspect-ratio: 16 / 9; display: block; object-fit: contain; background: #08090d; }
+.remote-screen canvas:not(.ready) { display: none; }
+.remote-screen canvas.ready { animation: ui-fade 160ms ease-out; }
+.screen-waiting { aspect-ratio: 16 / 9; display: grid; place-items: center; color: #6f7688; font: 10px/1 var(--font-mono); background: #08090d; }
+
+.voice-error { margin: 12px 0 0; color: #dba79f; font-size: 12px; line-height: 1.5; text-align: right; }
+
+@media (max-width: 640px) {
+  .room-peers { padding: 20px 14px 14px; }
+  .room-member-area { max-height: min(52%, 360px); }
+  .room-member-area .waiting-state { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .screen-stage,
+  .screen-stage.single { right: 14px; bottom: 14px; width: calc(100vw - 28px); max-height: calc(100vh - 86px); max-height: calc(100dvh - 86px); grid-template-columns: 1fr; }
+}

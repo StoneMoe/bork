@@ -22,7 +22,7 @@ import (
 	"github.com/thesyncim/gopus"
 )
 
-func TestClientsDiscoverAuthenticateAndExchangeVoiceOnSameHost(t *testing.T) {
+func TestClientsDiscoverAuthenticateAndExchangeVoiceAndScreenOnSameHost(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	firstDevice, err := identity.LoadOrCreate(t.TempDir())
 	if err != nil {
@@ -39,10 +39,10 @@ func TestClientsDiscoverAuthenticateAndExchangeVoiceOnSameHost(t *testing.T) {
 	options := endpoint.Options{ListenAddress: "[::]:0", STUNServers: []string{}, STUNRefresh: 0}
 	firstClient := NewClient(firstDevice, room, networking.Options{Endpoint: options}, logger)
 	secondClient := NewClient(secondDevice, room, networking.Options{Endpoint: options}, logger)
-	if err := firstClient.SetLocalMemberState("Alice", true); err != nil {
+	if err := firstClient.SetLocalMemberState("Alice", true, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := secondClient.SetLocalMemberState("Bob", false); err != nil {
+	if err := secondClient.SetLocalMemberState("Bob", false, true); err != nil {
 		t.Fatal(err)
 	}
 	firstFlow := media.NewFlow()
@@ -57,12 +57,12 @@ func TestClientsDiscoverAuthenticateAndExchangeVoiceOnSameHost(t *testing.T) {
 
 	waitForAuthenticatedRemotePeer(t, firstClient, firstChanges, secondDevice.PeerID())
 	waitForAuthenticatedRemotePeer(t, secondClient, secondChanges, firstDevice.PeerID())
-	waitForRemoteMemberState(t, firstClient, firstChanges, secondDevice.PeerID(), "Bob", false)
-	waitForRemoteMemberState(t, secondClient, secondChanges, firstDevice.PeerID(), "Alice", true)
-	if err := secondClient.SetLocalMemberState("Robert", true); err != nil {
+	waitForRemoteMemberState(t, firstClient, firstChanges, secondDevice.PeerID(), "Bob", false, true)
+	waitForRemoteMemberState(t, secondClient, secondChanges, firstDevice.PeerID(), "Alice", true, false)
+	if err := secondClient.SetLocalMemberState("Robert", true, false); err != nil {
 		t.Fatal(err)
 	}
-	waitForRemoteMemberState(t, firstClient, firstChanges, secondDevice.PeerID(), "Robert", true)
+	waitForRemoteMemberState(t, firstClient, firstChanges, secondDevice.PeerID(), "Robert", true, false)
 	encoder, err := gopus.NewEncoder(gopus.EncoderConfig{SampleRate: 48000, Channels: 1, Application: gopus.ApplicationVoIP})
 	if err != nil {
 		t.Fatalf("gopus.NewEncoder() error = %v", err)
@@ -117,12 +117,60 @@ voiceWait:
 	} else {
 		t.Fatal("timed out waiting for voice frame")
 	}
+	if err := firstClient.StartScreenShare(ScreenVideoCodecH264Baseline, 640, 360); err != nil {
+		t.Fatal(err)
+	}
+	waitForRemoteScreenState(t, secondClient, secondChanges, firstDevice.PeerID(), true)
+	screenVideo := bytes.Repeat([]byte{0, 0, 0, 1, 0x65, 0x88}, 700)
+	screenCtx, stopScreen := context.WithTimeout(context.Background(), 3*time.Second)
+	defer stopScreen()
+	retryScreen := time.NewTicker(50 * time.Millisecond)
+	defer retryScreen.Stop()
+	var screenChunk ScreenVideoChunk
+	screenReceived := false
+	for !screenReceived {
+		if _, err := firstClient.SendScreenVideoChunk(0, 66_667, true, screenVideo); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-screenCtx.Done():
+			t.Fatal("timed out waiting for screen video chunk")
+		case <-retryScreen.C:
+		case screenChunk = <-secondClient.ScreenVideoChunks():
+			screenReceived = true
+		}
+	}
+	if screenChunk.PeerID != firstDevice.PeerID() || screenChunk.ChunkID == 0 || screenChunk.Codec != ScreenVideoCodecH264Baseline || screenChunk.Width != 640 || screenChunk.Height != 360 || !screenChunk.KeyFrame || !bytes.Equal(screenChunk.Bytes, screenVideo) {
+		t.Fatalf("received screen video chunk = %#v", screenChunk)
+	}
+	if err := firstClient.StopScreenShare(); err != nil {
+		t.Fatal(err)
+	}
+	waitForRemoteScreenState(t, secondClient, secondChanges, firstDevice.PeerID(), false)
 	cancel()
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first local peer error = %v", err)
 	}
 	if err := <-secondDone; err != nil {
 		t.Fatalf("second local peer error = %v", err)
+	}
+}
+
+func waitForRemoteScreenState(t *testing.T, client *Client, changes <-chan struct{}, peerID string, sharing bool) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		snapshot, _ := client.StateSnapshot()
+		for _, remotePeer := range snapshot.RemotePeers {
+			if remotePeer.PeerID == peerID && remotePeer.ScreenSharing == sharing {
+				return
+			}
+		}
+		select {
+		case <-changes:
+		case <-deadline:
+			t.Fatalf("timed out waiting for screen sharing %t from %s", sharing, peerID)
+		}
 	}
 }
 
@@ -259,20 +307,20 @@ func waitForAuthenticatedRemotePeer(t *testing.T, client *Client, changes <-chan
 	}
 }
 
-func waitForRemoteMemberState(t *testing.T, client *Client, changes <-chan struct{}, peerID, nickname string, muted bool) {
+func waitForRemoteMemberState(t *testing.T, client *Client, changes <-chan struct{}, peerID, nickname string, muted, playbackMuted bool) {
 	t.Helper()
 	deadline := time.After(5 * time.Second)
 	for {
 		snapshot, _ := client.StateSnapshot()
 		for _, remotePeer := range snapshot.RemotePeers {
-			if remotePeer.PeerID == peerID && remotePeer.Nickname == nickname && remotePeer.Muted == muted {
+			if remotePeer.PeerID == peerID && remotePeer.Nickname == nickname && remotePeer.Muted == muted && remotePeer.PlaybackMuted == playbackMuted {
 				return
 			}
 		}
 		select {
 		case <-changes:
 		case <-deadline:
-			t.Fatalf("timed out waiting for member state %q/%t from %s", nickname, muted, peerID)
+			t.Fatalf("timed out waiting for member state %q/%t/%t from %s", nickname, muted, playbackMuted, peerID)
 		}
 	}
 }

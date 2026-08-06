@@ -10,7 +10,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: "../build/frontend",
+    outDir: "../internal/webassets/dist",
     emptyOutDir: true,
   },
   test: {

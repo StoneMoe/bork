@@ -14,9 +14,11 @@ import (
 )
 
 const (
-	groupPacketsPerSecond = 120.0
-	groupPacketBurst      = 24.0
-	groupStreamIdle       = 30 * time.Second
+	groupPacketsPerSecond       = 120.0
+	groupPacketBurst            = 24.0
+	screenVideoPacketsPerSecond = 192.0
+	screenVideoPacketBurst      = float64(maxScreenVideoFragments)
+	groupStreamIdle             = 30 * time.Second
 	// Signed room members can create arbitrary StreamIDs; bound retained replay
 	// state without imposing a member or concurrent-speaker product limit.
 	maxGroupReceiveStreams = 4096
@@ -25,6 +27,7 @@ const (
 type groupStreamKey struct {
 	sender [32]byte
 	stream [16]byte
+	class  protocol.TrafficClass
 }
 
 type groupReceiveState struct {
@@ -90,7 +93,7 @@ func (c *Client) sendGroupMedia(frame media.SendFrame) {
 
 func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.PeerPort) {
 	header, err := protocol.ParseGroupDatagramHeader(packet.Data, c.roomTag)
-	if err != nil || header.Class != protocol.TrafficAudio || header.SenderID == c.groupSenderID {
+	if err != nil || (header.Class != protocol.TrafficAudio && header.Class != protocol.TrafficInteractive && header.Class != protocol.TrafficCustomRealtime) || header.SenderID == c.groupSenderID {
 		return
 	}
 	remoteIdentity, err := identity.FromPublicKey(ed25519.PublicKey(header.SenderID[:]))
@@ -98,11 +101,23 @@ func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.P
 		return
 	}
 	remote := c.remotePeers[remoteIdentity.PeerID()]
-	if remote == nil || remote.session == nil || !remote.session.authenticated || remote.session.audioStreamID == ([16]byte{}) ||
-		remote.session.audioStreamID != header.StreamID || !c.authenticatedDirectSource(packet.From) {
+	if remote == nil || remote.session == nil || !remote.session.authenticated {
 		return
 	}
-	key := groupStreamKey{sender: header.SenderID, stream: header.StreamID}
+	if header.Class == protocol.TrafficCustomRealtime {
+		c.handleVirtualLANDatagram(remote, header, packet)
+		return
+	}
+	if !c.authenticatedDirectSource(packet.From) {
+		return
+	}
+	if header.Class == protocol.TrafficAudio && (remote.session.audioStreamID == ([16]byte{}) || remote.session.audioStreamID != header.StreamID) {
+		return
+	}
+	if header.Class == protocol.TrafficInteractive && (!remote.session.remoteScreenState.active || remote.session.remoteScreenState.streamID != header.StreamID) {
+		return
+	}
+	key := groupStreamKey{sender: header.SenderID, stream: header.StreamID, class: header.Class}
 	state := c.groupReceivers[key]
 	newState := state == nil
 	if state == nil {
@@ -112,20 +127,43 @@ func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.P
 		return
 	}
 	decoded, err := protocol.ParseGroupDatagram(packet.Data, c.roomTag, header, c.groupProtector)
-	if err != nil || !state.accept(header.Sequence) {
+	if err != nil {
+		return
+	}
+	var fragment decodedScreenVideoFragment
+	if header.Class == protocol.TrafficInteractive {
+		if decoded.Timestamp == 0 {
+			return
+		}
+		fragment, err = decodeScreenVideoFragment(decoded.Payload)
+		if err != nil || !screenVideoFragmentMatchesState(fragment, remote.session.remoteScreenState) {
+			return
+		}
+	}
+	if !state.accept(header.Sequence) {
 		return
 	}
 	if newState {
 		if len(c.groupReceivers) >= maxGroupReceiveStreams {
 			var oldestKey groupStreamKey
 			var oldestAt time.Time
+			found := false
 			for candidate, retained := range c.groupReceivers {
-				if oldestAt.IsZero() || retained.lastSeen.Before(oldestAt) {
+				if candidate.class == protocol.TrafficCustomRealtime {
+					continue
+				}
+				if !found || retained.lastSeen.Before(oldestAt) {
 					oldestKey = candidate
 					oldestAt = retained.lastSeen
+					found = true
 				}
 			}
+			if !found {
+				return
+			}
 			delete(c.groupReceivers, oldestKey)
+			c.removeScreenVideoAssembly(oldestKey)
+			delete(c.screenVideoReceivers, oldestKey)
 		}
 		c.groupReceivers[key] = state
 	}
@@ -133,10 +171,29 @@ func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.P
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if !state.allowCost(now, 1, groupPacketsPerSecond, groupPacketBurst) {
+	rate, burst := groupPacketsPerSecond, groupPacketBurst
+	if header.Class == protocol.TrafficInteractive {
+		rate, burst = screenVideoPacketsPerSecond, screenVideoPacketBurst
+	}
+	if !state.allowCost(now, 1, rate, burst) {
 		return
 	}
 	state.lastSeen = now
+	if header.Class == protocol.TrafficInteractive {
+		complete := c.acceptScreenVideoFragment(key, decoded.Timestamp, fragment, packet.Data, now)
+		if complete == nil {
+			return
+		}
+		c.forwardScreenVideoChunk(remoteIdentity.PeerID(), packet.From, complete.packets, complete.deadline)
+		c.deliverScreenVideoChunk(ScreenVideoChunk{
+			PeerID: remoteIdentity.PeerID(), SessionID: remote.session.sessionID, Generation: complete.metadata.generation, StreamID: header.StreamID,
+			ChunkID: complete.chunkID,
+			Codec:   complete.metadata.codec, Width: complete.metadata.width, Height: complete.metadata.height,
+			Timestamp: complete.metadata.timestamp, Duration: complete.metadata.duration,
+			KeyFrame: complete.metadata.keyFrame, Bytes: complete.bytes,
+		})
+		return
+	}
 	c.forwardGroupDatagram(remoteIdentity.PeerID(), header.Class, packet, now.Add(10*time.Millisecond))
 	if mediaPort != nil {
 		mediaPort.SubmitReceived(media.ReceivedFrame{
@@ -171,8 +228,13 @@ func (c *Client) authenticatedDirectSource(address netip.AddrPort) bool {
 
 func (c *Client) expireGroupStreams(now time.Time) {
 	for key, state := range c.groupReceivers {
+		if key.class == protocol.TrafficCustomRealtime {
+			continue
+		}
 		if state.lastSeen.Add(groupStreamIdle).Before(now) {
 			delete(c.groupReceivers, key)
+			c.removeScreenVideoAssembly(key)
+			delete(c.screenVideoReceivers, key)
 		}
 	}
 }

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"sync"
@@ -22,9 +23,11 @@ import (
 const stateCoalesceInterval = 50 * time.Millisecond
 
 type App struct {
-	config config.Config
-	logger *slog.Logger
-	emit   func(context.Context, string, ...interface{})
+	config         config.Config
+	logger         *slog.Logger
+	emit           func(context.Context, string, ...interface{})
+	openFileDialog func(context.Context, wailsruntime.OpenDialogOptions) (string, error)
+	saveFileDialog func(context.Context, wailsruntime.SaveDialogOptions) (string, error)
 
 	commandMu sync.Mutex
 	stateMu   sync.RWMutex
@@ -39,26 +42,29 @@ type App struct {
 	stateNotifierStopped chan struct{}
 	notificationsClosed  bool
 
-	localIdentity    *identity.LocalIdentity
-	identityLease    *identity.Lease
-	nickname         string
-	room             *roomSession
-	audioEngine      *audio.Engine
-	audioInitError   string
-	stopAudioWatcher context.CancelFunc
-	audioWatcherDone chan struct{}
-	lastDiagnostics  Diagnostics
-	lastError        *AppError
-	nextErrorID      uint64
-	shuttingDown     bool
+	localIdentity       *identity.LocalIdentity
+	identityLease       *identity.Lease
+	nickname            string
+	room                *roomSession
+	audioEngine         *audio.Engine
+	audioInitError      string
+	stopAudioWatcher    context.CancelFunc
+	audioWatcherDone    chan struct{}
+	lastDiagnostics     Diagnostics
+	lastError           *AppError
+	nextErrorID         uint64
+	nextScreenCaptureID uint32
+	shuttingDown        bool
 }
 
 type roomSession struct {
-	client   *peer.Client
-	media    *media.Flow
-	cancel   context.CancelFunc
-	done     chan struct{}
-	stopping bool
+	client          *peer.Client
+	media           *media.Flow
+	cancel          context.CancelFunc
+	done            chan struct{}
+	remotePeerCount int
+	screenCaptureID uint32
+	stopping        bool
 }
 
 type roomStateChange struct {
@@ -75,6 +81,8 @@ func NewApp(cfg config.Config, logger *slog.Logger) *App {
 		config:          cfg,
 		logger:          logger,
 		emit:            wailsruntime.EventsEmit,
+		openFileDialog:  wailsruntime.OpenFileDialog,
+		saveFileDialog:  wailsruntime.SaveFileDialog,
 		startupDone:     make(chan struct{}),
 		statePending:    make(chan struct{}, 1),
 		lastDiagnostics: emptyDiagnostics(),
@@ -204,12 +212,13 @@ func (a *App) publishRoomChange(change roomStateChange) {
 			room.cancel()
 		}
 		if audioEngine, err := a.readyAudioEngine(); err == nil {
-			audioEngine.Stop()
+			audioEngine.StopWithPeerLeave()
 		}
 		a.markStateChanged()
 		return
 	}
 	a.reconcileAudioLocked(change.room)
+	a.playPeerChangeLocked(change.room)
 	a.markStateChanged()
 }
 
@@ -313,7 +322,18 @@ func (a *App) activateRoom(client *peer.Client) error {
 	a.lastDiagnostics = emptyDiagnostics()
 	a.stateMu.Unlock()
 	go a.watchRoom(ctx, room)
-	return nil
+	select {
+	case <-client.Ready():
+		a.reconcileAudioLocked(room)
+		if audioEngine, err := a.readyAudioEngine(); err == nil {
+			audioEngine.PlayPeerChange(true)
+		}
+		return nil
+	case <-room.done:
+		return errors.New("room stopped during startup")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (a *App) watchRoom(ctx context.Context, room *roomSession) {
@@ -327,12 +347,15 @@ func (a *App) watchRoom(ctx context.Context, room *roomSession) {
 		a.markStateChanged()
 	}()
 	peerChanges := room.client.StateChanges()
+	screenVideoChunks := room.client.ScreenVideoChunks()
 	peerResult := make(chan error, 1)
 	go func() { peerResult <- room.client.Loop(ctx, room.media) }()
 	for {
 		select {
 		case <-peerChanges:
 			a.publishRoomChange(roomStateChange{room: room})
+		case chunk := <-screenVideoChunks:
+			a.publishScreenVideoChunk(room, chunk)
 		case err := <-peerResult:
 			a.publishRoomChange(roomStateChange{room: room, err: err, terminal: true})
 			return
@@ -340,6 +363,21 @@ func (a *App) watchRoom(ctx context.Context, room *roomSession) {
 			<-peerResult
 			return
 		}
+	}
+}
+
+func (a *App) publishScreenVideoChunk(room *roomSession, chunk peer.ScreenVideoChunk) {
+	a.stateMu.RLock()
+	active := a.room == room && room != nil && !room.stopping
+	ctx := a.appContext
+	a.stateMu.RUnlock()
+	if active && ctx != nil {
+		a.emit(ctx, screenVideoChunkEvent, ScreenVideoChunkEvent{
+			PeerID: chunk.PeerID, SessionID: hex.EncodeToString(chunk.SessionID[:]), Generation: chunk.Generation, StreamID: hex.EncodeToString(chunk.StreamID[:]),
+			ChunkID: chunk.ChunkID,
+			Codec:   chunk.Codec, Width: chunk.Width, Height: chunk.Height,
+			Timestamp: chunk.Timestamp, Duration: chunk.Duration, KeyFrame: chunk.KeyFrame, Bytes: chunk.Bytes,
+		})
 	}
 }
 
@@ -377,17 +415,24 @@ func (a *App) reconcileAudioLocked(room *roomSession) {
 	}
 	remotePeerCount := room.client.RemotePeerCount()
 	audioEngine.SetVoiceBitrate(audio.RecommendedVoiceBitrate(remotePeerCount + 1))
-	shouldRunAudio := remotePeerCount > 0
 	status := audioEngine.Status()
-	if status.Running == shouldRunAudio {
+	if status.Running || !status.Available {
 		return
 	}
-	if shouldRunAudio && status.Available {
-		if err := audioEngine.Start(room.media); err != nil {
-			a.logger.Warn("start voice automatically", "error", err)
-		}
-	} else if !shouldRunAudio && status.Running {
-		audioEngine.Stop()
+	if err := audioEngine.Start(room.media); err != nil {
+		a.logger.Warn("start voice automatically", "error", err)
+	}
+}
+
+func (a *App) playPeerChangeLocked(room *roomSession) {
+	remotePeerCount := room.client.RemotePeerCount()
+	previous := room.remotePeerCount
+	room.remotePeerCount = remotePeerCount
+	if remotePeerCount == previous {
+		return
+	}
+	if audioEngine, err := a.readyAudioEngine(); err == nil {
+		audioEngine.PlayPeerChange(remotePeerCount > previous)
 	}
 }
 
@@ -441,9 +486,13 @@ func (a *App) snapshot() AppSnapshot {
 		if room != nil {
 			peerSnapshot, networkSnapshot := room.client.StateSnapshot()
 			state.Room = &RoomState{
-				Name:        peerSnapshot.Name,
-				Phase:       peerSnapshot.Phase,
-				RemotePeers: make([]RemotePeer, 0, len(peerSnapshot.RemotePeers)),
+				Name:             peerSnapshot.Name,
+				Phase:            peerSnapshot.Phase,
+				ScreenSharing:    peerSnapshot.ScreenSharing,
+				RemotePeers:      make([]RemotePeer, 0, len(peerSnapshot.RemotePeers)),
+				Transfers:        projectTransfers(peerSnapshot.Transfers, peerSnapshot.RemotePeers),
+				VirtualLAN:       projectVirtualLAN(peerSnapshot.VirtualLAN),
+				RemoteVirtualLAN: projectRemoteVirtualLAN(peerSnapshot.RemoteVirtualLAN, peerSnapshot.RemotePeers),
 			}
 			for _, remotePeer := range peerSnapshot.RemotePeers {
 				state.Room.RemotePeers = append(state.Room.RemotePeers, projectRemotePeer(remotePeer))
@@ -564,13 +613,22 @@ func (a *App) isShuttingDown() bool {
 }
 
 func emptyAudioStatus() audio.Status {
-	return audio.Status{SpeakingPeerIDs: []string{}, CaptureDevices: []audio.Device{}, PlaybackDevices: []audio.Device{}}
+	return audio.Status{
+		CaptureGain:                 100,
+		PlaybackGain:                100,
+		EchoCancellation:            true,
+		NoiseSuppression:            true,
+		RemoteLoudnessNormalization: true,
+		SpeakingPeerIDs:             []string{},
+		CaptureDevices:              []audio.Device{},
+		PlaybackDevices:             []audio.Device{},
+	}
 }
 
 func emptyDiagnostics() Diagnostics {
 	return Diagnostics{
 		Candidates: []endpoint.Candidate{}, STUN: []endpoint.STUNResult{}, Tracker: []tracker.ProviderStatus{},
-		Connectivity: peer.ConnectivitySnapshot{KnownAddresses: []peer.KnownAddressSnapshot{}},
+		Connectivity: peer.ConnectivitySnapshot{DiscoveryHints: []peer.DiscoveryHintSnapshot{}},
 	}
 }
 
@@ -578,6 +636,9 @@ func cloneDiagnostics(value Diagnostics) Diagnostics {
 	value.Candidates = append([]endpoint.Candidate{}, value.Candidates...)
 	value.STUN = append([]endpoint.STUNResult{}, value.STUN...)
 	value.Tracker = append([]tracker.ProviderStatus{}, value.Tracker...)
-	value.Connectivity.KnownAddresses = append([]peer.KnownAddressSnapshot{}, value.Connectivity.KnownAddresses...)
+	for index := range value.Tracker {
+		value.Tracker[index] = value.Tracker[index].Clone()
+	}
+	value.Connectivity.DiscoveryHints = append([]peer.DiscoveryHintSnapshot{}, value.Connectivity.DiscoveryHints...)
 	return value
 }

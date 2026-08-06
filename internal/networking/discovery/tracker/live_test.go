@@ -17,7 +17,6 @@ func TestLiveDefaultHTTPProviders(t *testing.T) {
 	providers := []string{
 		"https://tracker.zhuqiy.com/announce",
 		"http://tracker.renfei.net:8080/announce",
-		"http://tracker.mywaifu.best:6969/announce",
 	}
 	digest := sha256.Sum256([]byte(time.Now().UTC().Format(time.RFC3339Nano)))
 	var infoHash [20]byte

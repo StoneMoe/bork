@@ -120,10 +120,17 @@ func (c *Client) sendBridgeHellos(now time.Time) {
 }
 
 func (c *Client) sendControlOnPath(path Path, inner []byte) error {
+	return c.sendPacketOnPath(path, inner, false)
+}
+
+func (c *Client) sendPacketOnPath(path Path, inner []byte, background bool) error {
 	if c.roomNetwork == nil || !path.IsValid() {
 		return errors.New("network path is unavailable")
 	}
 	if path.IsDirect() {
+		if background {
+			return c.roomNetwork.EnqueueBackground(inner, path.Address())
+		}
 		return c.roomNetwork.EnqueueControl(inner, path.Address())
 	}
 	origin := rawPeerIdentity(c.localIdentity.Identity)
@@ -143,9 +150,12 @@ func (c *Client) sendControlOnPath(path Path, inner []byte) error {
 	if err != nil {
 		return err
 	}
-	packet, err := protocol.MarshalBridge(c.roomTag, adjacent.sessionID, sequence, origin, path.Target(), inner, adjacent.ciphers.ControlSend)
+	packet, err := protocol.MarshalBridge(c.roomTag, adjacent.sessionID, sequence, origin, path.Target(), background, inner, adjacent.ciphers.ControlSend)
 	if err != nil {
 		return err
+	}
+	if background {
+		return c.roomNetwork.EnqueueBackground(packet, adjacent.path.Address())
 	}
 	return c.roomNetwork.EnqueueControl(packet, adjacent.path.Address())
 }
@@ -221,9 +231,13 @@ func (c *Client) forwardBridgePacket(decoded protocol.BridgePacket) {
 	if err != nil {
 		return
 	}
-	packet, err := protocol.MarshalBridge(c.roomTag, adjacent.sessionID, sequence, decoded.Origin, decoded.Target, decoded.Inner, adjacent.ciphers.ControlSend)
+	packet, err := protocol.MarshalBridge(c.roomTag, adjacent.sessionID, sequence, decoded.Origin, decoded.Target, decoded.Background, decoded.Inner, adjacent.ciphers.ControlSend)
 	if err == nil {
-		_ = c.roomNetwork.EnqueueControl(packet, adjacent.path.Address())
+		if decoded.Background {
+			_ = c.roomNetwork.EnqueueBackground(packet, adjacent.path.Address())
+		} else {
+			_ = c.roomNetwork.EnqueueControl(packet, adjacent.path.Address())
+		}
 	}
 }
 

@@ -13,12 +13,13 @@ const (
 )
 
 type BridgePacket struct {
-	Origin [32]byte
-	Target [32]byte
-	Inner  []byte
+	Origin     [32]byte
+	Target     [32]byte
+	Background bool
+	Inner      []byte
 }
 
-func MarshalBridge(roomTag, sessionID [16]byte, sequence uint64, origin, target [32]byte, inner []byte, protector cipher.AEAD) ([]byte, error) {
+func MarshalBridge(roomTag, sessionID [16]byte, sequence uint64, origin, target [32]byte, background bool, inner []byte, protector cipher.AEAD) ([]byte, error) {
 	if sequence == 0 || !validBridgeEndpoints(origin, target) || len(inner) == 0 || len(inner) > MaxBridgeInnerSize {
 		return nil, errors.New("bridge packet fields are invalid")
 	}
@@ -28,12 +29,19 @@ func MarshalBridge(roomTag, sessionID [16]byte, sequence uint64, origin, target 
 	if !validBridgeInner(inner, roomTag) {
 		return nil, errors.New("bridge inner packet is invalid")
 	}
+	if packetType, _, _ := ParsePrefix(inner); background && packetType != PacketReliable {
+		return nil, errors.New("only reliable bridge packets may use the background lane")
+	}
 
 	packet := make([]byte, 0, MaxDatagramSize)
 	packet = appendEstablishedHeader(packet, PacketBridgeControl, roomTag, sessionID, sequence)
 	packet = append(packet, origin[:]...)
 	packet = append(packet, target[:]...)
-	packet = binary.BigEndian.AppendUint16(packet, uint16(len(inner)))
+	innerLength := uint16(len(inner))
+	if background {
+		innerLength |= 1 << 15
+	}
+	packet = binary.BigEndian.AppendUint16(packet, innerLength)
 	packet = append(packet, inner...)
 	body := packet[establishedHeaderSize:]
 	sealed := protector.Seal(body[:0], establishedNonce(packet), body, packet[:establishedHeaderSize])
@@ -63,13 +71,18 @@ func ParseBridge(packet []byte, expectedRoomTag, expectedSessionID [16]byte, pro
 	if !validBridgeEndpoints(decoded.Origin, decoded.Target) {
 		return BridgePacket{}, errors.New("bridge packet endpoints are invalid")
 	}
-	innerLength := int(binary.BigEndian.Uint16(opened[64:66]))
+	encodedLength := binary.BigEndian.Uint16(opened[64:66])
+	decoded.Background = encodedLength&(1<<15) != 0
+	innerLength := int(encodedLength &^ (1 << 15))
 	if innerLength == 0 || innerLength > MaxBridgeInnerSize || len(opened) != bridgeBodyFixedSize+innerLength {
 		return BridgePacket{}, errors.New("bridge inner packet length is invalid")
 	}
 	decoded.Inner = opened[bridgeBodyFixedSize:]
 	if !validBridgeInner(decoded.Inner, expectedRoomTag) {
 		return BridgePacket{}, errors.New("bridge inner packet is invalid")
+	}
+	if packetType, _, _ := ParsePrefix(decoded.Inner); decoded.Background && packetType != PacketReliable {
+		return BridgePacket{}, errors.New("bridge packet background lane is invalid")
 	}
 	return decoded, nil
 }

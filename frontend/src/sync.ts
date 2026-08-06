@@ -11,7 +11,13 @@ const emptyState = new app.AppSnapshot({
   audio: {
     available: false,
     running: false,
-    muted: false,
+    captureMuted: false,
+    playbackMuted: false,
+    captureGain: 100,
+    playbackGain: 100,
+    echoCancellation: true,
+    noiseSuppression: true,
+    remoteLoudnessNormalization: true,
     speaking: false,
     speakingPeerIds: [],
     captureDeviceId: "",
@@ -25,7 +31,7 @@ const emptyState = new app.AppSnapshot({
     stun: [],
     tracker: [],
     connectivity: {
-      knownAddresses: [],
+      discoveryHints: [],
     },
   },
 });

@@ -3,10 +3,14 @@ package audio
 import "sync/atomic"
 
 type pcmFrame struct {
-	Samples    [FrameSamples]float32
-	Timestamp  uint32
-	Index      uint64
-	Generation uint64
+	Samples        [FrameSamples]float32
+	Reference      [FrameSamples]float32
+	Timestamp      uint32
+	Index          uint64
+	Generation     uint64
+	LocalOnly      bool
+	Muted          bool
+	ReferenceValid bool
 }
 
 // pcmFrameQueue is a strict single-producer/single-consumer queue. A slot is

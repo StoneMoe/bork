@@ -10,15 +10,16 @@ import (
 
 const (
 	reliableChannelMemberState = 3
-	memberStateVersion         = 1
+	memberStateVersion         = 2
 	maxNicknameRunes           = 64
 	maxNicknameBytes           = 256
 )
 
 type memberState struct {
-	generation uint64
-	nickname   string
-	muted      bool
+	generation    uint64
+	nickname      string
+	muted         bool
+	playbackMuted bool
 }
 
 func NormalizeNickname(nickname string) (string, error) {
@@ -49,7 +50,10 @@ func encodeMemberState(state memberState) ([]byte, error) {
 	payload[0] = memberStateVersion
 	binary.BigEndian.PutUint64(payload[1:9], state.generation)
 	if state.muted {
-		payload[9] = 1
+		payload[9] |= 1
+	}
+	if state.playbackMuted {
+		payload[9] |= 2
 	}
 	copy(payload[10:], nickname)
 	return payload, nil
@@ -60,10 +64,11 @@ func decodeMemberState(payload []byte) (memberState, error) {
 		return memberState{}, errors.New("member state header is invalid")
 	}
 	state := memberState{generation: binary.BigEndian.Uint64(payload[1:9])}
-	if state.generation == 0 || payload[9] > 1 {
+	if state.generation == 0 || payload[9]&^byte(3) != 0 {
 		return memberState{}, errors.New("member state fields are invalid")
 	}
-	state.muted = payload[9] == 1
+	state.muted = payload[9]&1 != 0
+	state.playbackMuted = payload[9]&2 != 0
 	rawNickname := string(payload[10:])
 	nickname, err := NormalizeNickname(rawNickname)
 	if err != nil || nickname != rawNickname {
@@ -73,18 +78,19 @@ func decodeMemberState(payload []byte) (memberState, error) {
 	return state, nil
 }
 
-func (c *Client) SetLocalMemberState(nickname string, muted bool) error {
+func (c *Client) SetLocalMemberState(nickname string, muted, playbackMuted bool) error {
 	nickname, err := NormalizeNickname(nickname)
 	if err != nil {
 		return err
 	}
 	c.memberStateMu.Lock()
-	if c.desiredMemberState.nickname == nickname && c.desiredMemberState.muted == muted {
+	if c.desiredMemberState.nickname == nickname && c.desiredMemberState.muted == muted && c.desiredMemberState.playbackMuted == playbackMuted {
 		c.memberStateMu.Unlock()
 		return nil
 	}
 	c.desiredMemberState.nickname = nickname
 	c.desiredMemberState.muted = muted
+	c.desiredMemberState.playbackMuted = playbackMuted
 	c.memberStateMu.Unlock()
 	select {
 	case c.memberStateUpdates <- struct{}{}:
@@ -97,7 +103,7 @@ func (c *Client) applyDesiredMemberState() {
 	c.memberStateMu.Lock()
 	desired := c.desiredMemberState
 	c.memberStateMu.Unlock()
-	if c.localMemberState.nickname == desired.nickname && c.localMemberState.muted == desired.muted {
+	if c.localMemberState.nickname == desired.nickname && c.localMemberState.muted == desired.muted && c.localMemberState.playbackMuted == desired.playbackMuted {
 		return
 	}
 	desired.generation = c.localMemberState.generation + 1

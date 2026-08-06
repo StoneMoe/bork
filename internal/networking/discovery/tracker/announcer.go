@@ -95,21 +95,28 @@ type Announcer struct {
 	timing      announcerTiming
 	waitRetry   func(context.Context, time.Duration) bool
 
-	randomMu      sync.Mutex
-	candidate     AnnounceCandidate
-	running       atomic.Bool
-	statusMu      sync.RWMutex
+	randomMu  sync.Mutex
+	candidate AnnounceCandidate
+	running   atomic.Bool
+	statusMu  sync.RWMutex
+	// Group creates one immutable-candidate Announcer per candidate.
 	statuses      map[string]ProviderStatus
 	statusChanges chan struct{}
 }
 
 type ProviderStatus struct {
-	Provider        string `json:"provider"`
-	Candidate       string `json:"candidate"`
-	ObservedAddress string `json:"observedAddress,omitempty"`
-	NextAnnounce    string `json:"nextAnnounce,omitempty"`
-	PeerCount       int    `json:"peerCount"`
-	Error           string `json:"error,omitempty"`
+	Provider        string   `json:"provider"`
+	Candidate       string   `json:"candidate"`
+	ObservedAddress string   `json:"observedAddress,omitempty"`
+	NextAnnounce    string   `json:"nextAnnounce,omitempty"`
+	PeerCount       int      `json:"peerCount"`
+	PeerAddresses   []string `json:"peerAddresses"`
+	Error           string   `json:"error,omitempty"`
+}
+
+func (s ProviderStatus) Clone() ProviderStatus {
+	s.PeerAddresses = append([]string{}, s.PeerAddresses...)
+	return s
 }
 
 type AnnounceCandidate struct {
@@ -197,7 +204,7 @@ func (a *Announcer) Snapshot() []ProviderStatus {
 	defer a.statusMu.RUnlock()
 	statuses := make([]ProviderStatus, 0, len(a.providers))
 	for _, configured := range a.providers {
-		status := a.statuses[configured.scope]
+		status := a.statuses[configured.scope].Clone()
 		status.Provider = configured.display
 		status.Candidate = a.candidate.String()
 		statuses = append(statuses, status)
@@ -636,9 +643,13 @@ func readNonzeroUint32(source io.Reader) (uint32, error) {
 func (a *Announcer) recordSuccess(configured provider, candidate AnnounceCandidate, response announceResponse, interval time.Duration) {
 	now := time.Now().UTC()
 	observed := observedRegistrationAddress(response, candidate)
+	addresses := make([]string, len(response.peers))
+	for index, peer := range response.peers {
+		addresses[index] = peer.String()
+	}
 	a.recordStatus(configured, ProviderStatus{
 		Provider: configured.display, Candidate: candidate.String(),
-		NextAnnounce: now.Add(interval).Format(time.RFC3339), PeerCount: len(response.peers), ObservedAddress: observed,
+		NextAnnounce: now.Add(interval).Format(time.RFC3339), PeerCount: len(response.peers), PeerAddresses: addresses, ObservedAddress: observed,
 	})
 }
 
@@ -678,7 +689,7 @@ func (a *Announcer) recordFailure(configured provider, candidate AnnounceCandida
 	message = boundedTrackerText(message, maxTrackerErrorLength)
 	a.recordStatus(configured, ProviderStatus{
 		Provider: configured.display, Candidate: candidate.String(),
-		NextAnnounce: retryAt.UTC().Format(time.RFC3339), Error: message,
+		NextAnnounce: retryAt.UTC().Format(time.RFC3339), PeerAddresses: []string{}, Error: message,
 	})
 }
 

@@ -12,6 +12,18 @@ const (
 
 	speakingThreshold     = 0.01
 	speakingReleaseFrames = 300 / FrameDuration
+
+	defaultAudioGain = 100
+	minimumAudioGain = 0
+	maximumAudioGain = 200
+
+	normalizationTargetRMS       = 0.10
+	normalizationMinimumGain     = 0.25
+	normalizationMaximumGain     = 4.0
+	normalizationAttackFrames    = 50 / FrameDuration
+	normalizationReleaseFrames   = 500 / FrameDuration
+	normalizationSmoothingFrames = 100 / FrameDuration
+	normalizationHoldFrames      = 300 / FrameDuration
 )
 
 type Device struct {
@@ -21,16 +33,33 @@ type Device struct {
 }
 
 type Status struct {
-	Available        bool     `json:"available"`
-	Running          bool     `json:"running"`
-	Muted            bool     `json:"muted"`
-	Speaking         bool     `json:"speaking"`
-	SpeakingPeerIDs  []string `json:"speakingPeerIds"`
-	CaptureDeviceID  string   `json:"captureDeviceId"`
-	PlaybackDeviceID string   `json:"playbackDeviceId"`
-	CaptureDevices   []Device `json:"captureDevices"`
-	PlaybackDevices  []Device `json:"playbackDevices"`
-	Error            string   `json:"error,omitempty"`
+	Available                   bool     `json:"available"`
+	Running                     bool     `json:"running"`
+	CaptureMuted                bool     `json:"captureMuted"`
+	PlaybackMuted               bool     `json:"playbackMuted"`
+	CaptureGain                 int      `json:"captureGain"`
+	PlaybackGain                int      `json:"playbackGain"`
+	EchoCancellation            bool     `json:"echoCancellation"`
+	NoiseSuppression            bool     `json:"noiseSuppression"`
+	RemoteLoudnessNormalization bool     `json:"remoteLoudnessNormalization"`
+	Speaking                    bool     `json:"speaking"`
+	SpeakingPeerIDs             []string `json:"speakingPeerIds"`
+	CaptureDeviceID             string   `json:"captureDeviceId"`
+	PlaybackDeviceID            string   `json:"playbackDeviceId"`
+	CaptureDevices              []Device `json:"captureDevices"`
+	PlaybackDevices             []Device `json:"playbackDevices"`
+	Error                       string   `json:"error,omitempty"`
+}
+
+func defaultStatus() Status {
+	return Status{
+		CaptureGain:                 defaultAudioGain,
+		PlaybackGain:                defaultAudioGain,
+		EchoCancellation:            true,
+		NoiseSuppression:            true,
+		RemoteLoudnessNormalization: true,
+		SpeakingPeerIDs:             []string{},
+	}
 }
 
 type Options struct {

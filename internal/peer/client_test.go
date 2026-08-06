@@ -26,6 +26,7 @@ type fakeRoomNetwork struct {
 	discovered      chan discovery.Hint
 	sent            []netip.AddrPort
 	sentPackets     [][]byte
+	background      [][]byte
 	realtimeBatches []endpoint.RealtimeBatch
 	enqueueErrors   map[netip.AddrPort]error
 	done            chan struct{}
@@ -64,6 +65,17 @@ func (e *fakeRoomNetwork) EnqueueControl(packet []byte, destination netip.AddrPo
 	if err := e.enqueueErrors[destination]; err != nil {
 		return err
 	}
+	e.sent = append(e.sent, destination)
+	e.sentPackets = append(e.sentPackets, append([]byte(nil), packet...))
+	return nil
+}
+func (e *fakeRoomNetwork) EnqueueBackground(packet []byte, destination netip.AddrPort) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.enqueueErrors[destination]; err != nil {
+		return err
+	}
+	e.background = append(e.background, append([]byte(nil), packet...))
 	e.sent = append(e.sent, destination)
 	e.sentPackets = append(e.sentPackets, append([]byte(nil), packet...))
 	return nil
@@ -125,7 +137,7 @@ func TestClientAppliesNetworkSnapshot(t *testing.T) {
 	network := <-createdNetwork
 	network.updateSnapshot(networking.RoomSnapshot{Endpoint: endpoint.Snapshot{
 		ListenAddress: "[::]:7778",
-		Candidates:    []endpoint.Candidate{{Type: endpoint.CandidateHost, Address: "192.0.2.10:7778", Family: "ipv4"}},
+		Candidates:    []endpoint.Candidate{{Type: endpoint.CandidateNIC, Address: "192.0.2.10:7778", Family: "ipv4"}},
 	}})
 	waitForClientState(t, client, peerChanges, func(snapshot ClientSnapshot, diagnostics networking.RoomSnapshot) bool {
 		return snapshot.Phase == "discovering" && len(diagnostics.Endpoint.Candidates) == 1
@@ -140,7 +152,7 @@ func TestNetworkDiagnosticsDoNotInvalidateTopologyOrFanout(t *testing.T) {
 	client := testClient(t, func() roomNetwork { return newFakeRoomNetwork() })
 	base := networking.RoomSnapshot{Endpoint: endpoint.Snapshot{
 		ListenAddress: "[::]:7778",
-		Candidates:    []endpoint.Candidate{{Type: endpoint.CandidateHost, Address: "192.0.2.10:7778", Family: "ipv4"}},
+		Candidates:    []endpoint.Candidate{{Type: endpoint.CandidateNIC, Address: "192.0.2.10:7778", Family: "ipv4"}},
 	}}
 	client.networkSnapshot = base
 	client.topologyGeneration = 7
@@ -164,7 +176,7 @@ func TestNetworkDiagnosticsDoNotInvalidateTopologyOrFanout(t *testing.T) {
 	}
 
 	diagnostics.Endpoint.Candidates = append(diagnostics.Endpoint.Candidates, endpoint.Candidate{
-		Type: endpoint.CandidateServerReflexive, Address: "198.51.100.10:7778", Family: "ipv4",
+		Type: endpoint.CandidateSTUN, Address: "198.51.100.10:7778", Family: "ipv4",
 	})
 	client.applyNetworkSnapshot(diagnostics)
 	if client.topologyGeneration != 8 || client.fanoutDirty {
@@ -172,13 +184,13 @@ func TestNetworkDiagnosticsDoNotInvalidateTopologyOrFanout(t *testing.T) {
 	}
 }
 
-func TestConnectivitySnapshotReportsKnownAddresses(t *testing.T) {
+func TestConnectivitySnapshotReportsDiscoveryHints(t *testing.T) {
 	client, _, _ := testHelloClient(t)
 	address := netip.MustParseAddrPort("198.51.100.80:48000")
 	client.addDiscoveryHintAt(discovery.Hint{Address: address, Source: discovery.SourceTracker, ExpiresAt: time.Now().Add(time.Minute)}, time.Now())
 	snapshot, _ := client.StateSnapshot()
 	discoverySnapshot := snapshot.Connectivity
-	if len(discoverySnapshot.KnownAddresses) != 1 || discoverySnapshot.KnownAddresses[0].Address != address.String() || discoverySnapshot.KnownAddresses[0].Source != string(discovery.SourceTracker) {
+	if len(discoverySnapshot.DiscoveryHints) != 1 || discoverySnapshot.DiscoveryHints[0].Address != address.String() || discoverySnapshot.DiscoveryHints[0].Source != string(discovery.SourceTracker) {
 		t.Fatalf("discovery diagnostics = %+v", discoverySnapshot)
 	}
 }
@@ -187,7 +199,7 @@ func TestStateSnapshotDeepCopiesSlices(t *testing.T) {
 	client := testClient(t, func() roomNetwork { return newFakeRoomNetwork() })
 	client.snapshot = ClientSnapshot{
 		RemotePeers:  []RemotePeerSnapshot{{PeerID: "remote"}},
-		Connectivity: ConnectivitySnapshot{KnownAddresses: []KnownAddressSnapshot{{Address: "192.0.2.1:9000"}}},
+		Connectivity: ConnectivitySnapshot{DiscoveryHints: []DiscoveryHintSnapshot{{Address: "192.0.2.1:9000"}}},
 	}
 	client.networkSnapshot = networking.RoomSnapshot{
 		Endpoint: endpoint.Snapshot{
@@ -199,13 +211,13 @@ func TestStateSnapshotDeepCopiesSlices(t *testing.T) {
 
 	snapshot, networkSnapshot := client.StateSnapshot()
 	snapshot.RemotePeers[0].PeerID = "changed"
-	snapshot.Connectivity.KnownAddresses[0].Address = "changed"
+	snapshot.Connectivity.DiscoveryHints[0].Address = "changed"
 	networkSnapshot.Endpoint.Candidates[0].Address = "changed"
 	networkSnapshot.Endpoint.STUN[0].Server = "changed"
 	networkSnapshot.Tracker[0].Provider = "changed"
 
 	unchanged, unchangedNetwork := client.StateSnapshot()
-	if unchanged.RemotePeers[0].PeerID != "remote" || unchanged.Connectivity.KnownAddresses[0].Address != "192.0.2.1:9000" ||
+	if unchanged.RemotePeers[0].PeerID != "remote" || unchanged.Connectivity.DiscoveryHints[0].Address != "192.0.2.1:9000" ||
 		unchangedNetwork.Endpoint.Candidates[0].Address != "192.0.2.2:9000" || unchangedNetwork.Endpoint.STUN[0].Server != "stun.example:3478" ||
 		unchangedNetwork.Tracker[0].Provider != "tracker.example" {
 		t.Fatalf("snapshot mutation reached client state: %#v %#v", unchanged, unchangedNetwork)
@@ -329,9 +341,9 @@ func TestDiscoveryHintRefreshAndExpirationPublishCurrentSnapshot(t *testing.T) {
 		t.Fatal("refreshed hint did not publish once or sent another immediate Hello")
 	}
 	snapshot, _ := client.StateSnapshot()
-	if len(snapshot.Connectivity.KnownAddresses) != 1 || snapshot.Connectivity.KnownAddresses[0].Source != string(discovery.SourceTopology) ||
-		snapshot.Connectivity.KnownAddresses[0].ExpiresAt != refreshedExpiry.UTC().Format(time.RFC3339) {
-		t.Fatalf("refreshed hint was stale in snapshot: %#v", snapshot.Connectivity.KnownAddresses)
+	if len(snapshot.Connectivity.DiscoveryHints) != 1 || snapshot.Connectivity.DiscoveryHints[0].Source != string(discovery.SourceTopology) ||
+		snapshot.Connectivity.DiscoveryHints[0].ExpiresAt != refreshedExpiry.UTC().Format(time.RFC3339) {
+		t.Fatalf("refreshed hint was stale in snapshot: %#v", snapshot.Connectivity.DiscoveryHints)
 	}
 	<-client.stateChanges
 
@@ -340,8 +352,8 @@ func TestDiscoveryHintRefreshAndExpirationPublishCurrentSnapshot(t *testing.T) {
 	}
 	client.publishStateChange()
 	snapshot, _ = client.StateSnapshot()
-	if len(client.stateChanges) != 1 || len(snapshot.Connectivity.KnownAddresses) != 0 {
-		t.Fatalf("expired hint was stale in snapshot: %#v", snapshot.Connectivity.KnownAddresses)
+	if len(client.stateChanges) != 1 || len(snapshot.Connectivity.DiscoveryHints) != 0 {
+		t.Fatalf("expired hint was stale in snapshot: %#v", snapshot.Connectivity.DiscoveryHints)
 	}
 }
 

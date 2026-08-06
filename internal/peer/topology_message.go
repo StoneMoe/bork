@@ -59,7 +59,7 @@ func (c *Client) marshalTopologyMessage(generation uint64, recipientID string, r
 		return nil, errors.New("topology audio stream is zero")
 	}
 	candidates := make([]netip.AddrPort, 0, len(c.networkSnapshot.Endpoint.Candidates))
-	for _, candidateType := range []endpoint.CandidateType{endpoint.CandidatePortMapped, endpoint.CandidateServerReflexive, endpoint.CandidateHost} {
+	for _, candidateType := range []endpoint.CandidateType{endpoint.CandidatePortMapped, endpoint.CandidateSTUN, endpoint.CandidateNIC} {
 		for _, candidate := range c.networkSnapshot.Endpoint.Candidates {
 			if candidate.Type != candidateType {
 				continue

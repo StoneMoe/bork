@@ -36,6 +36,9 @@ type RoomSnapshot struct {
 func (s RoomSnapshot) Clone() RoomSnapshot {
 	s.Endpoint = s.Endpoint.Clone()
 	s.Tracker = append([]tracker.ProviderStatus{}, s.Tracker...)
+	for index := range s.Tracker {
+		s.Tracker[index] = s.Tracker[index].Clone()
+	}
 	return s
 }
 
@@ -47,6 +50,7 @@ type roomEndpoint interface {
 	AudioPackets() <-chan endpoint.Datagram
 	InteractivePackets() <-chan endpoint.Datagram
 	EnqueueControl([]byte, netip.AddrPort) error
+	EnqueueBackground([]byte, netip.AddrPort) error
 	SendRealtimeBatch(endpoint.RealtimeBatch) error
 	InvalidateRealtime(uint64)
 }
@@ -349,7 +353,7 @@ func portMappingInternalPort(snapshot endpoint.Snapshot) uint16 {
 		return 0
 	}
 	for _, candidate := range snapshot.Candidates {
-		if candidate.Type != endpoint.CandidateHost || candidate.Family != "ipv4" {
+		if candidate.Type != endpoint.CandidateNIC || candidate.Family != "ipv4" {
 			continue
 		}
 		address, err := netip.ParseAddrPort(candidate.Address)
@@ -375,7 +379,7 @@ func trackerAnnounceCandidates(snapshot endpoint.Snapshot) []tracker.AnnounceCan
 		if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || carrierGradeNATPrefix.Contains(ip) {
 			return
 		}
-		if candidate.Type == endpoint.CandidatePortMapped && !hasServerReflexiveAddress(snapshot, ip) {
+		if candidate.Type == endpoint.CandidatePortMapped && !hasSTUNAddress(snapshot, ip) {
 			return
 		}
 		endpointAddress := netip.AddrPortFrom(ip, address.Port())
@@ -390,18 +394,18 @@ func trackerAnnounceCandidates(snapshot endpoint.Snapshot) []tracker.AnnounceCan
 			appendCandidate(candidate)
 		}
 	}
-	reflexive := make([]endpoint.Candidate, 0, len(snapshot.Candidates))
+	stunCandidates := make([]endpoint.Candidate, 0, len(snapshot.Candidates))
 	for _, candidate := range snapshot.Candidates {
-		if candidate.Type == endpoint.CandidateServerReflexive {
-			reflexive = append(reflexive, candidate)
+		if candidate.Type == endpoint.CandidateSTUN {
+			stunCandidates = append(stunCandidates, candidate)
 		}
 	}
 	rttByServer := make(map[string]int64, len(snapshot.STUN))
 	for _, result := range snapshot.STUN {
 		rttByServer[result.Server] = result.RTTMillis
 	}
-	sort.Slice(reflexive, func(i, j int) bool {
-		left, right := rttByServer[reflexive[i].Source], rttByServer[reflexive[j].Source]
+	sort.Slice(stunCandidates, func(i, j int) bool {
+		left, right := rttByServer[stunCandidates[i].Source], rttByServer[stunCandidates[j].Source]
 		if left <= 0 {
 			left = 1<<63 - 1
 		}
@@ -411,9 +415,9 @@ func trackerAnnounceCandidates(snapshot endpoint.Snapshot) []tracker.AnnounceCan
 		if left != right {
 			return left < right
 		}
-		return reflexive[i].Address < reflexive[j].Address
+		return stunCandidates[i].Address < stunCandidates[j].Address
 	})
-	for _, candidate := range reflexive {
+	for _, candidate := range stunCandidates {
 		appendCandidate(candidate)
 	}
 	if len(candidates) == 0 {
@@ -424,13 +428,13 @@ func trackerAnnounceCandidates(snapshot endpoint.Snapshot) []tracker.AnnounceCan
 	return candidates
 }
 
-func hasServerReflexiveAddress(snapshot endpoint.Snapshot, address netip.Addr) bool {
+func hasSTUNAddress(snapshot endpoint.Snapshot, address netip.Addr) bool {
 	for _, candidate := range snapshot.Candidates {
-		if candidate.Type != endpoint.CandidateServerReflexive {
+		if candidate.Type != endpoint.CandidateSTUN {
 			continue
 		}
-		reflexive, err := netip.ParseAddrPort(candidate.Address)
-		if err == nil && reflexive.Addr().Unmap() == address {
+		stunAddress, err := netip.ParseAddrPort(candidate.Address)
+		if err == nil && stunAddress.Addr().Unmap() == address {
 			return true
 		}
 	}
@@ -567,6 +571,10 @@ func (n *RoomNetwork) InteractivePackets() <-chan endpoint.Datagram {
 // EnqueueControl reports validation and queue admission, not the UDP write result.
 func (n *RoomNetwork) EnqueueControl(data []byte, destination netip.AddrPort) error {
 	return n.endpoint.EnqueueControl(data, destination)
+}
+
+func (n *RoomNetwork) EnqueueBackground(data []byte, destination netip.AddrPort) error {
+	return n.endpoint.EnqueueBackground(data, destination)
 }
 
 // SendRealtimeBatch transfers ownership of a complete realtime fan-out group.

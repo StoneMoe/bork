@@ -34,6 +34,7 @@ const (
 	maxInteractiveBatches     = 32
 	maxAudioWriteTime         = 20 * time.Millisecond
 	maxInteractiveWriteTime   = 50 * time.Millisecond
+	maxNonAudioWriteTime      = 2 * time.Millisecond
 	controlWriteTimeout       = time.Second
 	controlSourceRate         = 64.0
 	controlSourceBurst        = 64.0
@@ -48,7 +49,7 @@ const (
 	audioGlobalBurst          = 1000.0
 	maxAudioSources           = 256
 	interactiveSourceRate     = 1000.0
-	interactiveSourceBurst    = 200.0
+	interactiveSourceBurst    = 300.0
 	interactiveGlobalRate     = 5000.0
 	interactiveGlobalBurst    = 1000.0
 	maxInteractiveSources     = 256
@@ -211,6 +212,15 @@ func (e *Endpoint) InteractivePackets() <-chan Datagram { return e.interactivePa
 // EnqueueControl validates and admits a control datagram. It does not wait for
 // the kernel write because peer control paths must not inherit socket latency.
 func (e *Endpoint) EnqueueControl(data []byte, destination netip.AddrPort) error {
+	return e.enqueuePeerDatagram(data, destination, e.controlWrites, "control")
+}
+
+// EnqueueBackground admits low-priority peer data without blocking its owner.
+func (e *Endpoint) EnqueueBackground(data []byte, destination netip.AddrPort) error {
+	return e.enqueuePeerDatagram(data, destination, e.backgroundWrites, "background")
+}
+
+func (e *Endpoint) enqueuePeerDatagram(data []byte, destination netip.AddrPort, queue chan<- queuedWrite, lane string) error {
 	if len(data) == 0 || len(data) > maxDatagramSize {
 		return fmt.Errorf("peer datagram must contain 1 to %d bytes", maxDatagramSize)
 	}
@@ -227,10 +237,10 @@ func (e *Endpoint) EnqueueControl(data []byte, destination netip.AddrPort) error
 		deadline: time.Now().Add(controlWriteTimeout),
 	}
 	select {
-	case e.controlWrites <- request:
+	case queue <- request:
 		return nil
 	default:
-		return errors.New("UDP control queue is full")
+		return fmt.Errorf("UDP %s queue is full", lane)
 	}
 }
 
@@ -388,15 +398,15 @@ func (e *Endpoint) Run(ctx context.Context) error {
 		return errors.New("UDP endpoint has an invalid local address")
 	}
 	local := netip.AddrPortFrom(localIP.Unmap(), uint16(localAddress.Port))
-	candidates, err := hostCandidates(local.Addr(), local.Port())
+	candidates, err := nicCandidates(local.Addr(), local.Port())
 	if err != nil {
-		e.logger.Warn("collect host candidates", "error", err)
+		e.logger.Warn("collect NIC candidates", "error", err)
 	}
 	e.updateSnapshot(func(snapshot *Snapshot) {
 		snapshot.ListenAddress = local.String()
 		snapshot.Candidates = candidates
 	})
-	e.logger.Info("peer UDP endpoint listening", "address", local.String(), "host_candidates", len(candidates))
+	e.logger.Info("peer UDP endpoint listening", "address", local.String(), "nic_candidates", len(candidates))
 
 	workerDone := make(chan error, 2)
 	go func() {
@@ -715,7 +725,7 @@ func (e *Endpoint) writeRealtimeBatch(ctx context.Context, conn *net.UDPConn, ba
 	case protocol.TrafficAudio:
 		writeBudget = maxAudioWriteTime
 	case protocol.TrafficInteractive, protocol.TrafficCustomRealtime:
-		writeBudget = maxInteractiveWriteTime
+		writeBudget = min(maxInteractiveWriteTime, maxNonAudioWriteTime)
 	default:
 		return nil
 	}
@@ -787,11 +797,16 @@ func (e *Endpoint) queueWrite(ctx context.Context, lane chan<- queuedWrite, data
 }
 
 func writeQueued(conn *net.UDPConn, request queuedWrite) error {
-	if !request.deadline.After(time.Now()) {
+	now := time.Now()
+	if !request.deadline.After(now) {
 		reportQueuedWrite(request, context.DeadlineExceeded)
 		return nil
 	}
-	if err := conn.SetWriteDeadline(request.deadline); err != nil {
+	writeDeadline := now.Add(maxNonAudioWriteTime)
+	if request.deadline.Before(writeDeadline) {
+		writeDeadline = request.deadline
+	}
+	if err := conn.SetWriteDeadline(writeDeadline); err != nil {
 		reportQueuedWrite(request, err)
 		return err
 	}
@@ -878,13 +893,13 @@ func (e *Endpoint) refreshSTUN(ctx context.Context) {
 	}
 	sort.Slice(stunResults, func(i, j int) bool { return stunResults[i].Server < stunResults[j].Server })
 	e.updateSnapshot(func(snapshot *Snapshot) {
-		hosts := snapshot.Candidates[:0]
+		nics := snapshot.Candidates[:0]
 		for _, candidate := range snapshot.Candidates {
-			if candidate.Type == CandidateHost {
-				hosts = append(hosts, candidate)
+			if candidate.Type == CandidateNIC {
+				nics = append(nics, candidate)
 			}
 		}
-		snapshot.Candidates = hosts
+		snapshot.Candidates = nics
 		seen := make(map[string]struct{})
 		for _, result := range stunResults {
 			if result.MappedAddress == "" {
@@ -899,7 +914,7 @@ func (e *Endpoint) refreshSTUN(ctx context.Context) {
 				continue
 			}
 			snapshot.Candidates = append(snapshot.Candidates, Candidate{
-				Type:    CandidateServerReflexive,
+				Type:    CandidateSTUN,
 				Address: result.MappedAddress,
 				Family:  addressFamily(address.Addr()),
 				Source:  result.Server,

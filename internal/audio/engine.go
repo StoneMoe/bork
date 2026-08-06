@@ -23,17 +23,29 @@ const (
 	playbackQueueFrames = 2
 	voiceSendBudget     = 20 * time.Millisecond
 	maxPlaybackAge      = 100 * time.Millisecond
+
+	peerJoinedNotification   = 1
+	peerLeftNotification     = 2
+	audioMutedNotification   = 3
+	audioUnmutedNotification = 4
+	notificationSamples      = SampleRate * 140 / 1000
+	notificationAttack       = SampleRate * 5 / 1000
+	notificationRelease      = SampleRate * 30 / 1000
+	notificationAmplitude    = 0.15
+	notificationDrain        = time.Duration(notificationSamples+2*FrameSamples) * time.Second / SampleRate
 )
 
 type engineRun struct {
 	cancel context.CancelFunc
 	port   media.AudioPort
 
-	capture           *malgo.Device
-	playback          *malgo.Device
-	workers           sync.WaitGroup
-	captureGeneration atomic.Uint64
-	active            atomic.Bool
+	device             *malgo.Device
+	workers            sync.WaitGroup
+	captureGeneration  atomic.Uint64
+	urgentNotification atomic.Uint32
+	peerNotification   atomic.Uint32
+	audioNotification  atomic.Uint32
+	active             atomic.Bool
 
 	monitorDone chan struct{}
 }
@@ -47,11 +59,17 @@ type Engine struct {
 	mu    sync.RWMutex
 	state Status
 
-	run           *engineRun
-	muted         atomic.Bool
-	targetBitrate atomic.Int64
-	statusChanges chan struct{}
-	closed        bool
+	run                         *engineRun
+	captureMuted                atomic.Bool
+	playbackMuted               atomic.Bool
+	captureGain                 atomic.Int64
+	playbackGain                atomic.Int64
+	echoCancellation            atomic.Bool
+	noiseSuppression            atomic.Bool
+	remoteLoudnessNormalization atomic.Bool
+	targetBitrate               atomic.Int64
+	statusChanges               chan struct{}
+	closed                      bool
 }
 
 func New(options Options, logger *slog.Logger) (*Engine, error) {
@@ -70,9 +88,14 @@ func New(options Options, logger *slog.Logger) (*Engine, error) {
 		logger:               logger,
 		context:              audioContext,
 		maxEncodedFrameBytes: options.MaxEncodedFrameBytes,
-		state:                Status{SpeakingPeerIDs: []string{}},
+		state:                defaultStatus(),
 		statusChanges:        make(chan struct{}, 1),
 	}
+	engine.captureGain.Store(defaultAudioGain)
+	engine.playbackGain.Store(defaultAudioGain)
+	engine.echoCancellation.Store(true)
+	engine.noiseSuppression.Store(true)
+	engine.remoteLoudnessNormalization.Store(true)
 	engine.targetBitrate.Store(defaultVoiceBitrate)
 	if err := engine.refreshDevicesLocked(); err != nil {
 		_ = audioContext.Uninit()
@@ -214,30 +237,163 @@ func (e *Engine) SetDevices(captureID, playbackID string) error {
 	return nil
 }
 
-func (e *Engine) SetMuted(muted bool) {
+func (e *Engine) SetCaptureMuted(muted bool) {
 	e.opMu.Lock()
+	e.mu.RLock()
+	unchanged := e.state.CaptureMuted == muted
+	e.mu.RUnlock()
+	if unchanged {
+		e.opMu.Unlock()
+		return
+	}
 	if muted {
-		e.muted.Store(true)
+		e.captureMuted.Store(true)
 	}
 	if e.run != nil {
 		generation := e.run.port.InvalidateSend()
 		e.run.captureGeneration.Store(generation)
 	}
 	if !muted {
-		e.muted.Store(false)
+		e.captureMuted.Store(false)
 	}
 	e.mu.Lock()
-	changed := e.state.Muted != muted
-	e.state.Muted = muted
+	e.state.CaptureMuted = muted
 	if muted && e.state.Speaking {
 		e.state.Speaking = false
-		changed = true
 	}
 	e.mu.Unlock()
+	e.queueAudioNotificationLocked(muted)
+	e.publish()
+	e.opMu.Unlock()
+}
+
+func (e *Engine) SetPlaybackMuted(muted bool) {
+	e.opMu.Lock()
+	e.playbackMuted.Store(muted)
+	e.mu.Lock()
+	changed := e.state.PlaybackMuted != muted
+	e.state.PlaybackMuted = muted
+	e.mu.Unlock()
+	if changed {
+		e.queueAudioNotificationLocked(muted)
+	}
 	if changed {
 		e.publish()
 	}
 	e.opMu.Unlock()
+}
+
+func (e *Engine) queueAudioNotificationLocked(muted bool) {
+	if e.run == nil || !e.run.active.Load() {
+		return
+	}
+	notification := uint32(audioUnmutedNotification)
+	if muted {
+		notification = audioMutedNotification
+	}
+	e.run.audioNotification.Store(notification)
+}
+
+// PlayPeerChange queues a local tone on the current playback device.
+func (e *Engine) PlayPeerChange(joined bool) {
+	notification := uint32(peerLeftNotification)
+	if joined {
+		notification = peerJoinedNotification
+	}
+	e.opMu.Lock()
+	if e.run != nil && e.run.active.Load() {
+		// ponytail: coalesce peer churn instead of building an audible backlog.
+		e.run.peerNotification.Store(notification)
+	}
+	e.opMu.Unlock()
+}
+
+// StopWithPeerLeave lets the playback device consume the local leave tone
+// before room teardown stops its callback.
+func (e *Engine) StopWithPeerLeave() {
+	e.opMu.Lock()
+	run := e.run
+	queued := run != nil && run.active.Load() && !e.playbackMuted.Load()
+	if queued {
+		run.urgentNotification.Store(peerLeftNotification)
+	}
+	e.opMu.Unlock()
+	if queued {
+		time.Sleep(notificationDrain)
+	}
+	e.opMu.Lock()
+	e.stopRunLocked(run)
+	e.opMu.Unlock()
+	if run != nil {
+		<-run.monitorDone
+	}
+}
+
+func (e *Engine) SetCaptureGain(gain int) error {
+	if gain < minimumAudioGain || gain > maximumAudioGain {
+		return fmt.Errorf("capture gain must be between %d and %d", minimumAudioGain, maximumAudioGain)
+	}
+	e.captureGain.Store(int64(gain))
+	e.mu.Lock()
+	changed := e.state.CaptureGain != gain
+	e.state.CaptureGain = gain
+	e.mu.Unlock()
+	if changed {
+		e.publish()
+	}
+	return nil
+}
+
+func (e *Engine) SetPlaybackGain(gain int) error {
+	if gain < minimumAudioGain || gain > maximumAudioGain {
+		return fmt.Errorf("playback gain must be between %d and %d", minimumAudioGain, maximumAudioGain)
+	}
+	e.playbackGain.Store(int64(gain))
+	e.mu.Lock()
+	changed := e.state.PlaybackGain != gain
+	e.state.PlaybackGain = gain
+	e.mu.Unlock()
+	if changed {
+		e.publish()
+	}
+	return nil
+}
+
+func (e *Engine) SetRemoteLoudnessNormalization(enabled bool) {
+	e.remoteLoudnessNormalization.Store(enabled)
+	e.mu.Lock()
+	changed := e.state.RemoteLoudnessNormalization != enabled
+	e.state.RemoteLoudnessNormalization = enabled
+	e.mu.Unlock()
+	if changed {
+		e.publish()
+	}
+}
+
+func (e *Engine) SetEchoCancellation(enabled bool) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	e.echoCancellation.Store(enabled)
+	e.mu.Lock()
+	changed := e.state.EchoCancellation != enabled
+	e.state.EchoCancellation = enabled
+	e.mu.Unlock()
+	if changed {
+		e.publish()
+	}
+}
+
+func (e *Engine) SetNoiseSuppression(enabled bool) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	e.noiseSuppression.Store(enabled)
+	e.mu.Lock()
+	changed := e.state.NoiseSuppression != enabled
+	e.state.NoiseSuppression = enabled
+	e.mu.Unlock()
+	if changed {
+		e.publish()
+	}
 }
 
 func (e *Engine) Start(mediaPort media.AudioPort) error {
@@ -266,6 +422,7 @@ func (e *Engine) Start(mediaPort media.AudioPort) error {
 	if err != nil {
 		return e.fail(fmt.Errorf("initialise Opus encoder: %w", err))
 	}
+	processor := newCaptureProcessor()
 	captureQueue := newPCMFrameQueue(captureQueueFrames)
 	playbackQueue := newPCMFrameQueue(playbackQueueFrames)
 	playbackWake := make(chan struct{}, 1)
@@ -282,38 +439,23 @@ func (e *Engine) Start(mediaPort media.AudioPort) error {
 	run := &engineRun{cancel: cancel, port: mediaPort, monitorDone: make(chan struct{})}
 	run.captureGeneration.Store(generation)
 
-	capture, err := e.initCaptureDevice(captureID, captureQueue, captureReady, deviceStopped, &run.captureGeneration)
+	device, err := e.initDuplexDevice(captureID, playbackID, captureQueue, captureReady, playbackQueue, playbackWake, deviceStopped, &playbackDemand, &run.captureGeneration)
 	if err != nil {
 		cancel()
+		processor.Close()
 		return e.fail(err)
 	}
-	playback, err := e.initPlaybackDevice(playbackID, playbackQueue, playbackWake, deviceStopped, &playbackDemand)
-	if err != nil {
-		cancel()
-		capture.Uninit()
-		return e.fail(err)
-	}
-	run.capture = capture
-	run.playback = playback
+	run.device = device
 	run.workers.Add(2)
-	go e.encodeLoop(ctx, run, captureQueue, captureReady, encoder)
+	go e.encodeLoop(ctx, run, captureQueue, captureReady, encoder, processor)
 	go e.playbackLoop(ctx, run, playbackQueue, playbackWake, &playbackDemand)
 	notifyPlayback(playbackWake)
-	if err := playback.Start(); err != nil {
+	if err := device.Start(); err != nil {
 		cancel()
-		capture.Uninit()
-		playback.Uninit()
+		device.Uninit()
 		run.workers.Wait()
 		mediaPort.Reset()
-		return e.fail(fmt.Errorf("start playback device: %w", err))
-	}
-	if err := capture.Start(); err != nil {
-		cancel()
-		capture.Uninit()
-		playback.Uninit()
-		run.workers.Wait()
-		mediaPort.Reset()
-		return e.fail(fmt.Errorf("start capture device: %w", err))
+		return e.fail(fmt.Errorf("start audio device: %w", err))
 	}
 
 	e.mu.Lock()
@@ -327,42 +469,11 @@ func (e *Engine) Start(mediaPort media.AudioPort) error {
 	return nil
 }
 
-func (e *Engine) initCaptureDevice(deviceID string, queue *pcmFrameQueue, ready, stopped chan<- struct{}, generation *atomic.Uint64) (*malgo.Device, error) {
-	config := malgo.DefaultDeviceConfig(malgo.Capture)
+func (e *Engine) initDuplexDevice(captureID, playbackID string, captureQueue *pcmFrameQueue, captureReady chan<- struct{}, playbackQueue *pcmFrameQueue, playbackWake chan<- struct{}, stopped chan<- struct{}, playbackDemand, generation *atomic.Uint64) (*malgo.Device, error) {
+	config := malgo.DefaultDeviceConfig(malgo.Duplex)
 	config.Capture.Format = malgo.FormatF32
 	config.Capture.Channels = Channels
 	config.Capture.ShareMode = malgo.Shared
-	config.SampleRate = SampleRate
-	config.PeriodSizeInFrames = FrameSamples / 2
-	config.Periods = 2
-	config.PerformanceProfile = malgo.LowLatency
-	config.Alsa.NoMMap = 1
-	release, err := setDeviceID(e.context.Context, malgo.Capture, deviceID, &config.Capture)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-	assembler := captureAssembler{queue: queue, ready: ready, generation: generation}
-	callbacks := malgo.DeviceCallbacks{Data: func(_ []byte, input []byte, _ uint32) {
-		if len(input) == 0 {
-			return
-		}
-		assembler.Write(byteFloats(input), e.muted.Load())
-	}, Stop: func() {
-		select {
-		case stopped <- struct{}{}:
-		default:
-		}
-	}}
-	device, err := malgo.InitDevice(e.context.Context, config, callbacks)
-	if err != nil {
-		return nil, fmt.Errorf("initialise capture device: %w", err)
-	}
-	return device, nil
-}
-
-func (e *Engine) initPlaybackDevice(deviceID string, queue *pcmFrameQueue, wake, stopped chan<- struct{}, demand *atomic.Uint64) (*malgo.Device, error) {
-	config := malgo.DefaultDeviceConfig(malgo.Playback)
 	config.Playback.Format = malgo.FormatF32
 	config.Playback.Channels = Channels
 	config.Playback.ShareMode = malgo.Shared
@@ -371,17 +482,26 @@ func (e *Engine) initPlaybackDevice(deviceID string, queue *pcmFrameQueue, wake,
 	config.Periods = 2
 	config.PerformanceProfile = malgo.LowLatency
 	config.Alsa.NoMMap = 1
-	release, err := setDeviceID(e.context.Context, malgo.Playback, deviceID, &config.Playback)
+	releaseCapture, err := setDeviceID(e.context.Context, malgo.Capture, captureID, &config.Capture)
 	if err != nil {
 		return nil, err
 	}
-	defer release()
-	reader := newPlaybackReader(queue, wake, demand)
-	callbacks := malgo.DeviceCallbacks{Data: func(output, _ []byte, _ uint32) {
-		if len(output) == 0 {
-			return
+	defer releaseCapture()
+	releasePlayback, err := setDeviceID(e.context.Context, malgo.Playback, playbackID, &config.Playback)
+	if err != nil {
+		return nil, err
+	}
+	defer releasePlayback()
+	assembler := captureAssembler{queue: captureQueue, ready: captureReady, generation: generation}
+	reader := newPlaybackReader(playbackQueue, playbackWake, playbackDemand, &e.playbackMuted)
+	callbacks := malgo.DeviceCallbacks{Data: func(output, input []byte, _ uint32) {
+		played := byteFloats(output)
+		if len(played) > 0 {
+			reader.Read(played)
 		}
-		reader.Read(byteFloats(output))
+		if len(input) > 0 {
+			assembler.Write(byteFloats(input), played, e.captureMuted.Load())
+		}
 	}, Stop: func() {
 		select {
 		case stopped <- struct{}{}:
@@ -390,7 +510,7 @@ func (e *Engine) initPlaybackDevice(deviceID string, queue *pcmFrameQueue, wake,
 	}}
 	device, err := malgo.InitDevice(e.context.Context, config, callbacks)
 	if err != nil {
-		return nil, fmt.Errorf("initialise playback device: %w", err)
+		return nil, fmt.Errorf("initialise audio device: %w", err)
 	}
 	return device, nil
 }
@@ -419,12 +539,85 @@ func byteFloats(data []byte) []float32 {
 	return unsafe.Slice((*float32)(unsafe.Pointer(&data[0])), len(data)/4)
 }
 
-func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrameQueue, ready <-chan struct{}, encoder *opusEncoder) {
+func applyGainRamp(samples []float32, from, to float32) float32 {
+	if len(samples) == 0 {
+		return to
+	}
+	step := (to - from) / float32(len(samples))
+	gain := from
+	for index, sample := range samples {
+		gain += step
+		samples[index] = max(-1, min(1, sample*gain))
+	}
+	return to
+}
+
+type notificationTone struct {
+	phase             float64
+	frequency         float64
+	secondFrequency   float64
+	remaining         int
+	audibleWhileMuted bool
+}
+
+func (t *notificationTone) start(notification uint32) {
+	t.audibleWhileMuted = false
+	t.secondFrequency = 0
+	switch notification {
+	case peerJoinedNotification:
+		t.frequency = 520
+		t.secondFrequency = 760
+	case peerLeftNotification:
+		t.frequency = 520
+		t.secondFrequency = 340
+	case audioUnmutedNotification:
+		t.frequency = 880
+	case audioMutedNotification:
+		t.frequency = 440
+	default:
+		return
+	}
+	t.audibleWhileMuted = notification == audioMutedNotification || notification == audioUnmutedNotification
+	t.phase = 0
+	t.remaining = notificationSamples
+}
+
+func (t *notificationTone) mix(samples []float32, playbackMuted bool) bool {
+	localOnly := t.remaining > 0 && t.audibleWhileMuted && playbackMuted
+	if localOnly {
+		clear(samples)
+	}
+	for index := range samples {
+		if t.remaining == 0 {
+			return localOnly
+		}
+		elapsed := notificationSamples - t.remaining
+		envelope := min(1, float64(elapsed)/notificationAttack)
+		envelope = min(envelope, float64(t.remaining)/notificationRelease)
+		level := notificationAmplitude * envelope
+		samples[index] = samples[index]*float32(1-level) + float32(math.Sin(t.phase)*level)
+		frequency := t.frequency
+		if t.secondFrequency != 0 && elapsed >= notificationSamples/2 {
+			frequency = t.secondFrequency
+		}
+		t.phase += 2 * math.Pi * frequency / SampleRate
+		t.remaining--
+	}
+	return localOnly
+}
+
+func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrameQueue, ready <-chan struct{}, encoder *opusEncoder, processor *captureProcessor) {
 	defer run.workers.Done()
+	defer processor.Close()
 	var encoderGeneration uint64
 	var speakingGeneration uint64
+	processorGeneration := run.captureGeneration.Load()
+	processedEchoCancellation := e.echoCancellation.Load()
+	processedNoiseSuppression := e.noiseSuppression.Load()
+	var lastProcessedTimestamp uint32
 	var localSpeaking speakingHold
 	encoderBitrate := defaultVoiceBitrate
+	appliedCaptureGain := float32(e.captureGain.Load()) / 100
 	for {
 		select {
 		case <-ctx.Done():
@@ -449,7 +642,33 @@ func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrame
 					e.setLocalSpeaking(run, generation, false)
 					speakingGeneration = generation
 				}
-				if run.active.Load() && !e.muted.Load() && localSpeaking.update(speakingFrame(frame.Samples[:])) {
+				echoCancellation := e.echoCancellation.Load()
+				noiseSuppression := e.noiseSuppression.Load()
+				captureMuted := frame.Muted
+				discontinuous := lastProcessedTimestamp != 0 && frame.Timestamp-lastProcessedTimestamp != FrameSamples
+				if processorGeneration != generation || discontinuous {
+					processor.ResetEchoCancellation()
+					processor.ResetNoiseSuppression()
+					processorGeneration = generation
+					processedEchoCancellation = echoCancellation
+					processedNoiseSuppression = noiseSuppression
+				} else {
+					if !frame.ReferenceValid || processedEchoCancellation != echoCancellation {
+						processor.ResetEchoCancellation()
+						processedEchoCancellation = echoCancellation
+					}
+					if processedNoiseSuppression != noiseSuppression {
+						processor.ResetNoiseSuppression()
+						processedNoiseSuppression = noiseSuppression
+					}
+				}
+				lastProcessedTimestamp = frame.Timestamp
+				if !captureMuted {
+					processor.Process(frame.Samples[:], frame.Reference[:], echoCancellation && frame.ReferenceValid, noiseSuppression)
+				}
+				targetGain := float32(e.captureGain.Load()) / 100
+				appliedCaptureGain = applyGainRamp(frame.Samples[:], appliedCaptureGain, targetGain)
+				if run.active.Load() && !captureMuted && localSpeaking.update(speakingFrame(frame.Samples[:])) {
 					e.setLocalSpeaking(run, generation, localSpeaking.active())
 				}
 				targetBitrate := int(e.targetBitrate.Load())
@@ -510,6 +729,34 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 	mixer := newMixer(e.maxEncodedFrameBytes)
 	nextIndex := uint64(1)
 	discard := make([]float32, FrameSamples)
+	appliedPlaybackGain := float32(e.playbackGain.Load()) / 100
+	var notification notificationTone
+	mixFrame := func(destination []float32, consumeNotification bool) (bool, error) {
+		mixer.loudnessNormalization = e.remoteLoudnessNormalization.Load()
+		_, err := mixer.NextInto(destination)
+		e.setSpeakingPeerIDs(run, mixer.SpeakingPeerIDs())
+		if consumeNotification {
+			queued := run.urgentNotification.Swap(0)
+			if queued != 0 {
+				notification.start(queued)
+			} else if notification.remaining == 0 {
+				queued = run.audioNotification.Swap(0)
+				if queued == 0 {
+					queued = run.peerNotification.Swap(0)
+				}
+				if queued != 0 {
+					notification.start(queued)
+				}
+			}
+		}
+		localOnly := false
+		if consumeNotification {
+			localOnly = notification.mix(destination, e.playbackMuted.Load())
+		}
+		targetGain := float32(e.playbackGain.Load()) / 100
+		appliedPlaybackGain = applyGainRamp(destination, appliedPlaybackGain, targetGain)
+		return localOnly, err
+	}
 	drainPlayback := func() {
 		for {
 			frame, ok := run.port.TakeReceived()
@@ -534,8 +781,7 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 			drainPlayback()
 			target := demand.Load()
 			for nextIndex < target {
-				_, err := mixer.NextInto(discard)
-				e.setSpeakingPeerIDs(run, mixer.SpeakingPeerIDs())
+				_, err := mixFrame(discard, false)
 				if err != nil {
 					e.setRuntimeError(fmt.Errorf("decode Opus: %w", err))
 				}
@@ -546,9 +792,9 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 				if !ok {
 					break
 				}
-				_, err := mixer.NextInto(slot.Samples[:])
-				e.setSpeakingPeerIDs(run, mixer.SpeakingPeerIDs())
+				localOnly, err := mixFrame(slot.Samples[:], true)
 				slot.Index = nextIndex
+				slot.LocalOnly = localOnly
 				queue.CommitWrite()
 				nextIndex++
 				if err != nil {
@@ -582,11 +828,8 @@ func (e *Engine) stopRunLocked(run *engineRun) {
 	e.mu.Unlock()
 	run.port.Reset()
 	run.cancel()
-	if run.capture != nil {
-		run.capture.Uninit()
-	}
-	if run.playback != nil {
-		run.playback.Uninit()
+	if run.device != nil {
+		run.device.Uninit()
 	}
 	run.workers.Wait()
 	e.publish()
@@ -634,7 +877,7 @@ func (e *Engine) setRuntimeError(err error) {
 
 func (e *Engine) setLocalSpeaking(run *engineRun, generation uint64, speaking bool) {
 	e.mu.Lock()
-	if !run.active.Load() || e.muted.Load() || generation != run.captureGeneration.Load() || e.state.Speaking == speaking {
+	if !run.active.Load() || e.captureMuted.Load() || generation != run.captureGeneration.Load() || e.state.Speaking == speaking {
 		e.mu.Unlock()
 		return
 	}

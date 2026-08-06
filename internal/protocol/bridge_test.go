@@ -13,7 +13,7 @@ func TestBridgeControlRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	packet, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 12, origin, target, inner, pair.firstMaterial.Ciphers.ControlSend)
+	packet, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 12, origin, target, false, inner, pair.firstMaterial.Ciphers.ControlSend)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,12 +45,16 @@ func TestBridgeAcceptsMaximumReliableInner(t *testing.T) {
 	if len(reliable) != MaxBridgeInnerSize {
 		t.Fatalf("reliable packet size = %d, want %d", len(reliable), MaxBridgeInnerSize)
 	}
-	packet, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{1}, [32]byte{2}, reliable, pair.firstMaterial.Ciphers.ControlSend)
+	packet, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{1}, [32]byte{2}, true, reliable, pair.firstMaterial.Ciphers.ControlSend)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(packet) != MaxDatagramSize {
 		t.Fatalf("bridge packet size = %d, want %d", len(packet), MaxDatagramSize)
+	}
+	decoded, err := ParseBridge(packet, pair.roomTag, pair.secondMaterial.SessionID, pair.secondMaterial.Ciphers.ControlRecv)
+	if err != nil || !decoded.Background {
+		t.Fatalf("background bridge = %#v, %v", decoded, err)
 	}
 }
 
@@ -60,18 +64,21 @@ func TestBridgeRejectsInvalidFieldsAndTampering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{}, [32]byte{2}, inner, pair.firstMaterial.Ciphers.ControlSend); err == nil {
+	if _, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{}, [32]byte{2}, false, inner, pair.firstMaterial.Ciphers.ControlSend); err == nil {
 		t.Fatal("zero origin was accepted")
 	}
-	if _, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{1}, [32]byte{1}, inner, pair.firstMaterial.Ciphers.ControlSend); err == nil {
+	if _, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{1}, [32]byte{1}, false, inner, pair.firstMaterial.Ciphers.ControlSend); err == nil {
 		t.Fatal("equal endpoints were accepted")
 	}
 	wrongType := bytes.Clone(inner)
 	wrongType[5] = 255
-	if _, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{1}, [32]byte{2}, wrongType, pair.firstMaterial.Ciphers.ControlSend); err == nil {
+	if _, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{1}, [32]byte{2}, false, wrongType, pair.firstMaterial.Ciphers.ControlSend); err == nil {
 		t.Fatal("invalid inner type was accepted")
 	}
-	packet, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{1}, [32]byte{2}, inner, pair.firstMaterial.Ciphers.ControlSend)
+	if _, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{1}, [32]byte{2}, true, inner, pair.firstMaterial.Ciphers.ControlSend); err == nil {
+		t.Fatal("non-reliable background inner was accepted")
+	}
+	packet, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{1}, [32]byte{2}, false, inner, pair.firstMaterial.Ciphers.ControlSend)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +97,7 @@ func FuzzParseBridge(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	packet, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{1}, [32]byte{2}, inner, pair.firstMaterial.Ciphers.ControlSend)
+	packet, err := MarshalBridge(pair.roomTag, pair.firstMaterial.SessionID, 2, [32]byte{1}, [32]byte{2}, false, inner, pair.firstMaterial.Ciphers.ControlSend)
 	if err != nil {
 		f.Fatal(err)
 	}

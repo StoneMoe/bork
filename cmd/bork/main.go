@@ -9,6 +9,7 @@ import (
 
 	"bork/internal/app"
 	"bork/internal/config"
+	"bork/internal/webassets"
 )
 
 var version = "dev"
@@ -37,7 +38,7 @@ func run(args []string) int {
 		return 2
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	if err := app.RunGUI(cfg, assets, logger); err != nil {
+	if err := app.RunGUI(cfg, webassets.Files, logger); err != nil {
 		logger.Error("GUI stopped", "error", err)
 		return 1
 	}

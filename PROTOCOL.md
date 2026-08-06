@@ -135,7 +135,7 @@ Outer packet 使用相邻 Peer 的 pairwise control session。Encrypted body：
 | --- | ---: |
 | Origin raw Ed25519 key | 32 |
 | Target raw Ed25519 key | 32 |
-| InnerLength | 2 |
+| Background flag + InnerLength | 1 bit + 15 bits |
 | Inner packet | variable, <=1072 |
 
 Origin/Target 必须非零且不同。Inner 只能是同 RoomTag 的 Hello、Ping、Pong 或 Reliable packet。Forwarder：
@@ -144,6 +144,8 @@ Origin/Target 必须非零且不同。Inner 只能是同 RoomTag 的 Hello、Pin
 2. Target 必须是 forwarder 的 authenticated direct neighbor。
 3. 使用 forwarder-target control session 重新封装相同 inner packet。
 4. 不允许递归 bridge。
+
+长度字段最高位表示 background writer lane；只允许 Reliable inner 设置。Forwarder 在重新封装时保留该位，文件数据因此在 direct 和 single-bridge path 上均保持 background 优先级。
 
 ## Reliable Message
 
@@ -202,6 +204,10 @@ Flags：
 | 1 | Versioned full topology snapshot |
 | 2 | Versioned full fan-out assignment |
 | 3 | Versioned full member presentation state |
+| 4 | Versioned full screen-video state |
+| 5 | Versioned full Virtual LAN state |
+| 6 | Ordered file control |
+| 7 | Unordered file data |
 
 ## Topology Message
 
@@ -246,14 +252,32 @@ Reliable channel 3 使用 unordered full replacement：
 
 | Field | Size |
 | --- | ---: |
-| Version | 1 |
+| Version | 2 |
 | Generation | 8 |
-| Muted (`0` / `1`) | 1 |
+| Flags (`CaptureMuted` bit 0, `PlaybackMuted` bit 1) | 1 |
 | UTF-8 Nickname | 0–256 |
 
 Generation 非零并以 authenticated session 为作用域；只接受更高 generation，因此同一 identity 重连后可从 generation 1 重新开始。Nickname 必须是 trim 后的 canonical UTF-8，最多 64 个 Unicode code points、256 bytes，且不包含 control character。
 
-Nickname 和 Muted 由对应 identity 自声明，只用于 UI 展示。它们通过 pairwise encrypted Reliable 发送，但不代表唯一名称、发言权限或可信 moderation 状态。
+Nickname、CaptureMuted 和 PlaybackMuted 由对应 identity 自声明，只用于 UI 展示。它们通过 pairwise encrypted Reliable 发送，但不代表唯一名称、发言权限或可信 moderation 状态。
+
+## Screen Video
+
+Reliable channel 4 是 31-byte unordered full replacement：Version 1、Generation 8、Active 1、Codec 1、Width 2、Height 2、StreamID 16。Active 时 codec `1` 为 `avc1.42E01F`，`2` 为 `avc1.4D401F`；宽高必须为偶数且不超过 1280x720，StreamID 非零。Inactive 时 codec、尺寸和 StreamID 全为零。
+
+视频使用 Interactive GroupDatagram。每个 payload 以 35-byte fragment header 开始：Version 1、Flags 1、Codec 1、FragmentIndex 2、FragmentCount 2、Generation 8、TimestampMicros 8、DurationMicros 4、TotalChunkSize 4、Width 2、Height 2，随后是 H.264 Annex-B bytes。Flags bit 0 表示关键帧；其他位拒绝。单个 encoded chunk 最大 256 KiB，所有 fragment 元数据必须完全一致；不完整重组 750 ms 后丢弃，丢包后 decoder 等待后续关键帧。
+
+## Virtual LAN
+
+Reliable channel 5 是 30-byte unordered full replacement：Version 1、Enabled 1、Generation 8、StreamID 16、IPv4Address 4。Enabled 时 StreamID 非零且地址是 `100.64.0.0/10` 的非 network/broadcast host；Disabled 时二者全零。地址由 RoomTag 与 identity 确定性派生；重复地址被标记冲突且不路由。
+
+Virtual LAN 使用 CustomRealtime GroupDatagram，Timestamp 为零。Payload 为 Version 1、Target raw Ed25519 key 32、raw IPv4 packet。IPv4 packet 为 20–1000 bytes，version/IHL/total length/header checksum 必须正确；source 必须等于 sender 宣告地址，destination 必须是目标宣告地址或 `100.127.255.255`。普通 unicast 只发送一个 target-specific ciphertext；subnet broadcast 为每个已启用目标分别生成 packet。Forwarder 必须与 sender direct、target 必须与 forwarder direct 且位于 sender 当前 assignment；最多一个 intermediary。
+
+## File Transfer
+
+Channel 6 control message 共同前缀为 Version 1、Kind 1、TransferID 16。Kind 为 Offer、Accept、Reject、Cancel、ACK。Offer 追加 Size 8、SHA-256 32、NameLength 2 和 canonical basename；ACK 追加 next expected offset 8；其他 control 无附加字段。
+
+Channel 7 data message 为 Version 1、TransferID 16、Offset 8、Size 4、Data。Data 为 1–32768 bytes。发送方收到前一 chunk 的精确累计 ACK 后才发送下一 chunk；空文件在 Accept 后直接完成摘要校验。文件最大 1 GiB，session replacement、超时、拒绝或取消会终止传输并清理未完成目标文件。Channel 7 的 Reliable packet 使用 background writer lane。
 
 ## GroupDatagram
 
@@ -310,7 +334,7 @@ TrafficClass：
 
 ## Fan-out
 
-- Speaker 依据可靠 topology snapshot 计算 deterministic greedy cover。
+- Speaker 依据可靠 topology snapshot 计算 deterministic greedy cover；indirect Virtual LAN target 则固定到其当前 bridge intermediary。
 - Forwarder 必须与 speaker direct。
 - Listener 必须与 speaker direct，或与其 assigned forwarder direct。
 - 最大深度为 `speaker -> forwarder -> listener`。
@@ -333,6 +357,8 @@ Writer 使用 bounded weighted round-robin cycle：
 空 lane 立即跳过；所有 lane 都为空时才进入 blocking select。持续 audio/control 负载下 interactive 和 background 仍保证取得发送机会。
 
 Audio deadline 上限 20 ms，interactive deadline 上限 50 ms。Realtime queue 满时 drop-oldest whole batch；control admission 满时返回错误，由可靠层或周期性状态发送负责重试。
+
+单次非 audio socket write 的 writer quantum 上限为 2 ms；较大的 interactive batch 在量子耗尽后丢弃剩余 datagram，避免 control、screen、TUN 或 background 写阻塞后续 audio deadline。
 
 单个 realtime batch 最多包含 256 个 datagrams，总 payload bytes 最多为 `256 * 1200`。这是内存与 amplification 安全预算，不是成员数上限；更大的 speaker/forwarder destination set 必须拆成多个 bounded batches。
 

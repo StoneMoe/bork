@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 360" role="img" aria-labelledby="title description">
+  <title id="title">Bork</title>
+  <desc id="description">Voice first. No center.</desc>
+  <defs>
+    <linearGradient id="banner-background" x1="0" y1="0" x2="1440" y2="360" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#111725"/>
+      <stop offset="0.62" stop-color="#090C13"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="mark-background" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#171E31"/>
+      <stop offset="1" stop-color="#080A10"/>
+    </linearGradient>
+    <g id="peer">
+      <path d="M0-55 48-26 44 29 0 56-48 27-44-29Z" fill="currentColor"/>
+      <path d="M0-55 48-26 0 2-44-29Z" fill="#FFFFFF" opacity=".16"/>
+      <path d="m0 2 44 27L0 56Z" fill="#050711" opacity=".16"/>
+    </g>
+  </defs>
+  <rect width="1440" height="360" rx="32" fill="url(#banner-background)"/>
+  <path d="m1060 0 380 0v238l-198-82Z" fill="#151D31"/>
+  <path d="m902 360 340-204 198 82v122Z" fill="#101A28"/>
+  <path d="m1060 0-158 360 340-204Z" fill="#121727"/>
+  <g transform="translate(56 24) scale(.3046875)">
+    <rect width="1024" height="1024" rx="224" fill="url(#mark-background)"/>
+    <path d="M512 48 874 256 830 738 512 880 194 738 150 256Z" fill="#111726"/>
+    <g fill="none" stroke="#303A76" stroke-width="28" stroke-linecap="square" stroke-linejoin="bevel">
+      <path d="m292 196 244 18 184 130-184 118-244 2Z"/>
+      <path d="m292 464 244-2 184 142-184 116-244 12Z"/>
+    </g>
+    <path d="m536 214 184 130" fill="none" stroke="#4A58B8" stroke-width="28"/>
+    <path d="m536 462 184 142" fill="none" stroke="#3B8D9E" stroke-width="28"/>
+    <use href="#peer" transform="translate(292 196) rotate(-8)" color="#7281ED"/>
+    <use href="#peer" transform="translate(292 464) rotate(7)" color="#5969D7"/>
+    <use href="#peer" transform="translate(292 732) rotate(-5)" color="#4050AE"/>
+    <use href="#peer" transform="translate(536 214) rotate(9)" color="#6474E4"/>
+    <use href="#peer" transform="translate(720 344) rotate(-6)" color="#67DDE8"/>
+    <use href="#peer" transform="translate(536 462) rotate(5)" color="#6B79E7"/>
+    <use href="#peer" transform="translate(720 604) rotate(8)" color="#4F60C9"/>
+    <use href="#peer" transform="translate(536 720) rotate(-9)" color="#394791"/>
+  </g>
+  <text x="424" y="181" fill="#F4F7FF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="104" font-weight="800" letter-spacing="14">BORK</text>
+  <rect x="430" y="216" width="54" height="4" rx="2" fill="#68DCE7"/>
+  <text x="506" y="229" fill="#9CA9C6" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="22" font-weight="600" letter-spacing="6">VOICE FIRST / NO CENTER</text>
+  <path d="m1190 90 74 58 88-20m-88 20-42 112 130 16" fill="none" stroke="#35417F" stroke-width="2"/>
+  <path d="m1190 82 8 5v10l-8 5-8-5V87Zm74 58 8 5v10l-8 5-8-5v-10Zm88-20 8 5v10l-8 5-8-5v-10Zm-130 132 8 5v10l-8 5-8-5v-10Zm130 16 8 5v10l-8 5-8-5v-10Z" fill="#5969D7"/>
+  <path d="m1264 140 8 5v10l-8 5Z" fill="#74E2EB"/>
+</svg>

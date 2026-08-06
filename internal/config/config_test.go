@@ -34,6 +34,9 @@ func TestParseConfigDefault(t *testing.T) {
 	if cfg.UDPListen != "[::]:0" || !cfg.PortMapping || !slices.Equal(cfg.STUNServers, defaultSTUNServers) || !slices.Equal(cfg.TrackerURLs, defaultTrackerURLs) {
 		t.Fatalf("network config = %#v", cfg)
 	}
+	if !slices.Equal(cfg.TrackerURLs, []string{"https://tracker.zhuqiy.com/announce", "http://tracker.renfei.net:8080/announce"}) {
+		t.Fatalf("default trackers = %v", cfg.TrackerURLs)
+	}
 	if !cfg.NetworkOptions().EnablePortMapping {
 		t.Fatal("default network options disabled port mapping")
 	}
@@ -83,6 +86,33 @@ func TestParseConfigLoadsYAMLNetworkBehavior(t *testing.T) {
 	unchanged, err := os.ReadFile(path)
 	if err != nil || string(unchanged) != string(contents) {
 		t.Fatalf("existing config was rewritten: %v\n%s", err, unchanged)
+	}
+}
+
+func TestLoadBehaviorConfigOnlyMigratesLegacyDefaultTrackers(t *testing.T) {
+	tests := []struct {
+		name string
+		urls []string
+		want []string
+	}{
+		{name: "legacy defaults", urls: legacyDefaultTrackerURLs, want: defaultTrackerURLs},
+		{name: "custom", urls: []string{"http://tracker.mywaifu.best:6969/announce"}, want: []string{"http://tracker.mywaifu.best:6969/announce"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), behaviorConfigFilename)
+			contents := "network:\n  tracker_urls:\n    - " + strings.Join(test.urls, "\n    - ") + "\n"
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			config, err := loadBehaviorConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(config.TrackerURLs, test.want) {
+				t.Fatalf("TrackerURLs = %v, want %v", config.TrackerURLs, test.want)
+			}
+		})
 	}
 }
 

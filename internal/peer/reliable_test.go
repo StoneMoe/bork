@@ -364,6 +364,40 @@ func TestReliableQueueRejectionDoesNotCommitState(t *testing.T) {
 	}
 }
 
+func TestReliableDiscardChannelUpdatesAccounting(t *testing.T) {
+	r := newReliableTransport()
+	if err := r.queue(7, false, bytes.Repeat([]byte{1}, reliableMSS+1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.queue(8, false, []byte("keep")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := nextReliablePacket(r, time.Unix(850, 0)); !ok {
+		t.Fatal("nextPacket() returned no packet")
+	}
+	r.receive(reliableData(7, false, 1, 1, 0, 2, []byte("partial")), time.Unix(850, 0))
+
+	r.discardOutboundChannel(7)
+	r.discardInboundChannel(7)
+	if r.queuedBytes != len("keep") || r.bytesInFlight != 0 || r.reassemblyBytes != 0 || r.pendingChannel(7) {
+		t.Fatalf("discard accounting queued=%d inFlight=%d reassembly=%d", r.queuedBytes, r.bytesInFlight, r.reassemblyBytes)
+	}
+	if !r.pendingChannel(8) {
+		t.Fatal("discard removed another channel")
+	}
+}
+
+func TestReliableReassemblyMetadataIsBoundedAndRetainedAfterACK(t *testing.T) {
+	r := newReliableTransport()
+	now := time.Unix(900, 0)
+	for index := 0; index < maxReliableAssemblies+100; index++ {
+		r.receive(reliableData(7, false, uint64(index+1), uint64(index+1), 0, 2, []byte{1}), now)
+	}
+	if r.reassemblyCount != maxReliableAssemblies || r.reassemblyParts != maxReliableAssemblies {
+		t.Fatalf("reassembly metadata count=%d parts=%d", r.reassemblyCount, r.reassemblyParts)
+	}
+}
+
 func TestReliableSchedulerIsDeterministicallyFair(t *testing.T) {
 	network := newFakeRoomNetwork()
 	client := testClient(t, func() roomNetwork { return network })
@@ -432,6 +466,25 @@ func TestReliableSchedulerContinuesAfterPeerEnqueueFailure(t *testing.T) {
 	if len(sent) != 1 || sent[0] != servedPath.Address() || failed.reliable.outbound[0].transmissions != 0 || served.reliable.outbound[0].transmissions != 1 {
 		t.Fatalf("failure isolation sends=%v failed transmissions=%d served transmissions=%d",
 			sent, failed.reliable.outbound[0].transmissions, served.reliable.outbound[0].transmissions)
+	}
+}
+
+func TestFileDataReliableUsesBackgroundLane(t *testing.T) {
+	network := newFakeRoomNetwork()
+	client := testClient(t, func() roomNetwork { return network })
+	client.roomNetwork = network
+	remoteIdentity := testRemoteIdentity(t)
+	path, _ := NewPath(netip.MustParseAddrPort("192.0.2.85:9000"))
+	session := testPeeringSession(t, path)
+	session.authenticated = true
+	client.remotePeers[remoteIdentity.PeerID()] = &RemotePeer{identity: remoteIdentity, session: session}
+	if err := session.reliable.queue(reliableChannelFileData, false, []byte("file data")); err != nil {
+		t.Fatal(err)
+	}
+
+	client.sendReliable(time.Unix(960, 0))
+	if len(network.background) != 1 || len(network.sentPackets) != 1 {
+		t.Fatalf("background packets = %d, all packets = %d", len(network.background), len(network.sentPackets))
 	}
 }
 

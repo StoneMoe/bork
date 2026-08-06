@@ -118,6 +118,7 @@ func TestHandleBridgePacketForwardsOnlyToDirectTarget(t *testing.T) {
 		1,
 		rawPeerIdentity(origin),
 		rawPeerIdentity(target),
+		false,
 		client.helloPacket,
 		originSession.ciphers.ControlRecv,
 	)
@@ -138,6 +139,25 @@ func TestHandleBridgePacketForwardsOnlyToDirectTarget(t *testing.T) {
 	}
 	if decoded.Origin != rawPeerIdentity(origin) || decoded.Target != rawPeerIdentity(target) {
 		t.Fatalf("forwarded bridge = %+v", decoded)
+	}
+
+	inner, err := protocol.MarshalReliable(client.roomTag, originSession.sessionID, 2, protocol.ReliablePacket{
+		Channel: reliableChannelFileData, FragmentSequence: 1, MessageSequence: 1, FragmentCount: 1, Payload: []byte("file data"),
+	}, originSession.ciphers.ControlSend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err = protocol.MarshalBridge(client.roomTag, originSession.sessionID, 2, rawPeerIdentity(origin), rawPeerIdentity(target), true, inner, originSession.ciphers.ControlRecv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.handleBridgePacket(endpoint.Datagram{Data: packet, From: originAddress})
+	if len(network.background) != 1 {
+		t.Fatalf("forwarded background packets = %d", len(network.background))
+	}
+	decoded, err = protocol.ParseBridge(network.background[0], client.roomTag, targetSession.sessionID, targetSession.ciphers.ControlSend)
+	if err != nil || !decoded.Background {
+		t.Fatalf("forwarded background bridge = %+v, %v", decoded, err)
 	}
 }
 

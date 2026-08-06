@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"bork/internal/networking/discovery"
 )
@@ -42,6 +43,7 @@ var generatedHTTPQueryKeys = map[string]struct{}{
 	"numwant":    {},
 	"event":      {},
 	"ip":         {},
+	"nonce":      {},
 }
 
 func newHTTPClient() *http.Client {
@@ -179,6 +181,8 @@ func (a *Announcer) buildHTTPAnnounceURL(configured provider, registration track
 	query.Set("left", "0")
 	query.Set("compact", "1")
 	query.Set("numwant", strconv.Itoa(maxAnnouncePeers))
+	// Tracker frontends may cache time-sensitive GET responses despite request no-cache headers.
+	query.Set("nonce", strconv.FormatInt(time.Now().UnixNano(), 36))
 	switch event {
 	case eventStarted:
 		query.Set("event", "started")

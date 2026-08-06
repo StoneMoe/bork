@@ -1,36 +1,49 @@
-import {
-  For,
-  Show,
-  createMemo,
-  createSignal,
-  onCleanup,
-} from "solid-js";
+import { Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import * as Backend from "@wailsjs/go/app/App";
-import { ClipboardSetText } from "@wailsjs/runtime/runtime";
+import { ClipboardSetText, Quit, WindowIsMaximised, WindowMinimise, WindowToggleMaximise } from "@wailsjs/runtime/runtime";
+import Room from "./Room";
+import Settings from "./Settings";
+import { closePopoversEvent, nativePopoverOpen, nativePopoverSupported } from "./popover";
 import { createRemoteState } from "./sync";
-import type { AppState, Candidate, FriendlyStatus, RemotePeer } from "./types";
+import type { ActionProps, AppState, FriendlyStatus } from "./types";
 
 const maxInviteLength = 512;
+const nicknameStorageKey = "bork.nickname";
+const echoCancellationDisabledStorageKey = "bork.audio.echoCancellation.disabled";
+const noiseSuppressionDisabledStorageKey = "bork.audio.noiseSuppression.disabled";
+const remoteLoudnessNormalizationDisabledStorageKey = "bork.audio.remoteLoudnessNormalization.disabled";
+const lobbySpectrum = [14, 22, 38, 58, 32, 70, 48, 82, 60, 92, 100, 92, 60, 82, 48, 70, 32, 58, 38, 22, 14];
+
+function hasNativeWindowBridge() {
+  const host = window as typeof window & {
+    chrome?: { webview?: { postMessage?: unknown } };
+    webkit?: { messageHandlers?: { external?: { postMessage?: unknown } } };
+  };
+  return typeof host.chrome?.webview?.postMessage === "function"
+    || typeof host.webkit?.messageHandlers?.external?.postMessage === "function";
+}
+
+function closeOpenPopovers() {
+  const focused = document.activeElement;
+  document.dispatchEvent(new Event(closePopoversEvent));
+  if (nativePopoverSupported) {
+    document.querySelectorAll<HTMLElement>("[popover]").forEach((popover) => {
+      if (nativePopoverOpen(popover)) popover.hidePopover();
+    });
+  }
+  if (focused instanceof HTMLElement && focused.isConnected) focused.focus({ preventScroll: true });
+}
 
 function humanStatus(state: AppState): FriendlyStatus {
-  if (!state.peerId && state.error) return { badge: "启动失败", title: "", detail: "" };
-  if (!state.peerId) return { badge: "正在启动", title: "", detail: "" };
-  if (!state.room) return { badge: "准备就绪", title: "", detail: "" };
+  if (!state.peerId || !state.room) return {};
   if (state.room.phase === "gathering") {
     return {
-      badge: "正在准备",
       title: "正在准备连接",
       detail: "Bork 正在打开通信端口并检查网络环境。",
     };
   }
-  const remotePeers = state.room.remotePeers;
-  if (remotePeers.length > 0) {
-    return {
-      badge: state.audio.running ? (state.audio.muted ? "通话中 · 已静音" : "语音通话中") : `已连接 ${remotePeers.length}`,
-    };
-  }
+  if (state.room.remotePeers.length > 0) return {};
   return {
-    badge: "正在寻找",
     title: "正在寻找房间成员",
     detail: "保持 Bork 运行，其他成员上线后会自动尝试连接。",
   };
@@ -39,12 +52,131 @@ function humanStatus(state: AppState): FriendlyStatus {
 export default function App() {
   const [busy, setBusy] = createSignal(false);
   const [settingsOpen, setSettingsOpen] = createSignal(false);
+  const [inviteCopied, setInviteCopied] = createSignal(false);
+  const [nicknameStorageReady, setNicknameStorageReady] = createSignal(false);
+  const [audioPreferencesStorageReady, setAudioPreferencesStorageReady] = createSignal(false);
+  const customWindowControls = hasNativeWindowBridge();
+  const [windowMaximised, setWindowMaximised] = createSignal(false);
   const [error, setError] = createSignal("");
+  let leaveRoomAction: (() => Promise<void>) | undefined;
+  let nicknameRestoreStarted = false;
+  let audioPreferencesRestoreStarted = false;
+  let copyTimer: number | undefined;
+  let windowStateGeneration = 0;
+  let mainView: HTMLElement | undefined;
+  let settingsButton: HTMLButtonElement | undefined;
   const remote = createRemoteState(setError);
   const state = remote.state;
   const operational = createMemo(() => Boolean(state().peerId));
   const inRoom = createMemo(() => Boolean(state().room));
   const friendly = createMemo(() => humanStatus(state()));
+  let previousRoomState = inRoom();
+  onCleanup(() => window.clearTimeout(copyTimer));
+  onMount(() => {
+    if (!customWindowControls) return;
+    let active = true;
+    let resizeTimer: number | undefined;
+    const syncWindowState = async () => {
+      const generation = ++windowStateGeneration;
+      try {
+        const maximised = await WindowIsMaximised();
+        if (active && generation === windowStateGeneration) setWindowMaximised(maximised);
+      } catch { /* runtime unavailable in browser previews */ }
+    };
+    const syncAfterResize = () => {
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => void syncWindowState(), 75);
+    };
+    void syncWindowState();
+    window.addEventListener("resize", syncAfterResize);
+    window.addEventListener("focus", syncWindowState);
+    onCleanup(() => {
+      active = false;
+      window.clearTimeout(resizeTimer);
+      window.removeEventListener("resize", syncAfterResize);
+      window.removeEventListener("focus", syncWindowState);
+    });
+  });
+  createEffect(() => {
+    const current = inRoom();
+    if (current === previousRoomState) return;
+    previousRoomState = current;
+    if (!current) {
+      window.clearTimeout(copyTimer);
+      setInviteCopied(false);
+    }
+    if (!settingsOpen()) queueMicrotask(() => mainView?.focus({ preventScroll: true }));
+  });
+  createEffect(() => {
+    if (!operational() || nicknameRestoreStarted) return;
+    nicknameRestoreStarted = true;
+    let stored = "";
+    try {
+      stored = localStorage.getItem(nicknameStorageKey) || "";
+    } catch {
+      setNicknameStorageReady(true);
+      return;
+    }
+    if (!stored || stored === state().nickname) {
+      setNicknameStorageReady(true);
+      return;
+    }
+    void runAction(() => Backend.SetNickname(stored)).then((restored) => {
+      if (!restored) {
+        try { localStorage.removeItem(nicknameStorageKey); } catch { /* storage unavailable */ }
+      }
+      setNicknameStorageReady(true);
+    });
+  });
+  createEffect(() => {
+    if (!nicknameStorageReady()) return;
+    const nickname = state().nickname;
+    try {
+      if (nickname) localStorage.setItem(nicknameStorageKey, nickname);
+      else localStorage.removeItem(nicknameStorageKey);
+    } catch { /* storage unavailable */ }
+  });
+  createEffect(() => {
+    if (!operational() || !nicknameStorageReady() || busy() || audioPreferencesRestoreStarted) return;
+    audioPreferencesRestoreStarted = true;
+    let echoCancellation = true;
+    let noiseSuppression = true;
+    let remoteLoudnessNormalization = true;
+    try {
+      echoCancellation = localStorage.getItem(echoCancellationDisabledStorageKey) !== "1";
+      noiseSuppression = localStorage.getItem(noiseSuppressionDisabledStorageKey) !== "1";
+      remoteLoudnessNormalization = localStorage.getItem(remoteLoudnessNormalizationDisabledStorageKey) !== "1";
+    } catch {
+      setAudioPreferencesStorageReady(true);
+      return;
+    }
+    const restoreEchoCancellation = echoCancellation !== state().audio.echoCancellation;
+    const restoreNoiseSuppression = noiseSuppression !== state().audio.noiseSuppression;
+    const restoreRemoteLoudnessNormalization = remoteLoudnessNormalization !== state().audio.remoteLoudnessNormalization;
+    if (!restoreEchoCancellation && !restoreNoiseSuppression && !restoreRemoteLoudnessNormalization) {
+      setAudioPreferencesStorageReady(true);
+      return;
+    }
+    void runAction(async () => {
+      if (restoreEchoCancellation) await Backend.SetEchoCancellation(echoCancellation);
+      if (restoreNoiseSuppression) await Backend.SetNoiseSuppression(noiseSuppression);
+      if (restoreRemoteLoudnessNormalization) await Backend.SetRemoteLoudnessNormalization(remoteLoudnessNormalization);
+    }).then((restored) => {
+      if (restored) setAudioPreferencesStorageReady(true);
+      else audioPreferencesRestoreStarted = false;
+    });
+  });
+  createEffect(() => {
+    if (!audioPreferencesStorageReady()) return;
+    try {
+      if (state().audio.echoCancellation) localStorage.removeItem(echoCancellationDisabledStorageKey);
+      else localStorage.setItem(echoCancellationDisabledStorageKey, "1");
+      if (state().audio.noiseSuppression) localStorage.removeItem(noiseSuppressionDisabledStorageKey);
+      else localStorage.setItem(noiseSuppressionDisabledStorageKey, "1");
+      if (state().audio.remoteLoudnessNormalization) localStorage.removeItem(remoteLoudnessNormalizationDisabledStorageKey);
+      else localStorage.setItem(remoteLoudnessNormalizationDisabledStorageKey, "1");
+    } catch { /* storage unavailable */ }
+  });
 
   async function runAction(action: () => Promise<void>) {
     if (!operational() || busy()) return false;
@@ -63,30 +195,97 @@ export default function App() {
     }
   }
 
+  function openSettings() {
+    closeOpenPopovers();
+    setSettingsOpen(true);
+  }
+
+  function toggleWindowMaximised() {
+    windowStateGeneration++;
+    setWindowMaximised((maximised) => !maximised);
+    WindowToggleMaximise();
+  }
+
+  function closeSettings() {
+    setSettingsOpen(false);
+    queueMicrotask(() => settingsButton?.focus({ preventScroll: true }));
+  }
+
+  async function copyInvite() {
+    const copied = await runAction(async () => {
+      const invite = await Backend.GetInvite();
+      if (!invite) throw new Error("当前没有房间邀请");
+      if (!await ClipboardSetText(invite)) throw new Error("无法写入系统剪贴板");
+    });
+    if (!copied) return;
+    setInviteCopied(true);
+    window.clearTimeout(copyTimer);
+    copyTimer = window.setTimeout(() => setInviteCopied(false), 1600);
+  }
+
   return (
-    <main class="shell">
-      <header class="topbar">
-        <div class="wordmark">
-          BORK<span>/</span>
-          <span classList={{ "room-name": inRoom() }}>
-            {state().room?.name || "VOICE"}
-          </span>
+    <main class="shell" classList={{ maximised: customWindowControls && windowMaximised() }}>
+      <header
+        class="topbar"
+        onDblClick={(event) => {
+          if (customWindowControls && event.target instanceof Element && !event.target.closest("button")) toggleWindowMaximised();
+        }}
+      >
+        <div class="topbar-leading">
+          <Show when={inRoom()}>
+            <button
+              class="topbar-icon-button back-button"
+              type="button"
+              disabled={busy() || !operational()}
+              aria-label="离开房间"
+              title="离开房间"
+              onClick={() => void leaveRoomAction?.()}
+            ><BackIcon /></button>
+          </Show>
+          <div class="wordmark">
+            BORK<span>/</span>
+            <span classList={{ "room-name": inRoom() }}>
+              {state().room?.name || "VOICE"}
+            </span>
+            <Show when={inRoom()}>
+              <button
+                class="topbar-icon-button copy-invite-button"
+                classList={{ copied: inviteCopied() }}
+                type="button"
+                disabled={busy() || !operational()}
+                aria-label={inviteCopied() ? "邀请已复制" : "复制房间邀请"}
+                title={inviteCopied() ? "邀请已复制" : "复制房间邀请"}
+                onClick={() => void copyInvite()}
+              >
+                <Show when={inviteCopied()} fallback={<CopyIcon />}><CheckIcon /></Show>
+              </button>
+            </Show>
+          </div>
         </div>
         <div class="topbar-actions">
-          <div
-            class="status-pill"
-            classList={{ active: inRoom() }}
-          >
-            <i />
-            <span>{friendly().badge}</span>
-          </div>
-          <button class="settings-button" type="button" disabled={!operational()} onClick={() => setSettingsOpen(true)}>
-            设置
+          <button ref={settingsButton} class="topbar-icon-button settings-button" type="button" disabled={!operational()} aria-label="打开设置" title="设置" onClick={openSettings}>
+            <SettingsIcon />
           </button>
+          <Show when={customWindowControls}>
+            <div class="window-controls" role="group" aria-label="窗口控制">
+              <button class="window-control-button" type="button" aria-label="最小化窗口" title="最小化" onClick={WindowMinimise}><MinimiseIcon /></button>
+              <button
+                class="window-control-button"
+                type="button"
+                aria-label={windowMaximised() ? "还原窗口" : "最大化窗口"}
+                title={windowMaximised() ? "还原" : "最大化"}
+                onClick={toggleWindowMaximised}
+              >
+                <Show when={windowMaximised()} fallback={<MaximiseIcon />}><RestoreIcon /></Show>
+              </button>
+              <button class="window-control-button close" type="button" aria-label="关闭窗口" title="关闭" onClick={Quit}><CloseIcon /></button>
+            </div>
+          </Show>
         </div>
+        <span class="visually-hidden" role="status" aria-live="polite">{inviteCopied() ? "房间邀请已复制" : ""}</span>
       </header>
 
-      <section class="main-view">
+      <section ref={mainView} class="main-view" tabindex="-1">
         <Show
           when={inRoom()}
           fallback={<Lobby busy={busy()} ready={operational()} runAction={runAction} />}
@@ -97,6 +296,8 @@ export default function App() {
             busy={busy()}
             ready={operational()}
             runAction={runAction}
+            reportError={setError}
+            registerLeaveAction={(action) => { leaveRoomAction = action; }}
           />
         </Show>
       </section>
@@ -106,7 +307,7 @@ export default function App() {
           state={state()}
           busy={busy()}
           ready={operational()}
-          close={() => setSettingsOpen(false)}
+          close={closeSettings}
           runAction={runAction}
         />
       </Show>
@@ -122,10 +323,36 @@ export default function App() {
   );
 }
 
-interface ActionProps {
-  busy: boolean;
-  ready: boolean;
-  runAction: (action: () => Promise<void>) => Promise<boolean>;
+function BackIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12.25 5-7 7 7 7M5.75 12h13" /></svg>;
+}
+
+function CopyIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="11" rx="2" /><path d="M16.5 8.5v-2a2 2 0 0 0-2-2h-8a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" /></svg>;
+}
+
+function CheckIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5" /></svg>;
+}
+
+function SettingsIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6" /></svg>;
+}
+
+function MinimiseIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 17h12" /></svg>;
+}
+
+function MaximiseIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="1" /></svg>;
+}
+
+function RestoreIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8V6.5h9.5V16H16M6.5 8H16v9.5H6.5z" /></svg>;
+}
+
+function CloseIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>;
 }
 
 function Lobby(props: ActionProps) {
@@ -144,10 +371,10 @@ function Lobby(props: ActionProps) {
 
   return (
     <section class="lobby-view">
-      <div class="lobby-heading">
-        <p class="eyebrow">VOICE ROOMS / DISTRIBUTED</p>
-        <h1>世界末日<br />照样通信</h1>
-        <p>不用账号，也不用服务器，甚至没有互联网也能立刻开始通信</p>
+      <div class="lobby-visual" aria-hidden="true">
+        <div class="lobby-spectrum">
+          {lobbySpectrum.map((level, index) => <i style={`--level:${level}%;--index:${index}`} />)}
+        </div>
       </div>
       <div class="invite-stack">
         <form class="room-form" onSubmit={createRoom}>
@@ -179,324 +406,5 @@ function Lobby(props: ActionProps) {
         </form>
       </div>
     </section>
-  );
-}
-
-interface RoomProps extends ActionProps {
-  state: AppState;
-  friendly: FriendlyStatus;
-}
-
-function Room(props: RoomProps) {
-  const [copied, setCopied] = createSignal(false);
-  let copyTimer: number | undefined;
-  onCleanup(() => {
-    window.clearTimeout(copyTimer);
-  });
-
-  async function copyInvite() {
-    const copiedInvite = await props.runAction(async () => {
-      const invite = await Backend.GetInvite();
-      if (!invite) throw new Error("当前没有房间邀请");
-      if (!await ClipboardSetText(invite)) throw new Error("无法写入系统剪贴板");
-    });
-    if (!copiedInvite) return;
-    setCopied(true);
-    window.clearTimeout(copyTimer);
-    copyTimer = window.setTimeout(() => {
-      setCopied(false);
-    }, 1600);
-  }
-
-  const remotePeers = () => props.state.room?.remotePeers ?? [];
-
-  return (
-    <section class="room-view">
-      <div class="room-content">
-        <section class="voice-stage">
-          <div class="room-actions">
-            <button class="invite-button" type="button" disabled={props.busy || !props.ready} onClick={copyInvite}>
-              {copied() ? "已复制" : "复制邀请"}
-            </button>
-            <button
-              class="invite-button leave-button"
-              type="button"
-              disabled={props.busy || !props.ready}
-              onClick={() => props.runAction(Backend.LeaveRoom)}
-            >离开房间</button>
-          </div>
-          <Show
-            when={remotePeers().length > 0 || props.state.audio.running}
-            fallback={
-              <div class="voice-caption waiting-state">
-                <strong>{props.friendly.title}</strong>
-                <p>{props.friendly.detail}</p>
-              </div>
-            }
-          >
-            <section class="room-peers" aria-label="房间成员">
-              <RoomMemberList state={props.state} remotePeers={remotePeers()} />
-              <Show when={props.state.audio.running}>
-                <div class="voice-controls">
-                  <button
-                    class="button quiet"
-                    type="button"
-                    disabled={props.busy || !props.ready}
-                    onClick={() => props.runAction(() => Backend.SetMuted(!props.state.audio.muted))}
-                  >{props.state.audio.muted ? "取消静音" : "静音"}</button>
-                </div>
-              </Show>
-              <Show when={props.state.audio.error}>
-                <p class="voice-error">{props.state.audio.error}</p>
-              </Show>
-              <Show when={!props.state.audio.available && !props.state.audio.error}>
-                <p class="voice-error">没有可用的麦克风或扬声器。</p>
-              </Show>
-            </section>
-          </Show>
-        </section>
-      </div>
-    </section>
-  );
-}
-
-function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer[] }) {
-  const localSpeaking = () => props.state.audio.speaking && !props.state.audio.muted;
-  const remoteSpeaking = (remotePeer: RemotePeer) => !remotePeer.muted && props.state.audio.speakingPeerIds.includes(remotePeer.peerId);
-  const remoteName = (remotePeer: RemotePeer) => remotePeer.nickname || remotePeer.peerId.slice(0, 14);
-  const localStatus = () => props.state.audio.muted ? "已静音" : localSpeaking() ? "正在说话" : "空闲";
-  const remoteStatus = (remotePeer: RemotePeer) => remotePeer.muted ? "已静音" : remoteSpeaking(remotePeer) ? "正在说话" : "空闲";
-  const remoteTransport = (remotePeer: RemotePeer) => remotePeer.transport === "bridge" ? "桥接" : "直连";
-  return (
-    <div class="member-list" aria-label="当前房间成员">
-      <div
-        class="member-row local-member"
-        classList={{ speaking: localSpeaking() }}
-        tabindex="0"
-        aria-label={`${props.state.nickname || "本机"}，本机，${localStatus()}`}
-      >
-        <strong class="member-name">{props.state.nickname || "本机"}</strong>
-        <span class="member-connection local">本机</span>
-        <span class="member-latency">—</span>
-        <span class="member-status">{localStatus()}</span>
-        <div class="member-details">
-          <span><small>PeerID</small><code>{props.state.peerId || "正在载入"}</code></span>
-          <span><small>本机端点</small><code>{props.state.diagnostics.listenAddress || "尚未打开"}</code></span>
-          <span><small>房间状态</small><b>{props.state.room?.phase || "未知"}</b></span>
-        </div>
-      </div>
-      <For each={props.remotePeers}>{(remotePeer) => (
-        <div
-          class="member-row"
-          classList={{ speaking: remoteSpeaking(remotePeer) }}
-          tabindex="0"
-          aria-label={`${remoteName(remotePeer)}，${remoteTransport(remotePeer)}，${remotePeer.rttMillis || 1} 毫秒，${remoteStatus(remotePeer)}`}
-        >
-          <strong class="member-name">{remoteName(remotePeer)}</strong>
-          <span class="member-connection" classList={{ bridge: remotePeer.transport === "bridge" }}>
-            {remoteTransport(remotePeer)}
-          </span>
-          <span class="member-latency">{remotePeer.rttMillis || 1} ms</span>
-          <span class="member-status">{remoteStatus(remotePeer)}</span>
-          <div class="member-details">
-            <span><small>PeerID</small><code>{remotePeer.peerId}</code></span>
-            <span><small>Session</small><code>{remotePeer.sessionId || "未知"}</code></span>
-            <span>
-              <small>{remotePeer.transport === "bridge" ? "下一跳" : "远端地址"}</small>
-              <code>{remotePeer.address}</code>
-            </span>
-          </div>
-        </div>
-      )}</For>
-    </div>
-  );
-}
-
-interface SettingsProps extends ActionProps {
-  state: AppState;
-  close: () => void;
-}
-
-function Settings(props: SettingsProps) {
-  const audio = () => props.state.audio;
-  const diagnostics = () => props.state.diagnostics;
-  const candidates = () => diagnostics().candidates || [];
-  const stun = () => diagnostics().stun || [];
-  const trackers = () => diagnostics().tracker || [];
-  const connectivity = () => diagnostics().connectivity;
-  const knownAddresses = () => connectivity()?.knownAddresses || [];
-  const diagnosticErrors = () => [diagnostics().networkError, diagnostics().discoveryError, diagnostics().portMappingError]
-    .filter((message): message is string => Boolean(message));
-  const [nickname, setNickname] = createSignal(props.state.nickname);
-  const [now, setNow] = createSignal(Date.now());
-  const clock = window.setInterval(() => setNow(Date.now()), 1000);
-  onCleanup(() => window.clearInterval(clock));
-
-  async function saveNickname(event: SubmitEvent) {
-    event.preventDefault();
-    if (await props.runAction(() => Backend.SetNickname(nickname()))) setNickname(props.state.nickname);
-  }
-
-  return (
-    <div class="settings-layer">
-      <button class="settings-backdrop" type="button" aria-label="关闭设置" onClick={props.close} />
-      <aside class="settings-drawer" aria-label="设置">
-        <header class="settings-header">
-          <div><span>SETTINGS</span><strong>设置</strong></div>
-          <button type="button" aria-label="关闭设置" onClick={props.close}>关闭</button>
-        </header>
-        <section class="settings-section">
-          <div class="settings-section-heading">
-            <h3>语音设备</h3>
-            <button
-              class="section-action"
-              type="button"
-              disabled={props.busy || !props.ready || props.state.audio.running}
-              onClick={() => props.runAction(Backend.RefreshAudioDevices)}
-            >刷新</button>
-          </div>
-          <label class="audio-device-field">
-            <span>麦克风</span>
-            <select
-              value={audio().captureDeviceId}
-              disabled={props.busy || !props.ready || props.state.audio.running}
-              onChange={(event) => props.runAction(() => Backend.SetAudioDevices(event.currentTarget.value, audio().playbackDeviceId))}
-            >
-              <option value="">系统默认</option>
-              <For each={audio().captureDevices}>{(device) => (
-                <option value={device.id}>{device.name}{device.isDefault ? "（默认）" : ""}</option>
-              )}</For>
-            </select>
-          </label>
-          <label class="audio-device-field">
-            <span>扬声器</span>
-            <select
-              value={audio().playbackDeviceId}
-              disabled={props.busy || !props.ready || props.state.audio.running}
-              onChange={(event) => props.runAction(() => Backend.SetAudioDevices(audio().captureDeviceId, event.currentTarget.value))}
-            >
-              <option value="">系统默认</option>
-              <For each={audio().playbackDevices}>{(device) => (
-                <option value={device.id}>{device.name}{device.isDefault ? "（默认）" : ""}</option>
-              )}</For>
-            </select>
-          </label>
-          <Show when={props.state.audio.error}>
-            <p class="diagnostic-error">{props.state.audio.error}</p>
-          </Show>
-          <Show when={!props.state.audio.available && !props.state.audio.error}>
-            <p class="empty-diagnostic">没有可用的麦克风或扬声器。</p>
-          </Show>
-        </section>
-        <section class="settings-section">
-          <h3>设备</h3>
-          <form class="nickname-form" onSubmit={saveNickname}>
-            <label for="nickname">房间昵称</label>
-            <div>
-              <input
-                id="nickname"
-                autocomplete="nickname"
-                placeholder="未设置"
-                value={nickname()}
-                disabled={props.busy || !props.ready}
-                onInput={(event) => setNickname(event.currentTarget.value)}
-              />
-              <button type="submit" disabled={props.busy || !props.ready}>保存</button>
-            </div>
-            <small>最多 64 个字符，加入房间后对其他成员可见。</small>
-          </form>
-          <div class="setting-row stacked">
-            <span>用户身份</span>
-            <code>{props.state.peerId || "正在载入"}</code>
-          </div>
-        </section>
-        <section class="settings-section">
-          <h3>连接诊断</h3>
-          <div class="setting-row stacked">
-            <span>本机端点</span>
-            <Show when={diagnostics().listenAddress}>
-              <code>{`${diagnostics().listenAddress}（UDP）`}</code>
-            </Show>
-            <Show when={!diagnostics().listenAddress}>
-              <small>{props.state.room ? "正在打开本机 UDP 端点。" : "加入房间后打开 UDP 端点。"}</small>
-            </Show>
-          </div>
-          <div class="diagnostic-heading"><span>本机候选地址</span><b>{candidates().length}</b></div>
-          <ol class="candidate-list">
-            <For each={candidates()}>{(candidate) => <CandidateRow candidate={candidate} />}</For>
-          </ol>
-          <Show when={candidates().length === 0}>
-            <div class="empty-diagnostic">{props.state.room ? "尚未发现可用的本机候选地址。" : "加入房间后开始收集本机候选地址。"}</div>
-          </Show>
-          <div class="diagnostic-heading"><span>STUN 探测</span></div>
-          <ol class="stun-list">
-            <For each={stun()}>{(result) => (
-              <li classList={{ failed: !result.mappedAddress }} title={result.error || ""}>
-                <span>{result.server}</span>
-                <b>{result.mappedAddress ? `${result.rttMillis || 1} ms` : "失败"}</b>
-              </li>
-            )}</For>
-          </ol>
-          <Show when={stun().length === 0}>
-            <div class="empty-diagnostic">{props.state.room ? "尚未获得 STUN 探测结果。" : "加入房间后开始 STUN 探测。"}</div>
-          </Show>
-          <div class="diagnostic-heading"><span>Tracker 公告</span></div>
-          <ol class="stun-list">
-            <For each={trackers()}>{(tracker) => (
-              <li classList={{ failed: Boolean(tracker.error) }} title={tracker.error || `返回 ${tracker.peerCount} 个地址`}>
-                <span><strong>{tracker.provider}</strong><small>请求 {tracker.candidate}</small></span>
-                <span class="tracker-result">
-                  <b>{tracker.error ? "失败" : tracker.observedAddress || "未返回"}</b>
-                  <small>{tracker.nextAnnounce ? formatRelativeTime(tracker.nextAnnounce, now()) : "等待 announce"}</small>
-                </span>
-              </li>
-            )}</For>
-          </ol>
-          <Show when={trackers().length === 0}>
-            <div class="empty-diagnostic">{props.state.room ? "尚未产生 Tracker announce 记录。" : "加入房间后开始 Tracker announce。"}</div>
-          </Show>
-          <div class="diagnostic-heading"><span>已知地址</span><b>{knownAddresses().length}</b></div>
-          <ol class="candidate-list known-address-list">
-            <For each={knownAddresses()}>{(address) => (
-              <li>
-                <b>{address.source}</b>
-                <div>
-                  <code>{address.address}</code>
-                  <small>{address.expiresAt}</small>
-                </div>
-              </li>
-            )}</For>
-          </ol>
-          <Show when={knownAddresses().length === 0}>
-            <div class="empty-diagnostic">{props.state.room ? "尚未发现其他成员地址。" : "加入房间后开始发现其他成员。"}</div>
-          </Show>
-          <For each={diagnosticErrors()}>{(message) => <p class="diagnostic-error">{message}</p>}</For>
-        </section>
-      </aside>
-    </div>
-  );
-}
-
-function formatRelativeTime(value: string, now: number): string {
-  const target = Date.parse(value);
-  if (!Number.isFinite(target)) return "等待 announce";
-  const seconds = Math.max(0, Math.ceil((target - now) / 1000));
-  return `${seconds} 秒后`;
-}
-
-function CandidateRow(props: { candidate: Candidate }) {
-  const typeLabel = () => {
-    if (props.candidate.type === "port-mapped") return "端口映射";
-    if (props.candidate.type === "server-reflexive") return "STUN 公网";
-    return "本机";
-  };
-  return (
-    <li>
-      <b>{typeLabel()}</b>
-      <div>
-        <code>{props.candidate.address}</code>
-        <small>{props.candidate.interface || props.candidate.source || props.candidate.family || ""}</small>
-      </div>
-    </li>
   );
 }

@@ -39,6 +39,103 @@ func TestSpeakingThresholdAndReleaseHold(t *testing.T) {
 	}
 }
 
+func TestLoudnessNormalizerConvergesAndClamps(t *testing.T) {
+	for _, test := range []struct {
+		level float64
+		gain  float64
+	}{
+		{0.5, normalizationMinimumGain},
+		{0.05, 2},
+		{0.02, normalizationMaximumGain},
+	} {
+		var normalizer loudnessNormalizer
+		normalizer.reset()
+		driveNormalizer(&normalizer, test.level, true, true, 300)
+		if math.Abs(normalizer.gain-test.gain) > 0.001 {
+			t.Fatalf("level %.2f converged to gain %.4f, want %.2f", test.level, normalizer.gain, test.gain)
+		}
+		if normalizer.gain < normalizationMinimumGain || normalizer.gain > normalizationMaximumGain {
+			t.Fatalf("normalizer gain %.4f escaped clamp", normalizer.gain)
+		}
+	}
+}
+
+func TestLoudnessNormalizerHoldAndSmoothBypass(t *testing.T) {
+	var normalizer loudnessNormalizer
+	normalizer.reset()
+	driveNormalizer(&normalizer, 0.2, true, true, 300)
+	heldGain := normalizer.gain
+	driveNormalizer(&normalizer, 0, false, true, normalizationHoldFrames-1)
+	if math.Abs(normalizer.gain-heldGain) > 0.001 {
+		t.Fatalf("gain changed during hold: %.4f to %.4f", heldGain, normalizer.gain)
+	}
+	driveNormalizer(&normalizer, 0, false, true, 1)
+	if normalizer.gain <= heldGain {
+		t.Fatal("gain did not release toward unity after hold")
+	}
+
+	normalizer.reset()
+	driveNormalizer(&normalizer, 0.2, true, true, 300)
+	measured := normalizer.measuredRMS
+	normalizedGain := normalizer.gain
+	driveNormalizer(&normalizer, 0.2, true, false, 1)
+	if normalizer.gain <= normalizedGain || normalizer.gain >= 1 {
+		t.Fatalf("bypass did not begin smoothly: %.4f to %.4f", normalizedGain, normalizer.gain)
+	}
+	driveNormalizer(&normalizer, 0.2, true, false, 300)
+	if math.Abs(normalizer.gain-1) > 0.001 || normalizer.measuredRMS != measured {
+		t.Fatalf("bypass gain/measurement = %.4f/%.4f, want 1/%.4f", normalizer.gain, normalizer.measuredRMS, measured)
+	}
+	driveNormalizer(&normalizer, 0, false, true, 1)
+	if normalizer.gain >= 1 {
+		t.Fatal("re-enabled normalizer did not use retained measurement")
+	}
+}
+
+func TestMixerDoesNotTrainNormalizerOnFECOrPLC(t *testing.T) {
+	quiet := packetWithAmplitude(t, 0.05)
+	loud := packetWithAmplitude(t, 0.5)
+	mixer := newMixer(testMaxEncodedFrameBytes)
+	for sequence := uint64(1); sequence <= prebufferFrames; sequence++ {
+		if err := mixer.Add(media.ReceivedFrame{SourceID: "peer", Sequence: sequence, Timestamp: uint32(sequence) * FrameSamples, Payload: quiet}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range prebufferFrames {
+		if _, _, err := mixerNext(mixer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stream := mixer.streams["peer"]
+	measured := stream.normalizer.measuredRMS
+	if measured == 0 {
+		t.Fatal("real decoded frames did not train normalizer")
+	}
+	if err := mixer.Add(media.ReceivedFrame{SourceID: "peer", Sequence: 3, Timestamp: 4 * FrameSamples, Payload: loud}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := mixerNext(mixer); err != nil {
+		t.Fatal(err)
+	}
+	if stream.normalizer.measuredRMS != measured {
+		t.Fatalf("synthetic frame changed measurement from %.6f to %.6f", measured, stream.normalizer.measuredRMS)
+	}
+	if _, _, err := mixerNext(mixer); err != nil {
+		t.Fatal(err)
+	}
+	measured = stream.normalizer.measuredRMS
+	if _, _, err := mixerNext(mixer); err != nil {
+		t.Fatal(err)
+	}
+	if stream.normalizer.measuredRMS != measured {
+		t.Fatalf("PLC frame changed measurement from %.6f to %.6f", measured, stream.normalizer.measuredRMS)
+	}
+	resetJitterStream(stream, [16]byte{1}, 0)
+	if stream.normalizer.measuredRMS != 0 || stream.normalizer.gain != 1 || stream.normalizer.holdFrames != 0 {
+		t.Fatalf("stream reset retained normalizer state: %#v", stream.normalizer)
+	}
+}
+
 func TestMixerMapsSpeakingToSortedSourceIDs(t *testing.T) {
 	loud := packetWithAmplitude(t, 0.2)
 	quiet := packetWithAmplitude(t, 0.001)
@@ -293,4 +390,14 @@ func packetWithAmplitude(t *testing.T, amplitude float64) []byte {
 		t.Fatal(err)
 	}
 	return packet
+}
+
+func driveNormalizer(normalizer *loudnessNormalizer, level float64, measured, enabled bool, frames int) {
+	pcm := make([]float32, FrameSamples)
+	for range frames {
+		for index := range pcm {
+			pcm[index] = float32(level)
+		}
+		normalizer.process(pcm, level, measured, enabled)
+	}
 }

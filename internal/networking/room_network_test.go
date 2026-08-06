@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -34,11 +35,12 @@ func (e *fakeEndpoint) Snapshot() endpoint.Snapshot {
 	defer e.mu.RUnlock()
 	return e.snapshot
 }
-func (e *fakeEndpoint) SnapshotChanges() <-chan struct{}             { return e.changes }
-func (e *fakeEndpoint) ControlPackets() <-chan endpoint.Datagram     { return e.packets }
-func (e *fakeEndpoint) AudioPackets() <-chan endpoint.Datagram       { return nil }
-func (e *fakeEndpoint) InteractivePackets() <-chan endpoint.Datagram { return nil }
-func (e *fakeEndpoint) EnqueueControl([]byte, netip.AddrPort) error  { return nil }
+func (e *fakeEndpoint) SnapshotChanges() <-chan struct{}               { return e.changes }
+func (e *fakeEndpoint) ControlPackets() <-chan endpoint.Datagram       { return e.packets }
+func (e *fakeEndpoint) AudioPackets() <-chan endpoint.Datagram         { return nil }
+func (e *fakeEndpoint) InteractivePackets() <-chan endpoint.Datagram   { return nil }
+func (e *fakeEndpoint) EnqueueControl([]byte, netip.AddrPort) error    { return nil }
+func (e *fakeEndpoint) EnqueueBackground([]byte, netip.AddrPort) error { return nil }
 func (e *fakeEndpoint) SendRealtimeBatch(endpoint.RealtimeBatch) error {
 	return nil
 }
@@ -176,15 +178,16 @@ func TestRoomSnapshotCloneDoesNotAliasSlices(t *testing.T) {
 			Candidates: []endpoint.Candidate{{Address: "192.0.2.1:9000"}},
 			STUN:       []endpoint.STUNResult{{Server: "stun.example:3478"}},
 		},
-		Tracker: []tracker.ProviderStatus{{Provider: "tracker.example"}},
+		Tracker: []tracker.ProviderStatus{{Provider: "tracker.example", PeerAddresses: []string{"192.0.2.2:9000"}}},
 	}
 	clone := snapshot.Clone()
 	clone.Endpoint.Candidates[0].Address = "changed"
 	clone.Endpoint.STUN[0].Server = "changed"
 	clone.Tracker[0].Provider = "changed"
+	clone.Tracker[0].PeerAddresses[0] = "changed"
 
 	if snapshot.Endpoint.Candidates[0].Address != "192.0.2.1:9000" || snapshot.Endpoint.STUN[0].Server != "stun.example:3478" ||
-		snapshot.Tracker[0].Provider != "tracker.example" {
+		snapshot.Tracker[0].Provider != "tracker.example" || snapshot.Tracker[0].PeerAddresses[0] != "192.0.2.2:9000" {
 		t.Fatalf("clone mutation reached room snapshot: %#v", snapshot)
 	}
 }
@@ -299,15 +302,15 @@ func TestRoomNetworkRunsTrackerUpdatesMappedPortAndJoinsIt(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for tracker hint")
 	}
-	trackerStatus := tracker.ProviderStatus{Provider: "tracker.test", PeerCount: 2}
+	trackerStatus := tracker.ProviderStatus{Provider: "tracker.test", PeerCount: 2, PeerAddresses: []string{}}
 	trackerWorker.setStatus(trackerStatus)
 	waitForRoomSnapshot(t, network, func(snapshot RoomSnapshot) bool {
-		return len(snapshot.Tracker) == 1 && snapshot.Tracker[0] == trackerStatus
+		return len(snapshot.Tracker) == 1 && reflect.DeepEqual(snapshot.Tracker[0], trackerStatus)
 	})
 
 	endpointUDP.mu.Lock()
 	endpointUDP.snapshot.Candidates = []endpoint.Candidate{{
-		Type:    endpoint.CandidateServerReflexive,
+		Type:    endpoint.CandidateSTUN,
 		Address: "198.51.100.7:46000",
 		Family:  "ipv4",
 	}}
@@ -330,8 +333,8 @@ func TestRoomNetworkProjectsPortMappingAndUpdatesTracker(t *testing.T) {
 	endpointUDP.mu.Lock()
 	endpointUDP.snapshot.ListenAddress = "0.0.0.0:9000"
 	endpointUDP.snapshot.Candidates = []endpoint.Candidate{
-		{Type: endpoint.CandidateHost, Address: "192.0.2.10:9000", Family: "ipv4"},
-		{Type: endpoint.CandidateServerReflexive, Address: "8.8.8.8:45000", Family: "ipv4"},
+		{Type: endpoint.CandidateNIC, Address: "192.0.2.10:9000", Family: "ipv4"},
+		{Type: endpoint.CandidateSTUN, Address: "8.8.8.8:45000", Family: "ipv4"},
 	}
 	endpointUDP.mu.Unlock()
 	endpointUDP.run = func(ctx context.Context) error {
@@ -406,7 +409,7 @@ func TestRoomNetworkForwardsTypedHintAndClearsMappingAfterShutdown(t *testing.T)
 	endpointUDP.mu.Lock()
 	endpointUDP.snapshot.ListenAddress = "0.0.0.0:9000"
 	endpointUDP.snapshot.Candidates = []endpoint.Candidate{{
-		Type: endpoint.CandidateHost, Address: "192.0.2.10:9000", Family: "ipv4",
+		Type: endpoint.CandidateNIC, Address: "192.0.2.10:9000", Family: "ipv4",
 	}}
 	endpointUDP.mu.Unlock()
 	endpointUDP.run = func(ctx context.Context) error {
@@ -464,8 +467,8 @@ func TestRoomNetworkExpiresMappingWhileMapperRenewalIsBlocked(t *testing.T) {
 	endpointUDP.mu.Lock()
 	endpointUDP.snapshot.ListenAddress = "0.0.0.0:9000"
 	endpointUDP.snapshot.Candidates = []endpoint.Candidate{
-		{Type: endpoint.CandidateHost, Address: "192.0.2.10:9000", Family: "ipv4"},
-		{Type: endpoint.CandidateServerReflexive, Address: "8.8.8.8:45000", Family: "ipv4"},
+		{Type: endpoint.CandidateNIC, Address: "192.0.2.10:9000", Family: "ipv4"},
+		{Type: endpoint.CandidateSTUN, Address: "8.8.8.8:45000", Family: "ipv4"},
 	}
 	endpointUDP.mu.Unlock()
 	endpointUDP.run = func(ctx context.Context) error {
@@ -525,7 +528,7 @@ func TestRoomNetworkRejectsAlreadyExpiredMappingState(t *testing.T) {
 	endpointUDP, endpointStopped := newRunningFakeEndpoint()
 	endpointUDP.mu.Lock()
 	endpointUDP.snapshot.ListenAddress = "0.0.0.0:9000"
-	endpointUDP.snapshot.Candidates = []endpoint.Candidate{{Type: endpoint.CandidateHost, Address: "192.0.2.10:9000", Family: "ipv4"}}
+	endpointUDP.snapshot.Candidates = []endpoint.Candidate{{Type: endpoint.CandidateNIC, Address: "192.0.2.10:9000", Family: "ipv4"}}
 	endpointUDP.mu.Unlock()
 	endpointUDP.run = func(ctx context.Context) error {
 		endpointUDP.changes <- struct{}{}
@@ -560,8 +563,8 @@ func TestRoomNetworkRejectsAlreadyExpiredMappingState(t *testing.T) {
 
 func TestWithPortMappingPreservesRawEndpointSnapshot(t *testing.T) {
 	raw := endpoint.Snapshot{Candidates: []endpoint.Candidate{
-		{Type: endpoint.CandidateHost, Address: "192.168.1.10:9000", Family: "ipv4"},
-		{Type: endpoint.CandidateServerReflexive, Address: "8.8.8.8:45000", Family: "ipv4"},
+		{Type: endpoint.CandidateNIC, Address: "192.168.1.10:9000", Family: "ipv4"},
+		{Type: endpoint.CandidateSTUN, Address: "8.8.8.8:45000", Family: "ipv4"},
 	}}
 	withoutMapping := withPortMapping(raw, nil)
 	if !slices.Equal(withoutMapping.Candidates, raw.Candidates) || &withoutMapping.Candidates[0] != &raw.Candidates[0] {
@@ -572,7 +575,7 @@ func TestWithPortMappingPreservesRawEndpointSnapshot(t *testing.T) {
 	if len(projected.Candidates) != len(raw.Candidates)+1 || projected.Candidates[len(raw.Candidates)].Type != endpoint.CandidatePortMapped {
 		t.Fatalf("projected candidates = %+v", projected.Candidates)
 	}
-	if len(raw.Candidates) != 2 || raw.Candidates[0].Type != endpoint.CandidateHost || raw.Candidates[1].Type != endpoint.CandidateServerReflexive {
+	if len(raw.Candidates) != 2 || raw.Candidates[0].Type != endpoint.CandidateNIC || raw.Candidates[1].Type != endpoint.CandidateSTUN {
 		t.Fatalf("raw endpoint candidates were mutated: %+v", raw.Candidates)
 	}
 }
@@ -581,10 +584,10 @@ func TestTrackerAnnounceCandidatesPreserveActualEndpointPairs(t *testing.T) {
 	snapshot := endpoint.Snapshot{
 		ListenAddress: "0.0.0.0:9000",
 		Candidates: []endpoint.Candidate{
-			{Type: endpoint.CandidateServerReflexive, Address: "8.8.8.8:45000", Family: "ipv4", Source: "slow"},
-			{Type: endpoint.CandidateServerReflexive, Address: "1.1.1.1:46000", Family: "ipv4", Source: "fast"},
-			{Type: endpoint.CandidateServerReflexive, Address: "9.9.9.9:46500", Family: "ipv4", Source: "medium"},
-			{Type: endpoint.CandidateServerReflexive, Address: "100.64.0.1:48000", Family: "ipv4"},
+			{Type: endpoint.CandidateSTUN, Address: "8.8.8.8:45000", Family: "ipv4", Source: "slow"},
+			{Type: endpoint.CandidateSTUN, Address: "1.1.1.1:46000", Family: "ipv4", Source: "fast"},
+			{Type: endpoint.CandidateSTUN, Address: "9.9.9.9:46500", Family: "ipv4", Source: "medium"},
+			{Type: endpoint.CandidateSTUN, Address: "100.64.0.1:48000", Family: "ipv4"},
 			{Type: endpoint.CandidatePortMapped, Address: "8.8.8.8:47000", Family: "ipv4"},
 		},
 		STUN: []endpoint.STUNResult{{Server: "slow", RTTMillis: 30}, {Server: "fast", RTTMillis: 10}, {Server: "medium", RTTMillis: 20}},
@@ -603,14 +606,14 @@ func TestTrackerAnnounceCandidatesPreserveActualEndpointPairs(t *testing.T) {
 func TestTrackerAnnounceCandidatesUseObservedFallbackOnlyWithoutPublicEndpoint(t *testing.T) {
 	snapshot := endpoint.Snapshot{
 		ListenAddress: "[::]:9000",
-		Candidates:    []endpoint.Candidate{{Type: endpoint.CandidateHost, Address: "192.168.1.10:9000", Family: "ipv4"}},
+		Candidates:    []endpoint.Candidate{{Type: endpoint.CandidateNIC, Address: "192.168.1.10:9000", Family: "ipv4"}},
 	}
 	want := []tracker.AnnounceCandidate{{Port: 9000}}
 	if got := trackerAnnounceCandidates(snapshot); !slices.Equal(got, want) {
 		t.Fatalf("trackerAnnounceCandidates() = %+v, want %+v", got, want)
 	}
 	snapshot.Candidates = append(snapshot.Candidates, endpoint.Candidate{
-		Type: endpoint.CandidateServerReflexive, Address: "8.8.8.8:45000", Family: "ipv4",
+		Type: endpoint.CandidateSTUN, Address: "8.8.8.8:45000", Family: "ipv4",
 	})
 	want = []tracker.AnnounceCandidate{{Address: netip.MustParseAddr("8.8.8.8"), Port: 45000}}
 	if got := trackerAnnounceCandidates(snapshot); !slices.Equal(got, want) {
@@ -625,7 +628,7 @@ func TestPortMappingRequiresIPv4HostCandidate(t *testing.T) {
 	snapshot := endpoint.Snapshot{
 		ListenAddress: "[::]:9000",
 		Candidates: []endpoint.Candidate{{
-			Type: endpoint.CandidateHost, Address: "192.0.2.10:9000", Family: "ipv4",
+			Type: endpoint.CandidateNIC, Address: "192.0.2.10:9000", Family: "ipv4",
 		}},
 	}
 	if port := portMappingInternalPort(snapshot); port != 9000 {

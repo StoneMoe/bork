@@ -3,6 +3,7 @@ module bork
 go 1.25.0
 
 require (
+	github.com/ZertGraf/aeol v0.0.0-20260531135831-07089060e9b5
 	github.com/gen2brain/malgo v0.11.25
 	github.com/grandcat/zeroconf v1.0.0
 	github.com/huin/goupnp v1.3.0
@@ -10,9 +11,10 @@ require (
 	github.com/jackpal/go-nat-pmp v1.0.2
 	github.com/thesyncim/gopus v0.1.1
 	github.com/wailsapp/wails/v2 v2.11.0
-	golang.org/x/crypto v0.33.0
-	golang.org/x/net v0.35.0
-	golang.org/x/sys v0.30.0
+	golang.org/x/crypto v0.37.0
+	golang.org/x/net v0.39.0
+	golang.org/x/sys v0.32.0
+	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -46,6 +48,7 @@ require (
 	github.com/valyala/fasttemplate v1.2.2 // indirect
 	github.com/wailsapp/go-webview2 v1.0.22 // indirect
 	github.com/wailsapp/mimetype v1.4.1 // indirect
-	golang.org/x/sync v0.11.0 // indirect
-	golang.org/x/text v0.22.0 // indirect
+	golang.org/x/sync v0.13.0 // indirect
+	golang.org/x/text v0.24.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 )

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -30,6 +31,10 @@ var (
 		"stun.miwifi.com:3478",
 	}
 	defaultTrackerURLs = []string{
+		"https://tracker.zhuqiy.com/announce",
+		"http://tracker.renfei.net:8080/announce",
+	}
+	legacyDefaultTrackerURLs = []string{
 		"https://tracker.zhuqiy.com/announce",
 		"http://tracker.renfei.net:8080/announce",
 		"http://tracker.mywaifu.best:6969/announce",
@@ -109,6 +114,9 @@ func loadBehaviorConfig(path string) (behaviorConfig, error) {
 		}
 		if encoded.Network.TrackerURLs != nil {
 			config.TrackerURLs = append([]string{}, (*encoded.Network.TrackerURLs)...)
+			if slices.Equal(config.TrackerURLs, legacyDefaultTrackerURLs) {
+				config.TrackerURLs = append([]string{}, defaultTrackerURLs...)
+			}
 		}
 		if encoded.Network.PortMapping != nil {
 			config.PortMapping = *encoded.Network.PortMapping

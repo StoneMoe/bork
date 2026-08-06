@@ -117,6 +117,9 @@ func TestHTTPTrackerLifecycle(t *testing.T) {
 	assertSingleQueryValue(t, first.query, "numwant", strconv.Itoa(maxAnnouncePeers))
 	assertSingleQueryValue(t, first.query, "event", "started")
 	assertSingleQueryValue(t, first.query, "passkey", "abc123")
+	if first.query.Get("nonce") == "" {
+		t.Fatal("HTTP tracker request omitted its cache buster")
+	}
 
 	select {
 	case hint := <-hints:
@@ -131,8 +134,12 @@ func TestHTTPTrackerLifecycle(t *testing.T) {
 		t.Fatal("timed out waiting for HTTP tracker hint")
 	}
 	status := announcer.Snapshot()
-	if len(status) != 1 || status[0].PeerCount != 2 || status[0].Error != "" {
+	if len(status) != 1 || status[0].PeerCount != 2 || len(status[0].PeerAddresses) != 2 || status[0].PeerAddresses[0] != peer4.String() || status[0].PeerAddresses[1] != peer6.String() || status[0].Error != "" {
 		t.Fatalf("tracker status = %+v", status)
+	}
+	status[0].PeerAddresses[0] = "changed"
+	if fresh := announcer.Snapshot(); fresh[0].PeerAddresses[0] != peer4.String() {
+		t.Fatal("tracker status snapshot aliased returned addresses")
 	}
 
 	periodic := waitForHTTPRequest(t, requests, func(record recordedHTTPRequest) bool {
@@ -140,6 +147,9 @@ func TestHTTPTrackerLifecycle(t *testing.T) {
 		return !hasEvent
 	})
 	assertSingleQueryValue(t, periodic.query, "port", "41001")
+	if periodic.query.Get("nonce") == first.query.Get("nonce") {
+		t.Fatal("periodic HTTP tracker request reused its cache key")
+	}
 
 	cancel()
 	stopped := waitForHTTPRequest(t, requests, func(record recordedHTTPRequest) bool {
@@ -165,27 +175,37 @@ func TestDefaultAnnounceCadenceSupportsMutualNATPunching(t *testing.T) {
 }
 
 func TestHTTPTrackerRediscoversPeerJoiningAfterFirstAnnounce(t *testing.T) {
+	type requestRecord struct {
+		peerID, event string
+		cacheHit      bool
+	}
 	var mu sync.Mutex
 	peersByID := make(map[string]netip.AddrPort)
-	requests := make(chan struct{}, 16)
+	responsesByURL := make(map[string][]byte)
+	requests := make(chan requestRecord, 16)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		peerID := request.URL.Query().Get("peer_id")
-		port, _ := strconv.ParseUint(request.URL.Query().Get("port"), 10, 16)
 		mu.Lock()
-		if _, exists := peersByID[peerID]; !exists {
-			index := byte(len(peersByID) + 1)
-			peersByID[peerID] = netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 51, 100, index}), uint16(port))
-		}
-		peers := make([]netip.AddrPort, 0, len(peersByID))
-		for _, peer := range peersByID {
-			peers = append(peers, peer)
+		body, cacheHit := responsesByURL[request.URL.RequestURI()]
+		if !cacheHit {
+			port, _ := strconv.ParseUint(request.URL.Query().Get("port"), 10, 16)
+			if _, exists := peersByID[peerID]; !exists {
+				index := byte(len(peersByID) + 1)
+				peersByID[peerID] = netip.AddrPortFrom(netip.AddrFrom4([4]byte{198, 51, 100, index}), uint16(port))
+			}
+			peers := make([]netip.AddrPort, 0, len(peersByID))
+			for _, peer := range peersByID {
+				peers = append(peers, peer)
+			}
+			body = httpBencodeResponse(3600, peers, nil)
+			responsesByURL[request.URL.RequestURI()] = body
 		}
 		mu.Unlock()
 		select {
-		case requests <- struct{}{}:
+		case requests <- requestRecord{peerID: peerID, event: request.URL.Query().Get("event"), cacheHit: cacheHit}:
 		default:
 		}
-		_, _ = writer.Write(httpBencodeResponse(3600, peers, nil))
+		_, _ = writer.Write(body)
 	}))
 	defer server.Close()
 
@@ -206,15 +226,27 @@ func TestHTTPTrackerRediscoversPeerJoiningAfterFirstAnnounce(t *testing.T) {
 		return announcer, hints, cancel, done
 	}
 
-	_, firstHints, stopFirst, firstDone := newTestAnnouncer(41001)
+	first, firstHints, stopFirst, firstDone := newTestAnnouncer(41001)
 	t.Cleanup(stopFirst)
-	select {
-	case <-requests:
-	case <-time.After(time.Second):
-		t.Fatal("first peer did not announce")
+	firstRegistration := first.registration(first.providers[0], first.candidate)
+	for seenPeriodic := false; !seenPeriodic; {
+		select {
+		case request := <-requests:
+			seenPeriodic = request.peerID == string(firstRegistration.peerID[:]) && request.event == "" && !request.cacheHit
+		case <-time.After(time.Second):
+			t.Fatal("first peer did not make its initial periodic announce")
+		}
 	}
-	_, _, stopSecond, secondDone := newTestAnnouncer(41002)
+	_, secondHints, stopSecond, secondDone := newTestAnnouncer(41002)
 	t.Cleanup(stopSecond)
+	for foundFirst := false; !foundFirst; {
+		select {
+		case hint := <-secondHints:
+			foundFirst = hint.Address.Port() == 41001
+		case <-time.After(time.Second):
+			t.Fatal("later peer did not discover the first peer")
+		}
+	}
 	deadline := time.NewTimer(time.Second)
 	defer deadline.Stop()
 	foundSecond := false
