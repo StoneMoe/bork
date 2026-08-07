@@ -388,10 +388,7 @@ func (c *Client) sendReliable(now time.Time) {
 			if session == nil || !session.authenticated || session.reliable == nil {
 				continue
 			}
-			packet, reservation, ok := session.reliable.nextPacket(now)
-			if !ok {
-				packet, reservation, ok = session.reliable.nextAck()
-			}
+			packet, reservation, ok := session.reliable.nextSend(now)
 			if !ok {
 				continue
 			}
@@ -402,7 +399,9 @@ func (c *Client) sendReliable(now time.Time) {
 				continue
 			}
 			encoded, err := protocol.MarshalReliable(c.roomTag, session.sessionID, sequence, packet, session.ciphers.ControlSend)
-			if err != nil || c.sendPacketOnPath(session.path, encoded, packet.Channel == reliableChannelFileData) != nil {
+			background := packet.Channel == reliableChannelFileData && !packet.AckOnly()
+			if err != nil || c.sendPacketOnPath(session.path, encoded, background) != nil {
+				session.reliable.reject(reservation)
 				continue
 			}
 			session.reliable.commit(reservation)

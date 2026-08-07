@@ -32,6 +32,7 @@ type reliableTransport struct {
 	outbound        []*reliableFragment
 	ackChannels     []uint16
 	ackCursor       int
+	dataCursor      int
 	queuedBytes     int
 	bytesInFlight   int
 	reassemblyBytes int
@@ -43,7 +44,7 @@ type reliableTransport struct {
 	srtt            time.Duration
 	rttvar          time.Duration
 	haveRTT         bool
-	timeoutWave     bool
+	preferACK       bool
 }
 
 type reliableChannel struct {
@@ -66,6 +67,7 @@ type reliableFragment struct {
 	payload          []byte
 	sentAt           time.Time
 	transmissions    int
+	timeoutPending   bool
 }
 
 type reliableAssembly struct {
@@ -83,19 +85,21 @@ const (
 )
 
 type reliableReservation struct {
-	kind     reliableReservationKind
-	fragment *reliableFragment
-	channel  *reliableChannel
-	ackIndex int
-	now      time.Time
+	kind      reliableReservationKind
+	fragment  *reliableFragment
+	channel   *reliableChannel
+	ackIndex  int
+	dataIndex int
+	now       time.Time
 }
 
 func newReliableTransport() *reliableTransport {
 	return &reliableTransport{
-		channels: make(map[uint16]*reliableChannel),
-		cwnd:     initialReliableCwnd,
-		ssthresh: maximumReliableCwnd,
-		rto:      initialReliableRTO,
+		channels:  make(map[uint16]*reliableChannel),
+		cwnd:      initialReliableCwnd,
+		ssthresh:  maximumReliableCwnd,
+		rto:       initialReliableRTO,
+		preferACK: true,
 	}
 }
 
@@ -156,12 +160,24 @@ func (r *reliableTransport) canQueue(channel uint16, ordered bool, size int) err
 	return nil
 }
 
-func (r *reliableTransport) nextPacket(now time.Time) (protocol.ReliablePacket, reliableReservation, bool) {
-	for _, fragment := range r.outbound {
-		if fragment.transmissions == 0 || now.Before(fragment.sentAt.Add(r.rto)) {
-			continue
+func (r *reliableTransport) nextSend(now time.Time) (protocol.ReliablePacket, reliableReservation, bool) {
+	if r.preferACK {
+		if packet, reservation, ok := r.nextAck(); ok {
+			return packet, reservation, true
 		}
-		return r.packetFor(fragment), r.fragmentReservation(reliableReservationRetransmit, fragment, now), true
+		return r.nextPacket(now)
+	}
+	if packet, reservation, ok := r.nextPacket(now); ok {
+		return packet, reservation, true
+	}
+	return r.nextAck()
+}
+
+func (r *reliableTransport) nextPacket(now time.Time) (protocol.ReliablePacket, reliableReservation, bool) {
+	if fragment, index, ok := r.nextFragment(func(fragment *reliableFragment) bool {
+		return fragment.transmissions != 0 && (fragment.timeoutPending || !now.Before(fragment.sentAt.Add(r.rto)))
+	}); ok {
+		return r.packetFor(fragment), r.fragmentReservation(reliableReservationRetransmit, fragment, index, now), true
 	}
 	oldestTransmitted := make(map[uint16]uint64)
 	for _, fragment := range r.outbound {
@@ -173,16 +189,29 @@ func (r *reliableTransport) nextPacket(now time.Time) (protocol.ReliablePacket, 
 			oldestTransmitted[fragment.channel] = fragment.fragmentSequence
 		}
 	}
-	for _, fragment := range r.outbound {
+	if fragment, index, ok := r.nextFragment(func(fragment *reliableFragment) bool {
 		if fragment.transmissions != 0 || r.bytesInFlight+len(fragment.payload) > r.cwnd {
-			continue
+			return false
 		}
-		if oldest := oldestTransmitted[fragment.channel]; oldest != 0 && fragment.fragmentSequence-oldest >= 64 {
-			continue
-		}
-		return r.packetFor(fragment), r.fragmentReservation(reliableReservationNew, fragment, now), true
+		oldest := oldestTransmitted[fragment.channel]
+		return oldest == 0 || fragment.fragmentSequence-oldest < 64
+	}); ok {
+		return r.packetFor(fragment), r.fragmentReservation(reliableReservationNew, fragment, index, now), true
 	}
 	return protocol.ReliablePacket{}, reliableReservation{}, false
+}
+
+func (r *reliableTransport) nextFragment(eligible func(*reliableFragment) bool) (*reliableFragment, int, bool) {
+	for offset := 0; offset < len(r.ackChannels); offset++ {
+		index := (r.dataCursor + offset) % len(r.ackChannels)
+		channel := r.ackChannels[index]
+		for _, fragment := range r.outbound {
+			if fragment.channel == channel && eligible(fragment) {
+				return fragment, index, true
+			}
+		}
+	}
+	return nil, 0, false
 }
 
 func (r *reliableTransport) receive(packet protocol.ReliablePacket, now time.Time) []deliveredReliableMessage {
@@ -340,10 +369,10 @@ func (r *reliableTransport) packetFor(fragment *reliableFragment) protocol.Relia
 	}
 }
 
-func (r *reliableTransport) fragmentReservation(kind reliableReservationKind, fragment *reliableFragment, now time.Time) reliableReservation {
+func (r *reliableTransport) fragmentReservation(kind reliableReservationKind, fragment *reliableFragment, dataIndex int, now time.Time) reliableReservation {
 	state := r.channels[fragment.channel]
 	return reliableReservation{
-		kind: kind, fragment: fragment, channel: state,
+		kind: kind, fragment: fragment, channel: state, dataIndex: dataIndex,
 		now: now,
 	}
 }
@@ -355,20 +384,40 @@ func (r *reliableTransport) commit(reservation reliableReservation) {
 		reservation.fragment.sentAt = reservation.now
 		r.bytesInFlight += len(reservation.fragment.payload)
 	case reliableReservationRetransmit:
-		if !r.timeoutWave {
+		if !reservation.fragment.timeoutPending {
+			// Freeze every fragment already expired into this wave before changing the global RTO.
+			for _, fragment := range r.outbound {
+				if fragment.transmissions != 0 && !reservation.now.Before(fragment.sentAt.Add(r.rto)) {
+					fragment.timeoutPending = true
+				}
+			}
 			r.ssthresh = max(r.cwnd/2, minimumReliableCwnd)
 			r.cwnd = minimumReliableCwnd
 			r.rto = min(r.rto*2, maximumReliableRTO)
-			r.timeoutWave = true
 		}
+		reservation.fragment.timeoutPending = false
 		reservation.fragment.transmissions++
 		reservation.fragment.sentAt = reservation.now
 	case reliableReservationACK:
-		r.ackCursor = (reservation.ackIndex + 1) % len(r.ackChannels)
 	default:
 		return
 	}
+	r.advance(reservation)
 	reservation.channel.ackDirty = false
+}
+
+func (r *reliableTransport) reject(reservation reliableReservation) {
+	r.advance(reservation)
+}
+
+func (r *reliableTransport) advance(reservation reliableReservation) {
+	if reservation.kind == reliableReservationACK {
+		r.ackCursor = (reservation.ackIndex + 1) % len(r.ackChannels)
+		r.preferACK = false
+		return
+	}
+	r.dataCursor = (reservation.dataIndex + 1) % len(r.ackChannels)
+	r.preferACK = true
 }
 
 func (r *reliableTransport) consumeACK(channel uint16, base, bitmap uint64, now time.Time) {
@@ -393,7 +442,6 @@ func (r *reliableTransport) consumeACK(channel uint16, base, bitmap uint64, now 
 	if ackedBytes == 0 {
 		return
 	}
-	r.timeoutWave = false
 	if r.cwnd < r.ssthresh {
 		r.cwnd += ackedBytes
 	} else {

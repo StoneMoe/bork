@@ -30,6 +30,8 @@ type roomNetwork interface {
 	StateChanges() <-chan struct{}
 	DiscoveredPeers() <-chan discovery.Hint
 	ControlPackets() <-chan endpoint.Datagram
+	ReliablePackets() <-chan endpoint.Datagram
+	BridgePackets() <-chan endpoint.Datagram
 	AudioPackets() <-chan endpoint.Datagram
 	InteractivePackets() <-chan endpoint.Datagram
 	EnqueueControl([]byte, netip.AddrPort) error
@@ -222,6 +224,8 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	networkChanges := roomNetwork.StateChanges()
 	discoveredPeers := roomNetwork.DiscoveredPeers()
 	controlPackets := roomNetwork.ControlPackets()
+	reliablePackets := roomNetwork.ReliablePackets()
+	bridgePackets := roomNetwork.BridgePackets()
 	audioPackets := roomNetwork.AudioPackets()
 	interactivePackets := roomNetwork.InteractivePackets()
 	helloTicker := time.NewTicker(helloInterval)
@@ -268,7 +272,6 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 				} else {
 					c.handlePacket(packet, mediaPort)
 				}
-				continue
 			default:
 			}
 		}
@@ -300,6 +303,18 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 		case packet, ok := <-controlPackets:
 			if !ok {
 				controlPackets = nil
+				continue
+			}
+			c.handlePacket(packet, mediaPort)
+		case packet, ok := <-reliablePackets:
+			if !ok {
+				reliablePackets = nil
+				continue
+			}
+			c.handlePacket(packet, mediaPort)
+		case packet, ok := <-bridgePackets:
+			if !ok {
+				bridgePackets = nil
 				continue
 			}
 			c.handlePacket(packet, mediaPort)

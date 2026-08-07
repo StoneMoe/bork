@@ -37,6 +37,8 @@ func (e *fakeEndpoint) Snapshot() endpoint.Snapshot {
 }
 func (e *fakeEndpoint) SnapshotChanges() <-chan struct{}               { return e.changes }
 func (e *fakeEndpoint) ControlPackets() <-chan endpoint.Datagram       { return e.packets }
+func (e *fakeEndpoint) ReliablePackets() <-chan endpoint.Datagram      { return nil }
+func (e *fakeEndpoint) BridgePackets() <-chan endpoint.Datagram        { return nil }
 func (e *fakeEndpoint) AudioPackets() <-chan endpoint.Datagram         { return nil }
 func (e *fakeEndpoint) InteractivePackets() <-chan endpoint.Datagram   { return nil }
 func (e *fakeEndpoint) EnqueueControl([]byte, netip.AddrPort) error    { return nil }

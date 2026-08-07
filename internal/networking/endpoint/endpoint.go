@@ -41,18 +41,28 @@ const (
 	controlGlobalRate         = 512.0
 	controlGlobalBurst        = 256.0
 	maxControlSources         = 256
-	audioSourceRate           = 120.0
-	audioSourceBurst          = 24.0
-	audioIPRate               = 800.0
-	audioIPBurst              = 160.0
+	reliableSourceRate        = 2048.0
+	reliableSourceBurst       = 256.0
+	reliableGlobalRate        = 8192.0
+	reliableGlobalBurst       = 1024.0
+	maxReliableSources        = 256
+	bridgeSourceRate          = 2048.0
+	bridgeSourceBurst         = 256.0
+	bridgeGlobalRate          = 8192.0
+	bridgeGlobalBurst         = 1024.0
+	maxBridgeSources          = 256
 	audioGlobalRate           = 10000.0
 	audioGlobalBurst          = 1000.0
-	maxAudioSources           = 256
-	interactiveSourceRate     = 1000.0
-	interactiveSourceBurst    = 300.0
-	interactiveGlobalRate     = 5000.0
-	interactiveGlobalBurst    = 1000.0
-	maxInteractiveSources     = 256
+	// A forwarder may aggregate audio streams; the peer layer still applies
+	// the signed per-stream 120 pps limit after authentication.
+	audioIPRate            = 2000.0
+	audioIPBurst           = 400.0
+	maxAudioSources        = 256
+	interactiveSourceRate  = 1000.0
+	interactiveSourceBurst = 300.0
+	interactiveGlobalRate  = 5000.0
+	interactiveGlobalBurst = 1000.0
+	maxInteractiveSources  = 256
 )
 
 type Datagram struct {
@@ -66,6 +76,8 @@ type packetClass byte
 const (
 	packetDrop packetClass = iota
 	packetControl
+	packetReliable
+	packetBridge
 	packetAudio
 	packetInteractive
 )
@@ -80,6 +92,7 @@ type RealtimeBatch struct {
 	Datagrams  []RealtimeDatagram
 	Deadline   time.Time
 	Generation uint64
+	writeUntil time.Time
 }
 
 type queuedWrite struct {
@@ -141,6 +154,8 @@ type Endpoint struct {
 
 	snapshotChanges    chan struct{}
 	controlPackets     chan Datagram
+	reliablePackets    chan Datagram
+	bridgePackets      chan Datagram
 	audioPackets       chan Datagram
 	interactivePackets chan Datagram
 	audioBatches       chan RealtimeBatch
@@ -163,6 +178,8 @@ func New(options Options, roomTag [16]byte, logger *slog.Logger) *Endpoint {
 		trackers:           make(map[uint32]pendingTracker),
 		snapshotChanges:    make(chan struct{}, 1),
 		controlPackets:     make(chan Datagram, maxPeerDatagrams),
+		reliablePackets:    make(chan Datagram, maxPeerDatagrams),
+		bridgePackets:      make(chan Datagram, maxPeerDatagrams),
 		audioPackets:       make(chan Datagram, maxPeerDatagrams),
 		interactivePackets: make(chan Datagram, maxPeerDatagrams),
 		audioBatches:       make(chan RealtimeBatch, maxAudioBatches),
@@ -189,8 +206,12 @@ func (e *Endpoint) classifyRoomPacket(packet []byte) packetClass {
 		case protocol.TrafficInteractive, protocol.TrafficCustomRealtime:
 			return packetInteractive
 		}
-	case protocol.PacketHello, protocol.PacketPing, protocol.PacketPong, protocol.PacketReliable, protocol.PacketBridgeControl:
+	case protocol.PacketHello, protocol.PacketPing, protocol.PacketPong:
 		return packetControl
+	case protocol.PacketReliable:
+		return packetReliable
+	case protocol.PacketBridgeControl:
+		return packetBridge
 	}
 	return packetDrop
 }
@@ -206,6 +227,8 @@ func (e *Endpoint) Snapshot() Snapshot {
 }
 
 func (e *Endpoint) ControlPackets() <-chan Datagram     { return e.controlPackets }
+func (e *Endpoint) ReliablePackets() <-chan Datagram    { return e.reliablePackets }
+func (e *Endpoint) BridgePackets() <-chan Datagram      { return e.bridgePackets }
 func (e *Endpoint) AudioPackets() <-chan Datagram       { return e.audioPackets }
 func (e *Endpoint) InteractivePackets() <-chan Datagram { return e.interactivePackets }
 
@@ -453,6 +476,8 @@ func (e *Endpoint) Run(ctx context.Context) error {
 	e.mu.Unlock()
 	close(e.snapshotChanges)
 	close(e.controlPackets)
+	close(e.reliablePackets)
+	close(e.bridgePackets)
 	close(e.audioPackets)
 	close(e.interactivePackets)
 	return runErr
@@ -480,7 +505,8 @@ func unsupportedAddressFamily(err error) bool {
 func (e *Endpoint) readLoop(conn *net.UDPConn) error {
 	buffer := make([]byte, udpReceiveBufferSize)
 	controlLimiter := newIngressLimiter(controlSourceRate, controlSourceBurst, controlGlobalRate, controlGlobalBurst, maxControlSources)
-	audioLimiter := newIngressLimiter(audioSourceRate, audioSourceBurst, audioGlobalRate, audioGlobalBurst, maxAudioSources)
+	reliableLimiter := newIngressLimiter(reliableSourceRate, reliableSourceBurst, reliableGlobalRate, reliableGlobalBurst, maxReliableSources)
+	bridgeLimiter := newIngressLimiter(bridgeSourceRate, bridgeSourceBurst, bridgeGlobalRate, bridgeGlobalBurst, maxBridgeSources)
 	audioIPLimiter := newIngressLimiter(audioIPRate, audioIPBurst, audioGlobalRate, audioGlobalBurst, maxAudioSources)
 	interactiveLimiter := newIngressLimiter(interactiveSourceRate, interactiveSourceBurst, interactiveGlobalRate, interactiveGlobalBurst, maxInteractiveSources)
 	for {
@@ -533,9 +559,17 @@ func (e *Endpoint) readLoop(conn *net.UDPConn) error {
 			if !controlLimiter.allow(controlSource, receivedAt) {
 				continue
 			}
+		case packetReliable:
+			if !reliableLimiter.allow(remote, receivedAt) {
+				continue
+			}
+		case packetBridge:
+			if !bridgeLimiter.allow(remote, receivedAt) {
+				continue
+			}
 		case packetAudio:
 			audioIPSource := netip.AddrPortFrom(remote.Addr(), 0)
-			if !audioIPLimiter.allow(audioIPSource, receivedAt) || !audioLimiter.allow(remote, receivedAt) {
+			if !audioIPLimiter.allow(audioIPSource, receivedAt) {
 				continue
 			}
 		case packetInteractive:
@@ -548,6 +582,10 @@ func (e *Endpoint) readLoop(conn *net.UDPConn) error {
 		switch class {
 		case packetControl:
 			enqueueFresh(e.controlPackets, packet)
+		case packetReliable:
+			enqueueFresh(e.reliablePackets, packet)
+		case packetBridge:
+			enqueueFresh(e.bridgePackets, packet)
 		case packetAudio:
 			enqueueFresh(e.audioPackets, packet)
 		case packetInteractive:
@@ -628,6 +666,7 @@ func (e *Endpoint) writeLoop(ctx context.Context, conn *net.UDPConn) error {
 	)
 	weights := [laneCount]int{8, 2, 2, 1}
 	lane, remaining := audioLane, weights[audioLane]
+	var pendingRealtime [laneCount]RealtimeBatch
 	advance := func() {
 		lane = (lane + 1) % laneCount
 		remaining = weights[lane]
@@ -645,10 +684,16 @@ func (e *Endpoint) writeLoop(ctx context.Context, conn *net.UDPConn) error {
 			selected = lane
 			switch lane {
 			case audioLane:
-				select {
-				case batch = <-e.audioBatches:
+				if len(pendingRealtime[audioLane].Datagrams) > 0 {
+					batch = pendingRealtime[audioLane]
+					pendingRealtime[audioLane] = RealtimeBatch{}
 					ready = true
-				default:
+				} else {
+					select {
+					case batch = <-e.audioBatches:
+						ready = true
+					default:
+					}
 				}
 			case controlLane:
 				select {
@@ -657,10 +702,16 @@ func (e *Endpoint) writeLoop(ctx context.Context, conn *net.UDPConn) error {
 				default:
 				}
 			case interactiveLane:
-				select {
-				case batch = <-e.interactiveBatches:
+				if len(pendingRealtime[interactiveLane].Datagrams) > 0 {
+					batch = pendingRealtime[interactiveLane]
+					pendingRealtime[interactiveLane] = RealtimeBatch{}
 					ready = true
-				default:
+				} else {
+					select {
+					case batch = <-e.interactiveBatches:
+						ready = true
+					default:
+					}
 				}
 			case backgroundLane:
 				select {
@@ -700,7 +751,10 @@ func (e *Endpoint) writeLoop(ctx context.Context, conn *net.UDPConn) error {
 
 		var err error
 		if selected == audioLane || selected == interactiveLane {
-			err = e.writeRealtimeBatch(ctx, conn, batch)
+			batch, err = e.writeRealtimeDatagram(ctx, conn, batch)
+			if len(batch.Datagrams) > 0 {
+				pendingRealtime[selected] = batch
+			}
 		} else {
 			err = writeQueued(conn, request)
 		}
@@ -719,7 +773,10 @@ func (e *Endpoint) stopAcceptingWrites(conn *net.UDPConn) {
 	e.mu.Unlock()
 }
 
-func (e *Endpoint) writeRealtimeBatch(ctx context.Context, conn *net.UDPConn, batch RealtimeBatch) error {
+func (e *Endpoint) writeRealtimeDatagram(ctx context.Context, conn *net.UDPConn, batch RealtimeBatch) (RealtimeBatch, error) {
+	if len(batch.Datagrams) == 0 {
+		return RealtimeBatch{}, nil
+	}
 	var writeBudget time.Duration
 	switch batch.Class {
 	case protocol.TrafficAudio:
@@ -727,40 +784,43 @@ func (e *Endpoint) writeRealtimeBatch(ctx context.Context, conn *net.UDPConn, ba
 	case protocol.TrafficInteractive, protocol.TrafficCustomRealtime:
 		writeBudget = min(maxInteractiveWriteTime, maxNonAudioWriteTime)
 	default:
-		return nil
+		return RealtimeBatch{}, nil
 	}
 
 	e.realtimeMu.Lock()
 	defer e.realtimeMu.Unlock()
 	now := time.Now()
 	if (batch.Generation != 0 && batch.Generation != e.realtimeGeneration) || (!batch.Deadline.IsZero() && now.After(batch.Deadline)) {
-		return nil
+		return RealtimeBatch{}, nil
 	}
-	writeDeadline := now.Add(writeBudget)
-	if !batch.Deadline.IsZero() && batch.Deadline.Before(writeDeadline) {
-		writeDeadline = batch.Deadline
+	if batch.writeUntil.IsZero() {
+		batch.writeUntil = now.Add(writeBudget)
+		if !batch.Deadline.IsZero() && batch.Deadline.Before(batch.writeUntil) {
+			batch.writeUntil = batch.Deadline
+		}
 	}
-	if err := conn.SetWriteDeadline(writeDeadline); err != nil {
-		return err
+	if now.After(batch.writeUntil) {
+		return RealtimeBatch{}, nil
+	}
+	packet := batch.Datagrams[0]
+	batch.Datagrams[0] = RealtimeDatagram{}
+	batch.Datagrams = batch.Datagrams[1:]
+	if err := conn.SetWriteDeadline(batch.writeUntil); err != nil {
+		return batch, err
 	}
 	defer conn.SetWriteDeadline(time.Time{})
-	for _, packet := range batch.Datagrams {
-		if time.Now().After(writeDeadline) {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		if _, err := conn.WriteToUDPAddrPort(packet.Data, packet.Destination); err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return err
-			}
-			e.logger.Debug("drop realtime datagram after send failure", "destination", packet.Destination, "error", err)
-		}
+	select {
+	case <-ctx.Done():
+		return batch, ctx.Err()
+	default:
 	}
-	return nil
+	if _, err := conn.WriteToUDPAddrPort(packet.Data, packet.Destination); err != nil {
+		if errors.Is(err, net.ErrClosed) {
+			return batch, err
+		}
+		e.logger.Debug("drop realtime datagram after send failure", "destination", packet.Destination, "error", err)
+	}
+	return batch, nil
 }
 
 func (e *Endpoint) queueWrite(ctx context.Context, lane chan<- queuedWrite, data []byte, destination netip.AddrPort) error {

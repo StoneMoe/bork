@@ -47,6 +47,8 @@ type roomEndpoint interface {
 	Snapshot() endpoint.Snapshot
 	SnapshotChanges() <-chan struct{}
 	ControlPackets() <-chan endpoint.Datagram
+	ReliablePackets() <-chan endpoint.Datagram
+	BridgePackets() <-chan endpoint.Datagram
 	AudioPackets() <-chan endpoint.Datagram
 	InteractivePackets() <-chan endpoint.Datagram
 	EnqueueControl([]byte, netip.AddrPort) error
@@ -563,7 +565,11 @@ func (n *RoomNetwork) Snapshot() RoomSnapshot {
 func (n *RoomNetwork) StateChanges() <-chan struct{}            { return n.stateChanges }
 func (n *RoomNetwork) DiscoveredPeers() <-chan discovery.Hint   { return n.discovered }
 func (n *RoomNetwork) ControlPackets() <-chan endpoint.Datagram { return n.endpoint.ControlPackets() }
-func (n *RoomNetwork) AudioPackets() <-chan endpoint.Datagram   { return n.endpoint.AudioPackets() }
+func (n *RoomNetwork) ReliablePackets() <-chan endpoint.Datagram {
+	return n.endpoint.ReliablePackets()
+}
+func (n *RoomNetwork) BridgePackets() <-chan endpoint.Datagram { return n.endpoint.BridgePackets() }
+func (n *RoomNetwork) AudioPackets() <-chan endpoint.Datagram  { return n.endpoint.AudioPackets() }
 func (n *RoomNetwork) InteractivePackets() <-chan endpoint.Datagram {
 	return n.endpoint.InteractivePackets()
 }

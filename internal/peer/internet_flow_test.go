@@ -75,6 +75,8 @@ func (n *internetTestNetwork) Snapshot() networking.RoomSnapshot              { 
 func (n *internetTestNetwork) StateChanges() <-chan struct{}                  { return n.changes }
 func (n *internetTestNetwork) DiscoveredPeers() <-chan discovery.Hint         { return n.discovered }
 func (n *internetTestNetwork) ControlPackets() <-chan endpoint.Datagram       { return n.control }
+func (n *internetTestNetwork) ReliablePackets() <-chan endpoint.Datagram      { return n.control }
+func (n *internetTestNetwork) BridgePackets() <-chan endpoint.Datagram        { return n.control }
 func (n *internetTestNetwork) AudioPackets() <-chan endpoint.Datagram         { return nil }
 func (n *internetTestNetwork) InteractivePackets() <-chan endpoint.Datagram   { return nil }
 func (n *internetTestNetwork) SendRealtimeBatch(endpoint.RealtimeBatch) error { return nil }

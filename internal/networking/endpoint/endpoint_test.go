@@ -250,6 +250,26 @@ func TestEndpointsExchangePeerDatagrams(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for peer datagram")
 	}
+	for _, test := range []struct {
+		name    string
+		payload []byte
+		packets <-chan Datagram
+	}{
+		{name: "reliable", payload: testReliablePacket(t, endpointTestRoomTag), packets: second.ReliablePackets()},
+		{name: "bridge", payload: testBridgePacket(t, endpointTestRoomTag), packets: second.BridgePackets()},
+	} {
+		if err := first.EnqueueControl(test.payload, secondAddress); err != nil {
+			t.Fatalf("send %s packet: %v", test.name, err)
+		}
+		select {
+		case packet := <-test.packets:
+			if !bytes.Equal(packet.Data, test.payload) {
+				t.Fatalf("%s packet data mismatch", test.name)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for %s packet", test.name)
+		}
+	}
 
 	cancel()
 	if err := <-firstDone; err != nil {
@@ -326,8 +346,8 @@ func TestClassifyRoomPacket(t *testing.T) {
 		{name: "hello", packet: testHelloPacket(t, endpointTestRoomTag), want: packetControl},
 		{name: "ping", packet: testControlPacket(t, protocol.PacketPing, endpointTestRoomTag), want: packetControl},
 		{name: "pong", packet: testControlPacket(t, protocol.PacketPong, endpointTestRoomTag), want: packetControl},
-		{name: "reliable", packet: testReliablePacket(t, endpointTestRoomTag), want: packetControl},
-		{name: "bridge", packet: testBridgePacket(t, endpointTestRoomTag), want: packetControl},
+		{name: "reliable", packet: testReliablePacket(t, endpointTestRoomTag), want: packetReliable},
+		{name: "bridge", packet: testBridgePacket(t, endpointTestRoomTag), want: packetBridge},
 		{name: "audio", packet: testGroupDatagram(t, protocol.TrafficAudio, endpointTestRoomTag), want: packetAudio},
 		{name: "interactive", packet: testGroupDatagram(t, protocol.TrafficInteractive, endpointTestRoomTag), want: packetInteractive},
 		{name: "custom realtime", packet: testGroupDatagram(t, protocol.TrafficCustomRealtime, endpointTestRoomTag), want: packetInteractive},
@@ -408,24 +428,27 @@ func TestControlIngressLimiterBoundsEachSourceAndTrackedState(t *testing.T) {
 	}
 }
 
-func TestAudioIngressLimiterBoundsOnePath(t *testing.T) {
-	limiter := newIngressLimiter(audioSourceRate, audioSourceBurst, audioGlobalRate, audioGlobalBurst, maxAudioSources)
+func TestReliableIngressLimiterBoundsEachPath(t *testing.T) {
+	limiter := newIngressLimiter(reliableSourceRate, reliableSourceBurst, reliableGlobalRate, reliableGlobalBurst, maxReliableSources)
 	now := time.Unix(1000, 0)
-	source := netip.MustParseAddrPort("192.0.2.1:9000")
-	for range int(audioSourceBurst) {
-		if !limiter.allow(source, now) {
-			t.Fatal("audio limiter rejected a packet within the path burst")
+	first := netip.MustParseAddrPort("192.0.2.1:9000")
+	for range int(reliableSourceBurst) {
+		if !limiter.allow(first, now) {
+			t.Fatal("reliable limiter rejected a packet within the path burst")
 		}
 	}
-	if limiter.allow(source, now) {
-		t.Fatal("audio limiter accepted a packet above the path burst")
+	if limiter.allow(first, now) {
+		t.Fatal("reliable limiter accepted a packet above the path burst")
 	}
-	if !limiter.allow(source, now.Add(time.Second)) {
-		t.Fatal("audio limiter did not replenish path tokens")
+	if !limiter.allow(netip.MustParseAddrPort("192.0.2.1:9001"), now) {
+		t.Fatal("reliable limiter coupled different paths behind one IP")
+	}
+	if !limiter.allow(first, now.Add(time.Second)) {
+		t.Fatal("reliable limiter did not replenish path tokens")
 	}
 }
 
-func TestAudioIPLimiterCannotBeBypassedWithSourcePorts(t *testing.T) {
+func TestAudioIPLimiterAllowsForwarderAggregateAndBoundsSourcePorts(t *testing.T) {
 	limiter := newIngressLimiter(audioIPRate, audioIPBurst, audioGlobalRate, audioGlobalBurst, maxAudioSources)
 	now := time.Unix(1000, 0)
 	address := netip.MustParseAddr("192.0.2.1")
@@ -438,6 +461,12 @@ func TestAudioIPLimiterCannotBeBypassedWithSourcePorts(t *testing.T) {
 	}
 	if limiter.allow(netip.AddrPortFrom(address, 0), now) {
 		t.Fatal("rotating source ports bypassed the audio IP burst")
+	}
+	if !limiter.allow(netip.MustParseAddrPort("192.0.2.2:0"), now) {
+		t.Fatal("one audio source consumed the global ingress budget")
+	}
+	if !limiter.allow(netip.AddrPortFrom(address, 0), now.Add(time.Second)) {
+		t.Fatal("audio IP limiter did not replenish aggregate tokens")
 	}
 }
 
@@ -555,7 +584,9 @@ func TestWriteLoopUsesWeightedCycleWithoutStarvingLanes(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	audio := RealtimeBatch{
 		Class: protocol.TrafficAudio, Deadline: deadline,
-		Datagrams: []RealtimeDatagram{{Data: []byte{1}, Destination: destination}},
+	}
+	for range 16 {
+		audio.Datagrams = append(audio.Datagrams, RealtimeDatagram{Data: []byte{1}, Destination: destination})
 	}
 	control := func() queuedWrite {
 		return queuedWrite{data: []byte{2}, destination: destination, deadline: deadline, result: make(chan error, 1)}
@@ -574,52 +605,8 @@ func TestWriteLoopUsesWeightedCycleWithoutStarvingLanes(t *testing.T) {
 		data: []byte{4}, destination: destination, deadline: deadline, result: make(chan error, 1),
 	}
 
-	stopRefill := make(chan struct{})
-	var refillers sync.WaitGroup
-	refillers.Add(2)
-	go func() {
-		defer refillers.Done()
-		for {
-			select {
-			case <-stopRefill:
-				return
-			default:
-			}
-			select {
-			case endpoint.audioBatches <- audio:
-			case <-stopRefill:
-				return
-			}
-		}
-	}()
-	go func() {
-		defer refillers.Done()
-		for {
-			select {
-			case <-stopRefill:
-				return
-			default:
-			}
-			select {
-			case endpoint.controlWrites <- control():
-			case <-stopRefill:
-				return
-			}
-		}
-	}()
-	refillersStopped := false
-	stopRefillers := func() {
-		if refillersStopped {
-			return
-		}
-		close(stopRefill)
-		refillers.Wait()
-		refillersStopped = true
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	defer stopRefillers()
 	done := make(chan error, 1)
 	go func() { done <- endpoint.writeLoop(ctx, sender) }()
 	if err := receiver.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
@@ -641,7 +628,6 @@ func TestWriteLoopUsesWeightedCycleWithoutStarvingLanes(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Fatalf("scheduled writes = %v, want %v", got, want)
 	}
-	stopRefillers()
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("writeLoop() error = %v", err)

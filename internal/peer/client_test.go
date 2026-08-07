@@ -33,6 +33,15 @@ type fakeRoomNetwork struct {
 	err             error
 }
 
+type loadedRoomNetwork struct {
+	*fakeRoomNetwork
+	control chan endpoint.Datagram
+	audio   chan endpoint.Datagram
+}
+
+func (n *loadedRoomNetwork) ControlPackets() <-chan endpoint.Datagram { return n.control }
+func (n *loadedRoomNetwork) AudioPackets() <-chan endpoint.Datagram   { return n.audio }
+
 func newFakeRoomNetwork() *fakeRoomNetwork {
 	return &fakeRoomNetwork{
 		snapshotChanges: make(chan struct{}, 1), packets: make(chan endpoint.Datagram, 4),
@@ -57,6 +66,8 @@ func (e *fakeRoomNetwork) Snapshot() networking.RoomSnapshot {
 func (e *fakeRoomNetwork) StateChanges() <-chan struct{}                { return e.snapshotChanges }
 func (e *fakeRoomNetwork) DiscoveredPeers() <-chan discovery.Hint       { return e.discovered }
 func (e *fakeRoomNetwork) ControlPackets() <-chan endpoint.Datagram     { return e.packets }
+func (e *fakeRoomNetwork) ReliablePackets() <-chan endpoint.Datagram    { return e.packets }
+func (e *fakeRoomNetwork) BridgePackets() <-chan endpoint.Datagram      { return e.packets }
 func (e *fakeRoomNetwork) AudioPackets() <-chan endpoint.Datagram       { return nil }
 func (e *fakeRoomNetwork) InteractivePackets() <-chan endpoint.Datagram { return nil }
 func (e *fakeRoomNetwork) EnqueueControl(packet []byte, destination netip.AddrPort) error {
@@ -120,6 +131,70 @@ func TestClientLoopStopsWithContext(t *testing.T) {
 	}
 	if err := client.Loop(context.Background(), nil); err == nil {
 		t.Fatal("second Client.Loop() call was accepted")
+	}
+}
+
+func TestClientLoopDoesNotStarveCommandsUnderRealtimeLoad(t *testing.T) {
+	network := &loadedRoomNetwork{
+		fakeRoomNetwork: newFakeRoomNetwork(),
+		control:         make(chan endpoint.Datagram, 256),
+		audio:           make(chan endpoint.Datagram, 256),
+	}
+	packet := endpoint.Datagram{Data: []byte{0}}
+	for range cap(network.control) {
+		network.control <- packet
+		network.audio <- packet
+	}
+	loadContext, stopLoad := context.WithCancel(context.Background())
+	var flooders sync.WaitGroup
+	fill := func(queue chan<- endpoint.Datagram) {
+		defer flooders.Done()
+		for {
+			select {
+			case queue <- packet:
+			case <-loadContext.Done():
+				return
+			}
+		}
+	}
+	flooders.Add(2)
+	go fill(network.control)
+	go fill(network.audio)
+
+	client := testClient(t, func() roomNetwork { return network })
+	loopContext, stopLoop := context.WithCancel(context.Background())
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- client.Loop(loopContext, nil) }()
+	<-client.Ready()
+	commandDone := make(chan error, 1)
+	go func() {
+		_, err := client.OfferFile("missing", "missing")
+		commandDone <- err
+	}()
+
+	var commandErr error
+	timedOut := false
+	select {
+	case commandErr = <-commandDone:
+	case <-time.After(time.Second):
+		timedOut = true
+	}
+	stopLoad()
+	flooders.Wait()
+	stopLoop()
+	select {
+	case err := <-loopDone:
+		if err != nil {
+			t.Fatalf("Loop() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Loop() did not stop")
+	}
+	if timedOut {
+		t.Fatal("file command was starved by realtime and control traffic")
+	}
+	if commandErr == nil {
+		t.Fatal("invalid file command unexpectedly succeeded")
 	}
 }
 

@@ -85,7 +85,7 @@ func TestClientsTransferAndCancelFiles(t *testing.T) {
 	waitForAuthenticatedRemotePeer(t, first, first.StateChanges(), secondDevice.PeerID())
 	waitForAuthenticatedRemotePeer(t, second, second.StateChanges(), firstDevice.PeerID())
 
-	sourceData := make([]byte, 96<<10+17)
+	sourceData := make([]byte, 1<<20+17)
 	for index := range sourceData {
 		sourceData[index] = byte(index * 31)
 	}

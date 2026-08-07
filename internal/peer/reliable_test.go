@@ -166,6 +166,89 @@ func TestReliableRTTAndTimeoutCongestionResponse(t *testing.T) {
 	}
 }
 
+func TestReliableTimeoutWaveKeepsExpiredSiblingsEligible(t *testing.T) {
+	r := newReliableTransport()
+	if err := r.queue(11, false, bytes.Repeat([]byte{1}, 3*reliableMSS)); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(550, 0)
+	for sequence := uint64(1); sequence <= 3; sequence++ {
+		packet, ok := nextReliablePacket(r, now)
+		if !ok || packet.FragmentSequence != sequence {
+			t.Fatalf("initial packet = %#v, %t; want sequence %d", packet, ok, sequence)
+		}
+	}
+
+	timeoutAt := now.Add(initialReliableRTO)
+	for sequence := uint64(1); sequence <= 3; sequence++ {
+		packet, ok := nextReliablePacket(r, timeoutAt)
+		if !ok || packet.FragmentSequence != sequence {
+			t.Fatalf("timeout packet = %#v, %t; want sequence %d", packet, ok, sequence)
+		}
+	}
+	if r.cwnd != minimumReliableCwnd || r.rto != 2*initialReliableRTO {
+		t.Fatalf("cwnd = %d, RTO = %v", r.cwnd, r.rto)
+	}
+}
+
+func TestReliableTimeoutWaveSurvivesPartialACK(t *testing.T) {
+	r := newReliableTransport()
+	if err := r.queue(12, false, bytes.Repeat([]byte{1}, 3*reliableMSS)); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(560, 0)
+	for range 3 {
+		if _, ok := nextReliablePacket(r, now); !ok {
+			t.Fatal("nextPacket() returned no initial packet")
+		}
+	}
+	timeoutAt := now.Add(initialReliableRTO)
+	first, ok := nextReliablePacket(r, timeoutAt)
+	if !ok || first.FragmentSequence != 1 {
+		t.Fatalf("first timeout packet = %#v, %t", first, ok)
+	}
+	r.receive(protocol.ReliablePacket{
+		Channel:   12,
+		Flags:     protocol.ReliableFlagAckOnly,
+		AckBase:   first.FragmentSequence,
+		AckBitmap: 1,
+	}, timeoutAt.Add(time.Nanosecond))
+	waveCwnd, waveSsthresh, waveRTO := r.cwnd, r.ssthresh, r.rto
+
+	retryAt := now.Add(2 * initialReliableRTO)
+	for sequence := uint64(2); sequence <= 3; sequence++ {
+		packet, ok := nextReliablePacket(r, retryAt)
+		if !ok || packet.FragmentSequence != sequence {
+			t.Fatalf("remaining timeout packet = %#v, %t; want sequence %d", packet, ok, sequence)
+		}
+		if r.cwnd != waveCwnd || r.ssthresh != waveSsthresh || r.rto != waveRTO {
+			t.Fatalf("same wave backed off again: cwnd=%d ssthresh=%d RTO=%v", r.cwnd, r.ssthresh, r.rto)
+		}
+	}
+}
+
+func TestReliablePersistentLossStartsLaterTimeoutWaves(t *testing.T) {
+	r := newReliableTransport()
+	if err := r.queue(13, false, []byte("lost")); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(570, 0)
+	if _, ok := nextReliablePacket(r, now); !ok {
+		t.Fatal("nextPacket() returned no initial packet")
+	}
+
+	timeoutAt := now.Add(initialReliableRTO)
+	for wave, wantRTO := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, maximumReliableRTO} {
+		if _, ok := nextReliablePacket(r, timeoutAt); !ok {
+			t.Fatalf("wave %d returned no retransmission", wave+1)
+		}
+		if r.rto != wantRTO {
+			t.Fatalf("wave %d RTO = %v, want %v", wave+1, r.rto, wantRTO)
+		}
+		timeoutAt = timeoutAt.Add(wantRTO)
+	}
+}
+
 func TestReliableQueueAndReassemblyBounds(t *testing.T) {
 	r := newReliableTransport()
 	if err := r.queue(0, false, []byte("x")); err == nil {
@@ -324,9 +407,9 @@ func TestReliableQueueRejectionDoesNotCommitState(t *testing.T) {
 
 	client.sendReliable(now)
 	if fragment.transmissions != 0 || !fragment.sentAt.IsZero() || transport.bytesInFlight != 0 || !transport.channels[3].ackDirty ||
-		transport.cwnd != initialReliableCwnd || transport.rto != initialReliableRTO || transport.timeoutWave {
-		t.Fatalf("rejected first send changed state: fragment=%#v inFlight=%d cwnd=%d rto=%v dirty=%t wave=%t",
-			fragment, transport.bytesInFlight, transport.cwnd, transport.rto, transport.channels[3].ackDirty, transport.timeoutWave)
+		transport.cwnd != initialReliableCwnd || transport.rto != initialReliableRTO || fragment.timeoutPending {
+		t.Fatalf("rejected first send changed state: fragment=%#v inFlight=%d cwnd=%d rto=%v dirty=%t",
+			fragment, transport.bytesInFlight, transport.cwnd, transport.rto, transport.channels[3].ackDirty)
 	}
 
 	delete(network.enqueueErrors, path.Address())
@@ -342,17 +425,17 @@ func TestReliableQueueRejectionDoesNotCommitState(t *testing.T) {
 	network.enqueueErrors[path.Address()] = errors.New("queue full")
 	client.sendReliable(timeoutAt)
 	if fragment.transmissions != 1 || !fragment.sentAt.Equal(now) || transport.cwnd != 8*reliableMSS ||
-		transport.ssthresh != maximumReliableCwnd || transport.rto != 400*time.Millisecond || transport.timeoutWave {
-		t.Fatalf("rejected retransmit changed state: fragment=%#v cwnd=%d ssthresh=%d rto=%v wave=%t",
-			fragment, transport.cwnd, transport.ssthresh, transport.rto, transport.timeoutWave)
+		transport.ssthresh != maximumReliableCwnd || transport.rto != 400*time.Millisecond || fragment.timeoutPending {
+		t.Fatalf("rejected retransmit changed state: fragment=%#v cwnd=%d ssthresh=%d rto=%v",
+			fragment, transport.cwnd, transport.ssthresh, transport.rto)
 	}
 
 	delete(network.enqueueErrors, path.Address())
 	client.sendReliable(timeoutAt)
 	if fragment.transmissions != 2 || !fragment.sentAt.Equal(timeoutAt) || transport.cwnd != minimumReliableCwnd ||
-		transport.ssthresh != 4*reliableMSS || transport.rto != 800*time.Millisecond || !transport.timeoutWave {
-		t.Fatalf("admitted retransmit was not committed: fragment=%#v cwnd=%d ssthresh=%d rto=%v wave=%t",
-			fragment, transport.cwnd, transport.ssthresh, transport.rto, transport.timeoutWave)
+		transport.ssthresh != 4*reliableMSS || transport.rto != 800*time.Millisecond || fragment.timeoutPending {
+		t.Fatalf("admitted retransmit was not committed: fragment=%#v cwnd=%d ssthresh=%d rto=%v",
+			fragment, transport.cwnd, transport.ssthresh, transport.rto)
 	}
 
 	transport.receive(reliableData(4, false, 1, 1, 0, 1, []byte("ack only")), timeoutAt)
@@ -436,6 +519,73 @@ func TestReliableSchedulerIsDeterministicallyFair(t *testing.T) {
 	}
 }
 
+func TestReliableSchedulerRotatesChannelsWithinPeer(t *testing.T) {
+	r := newReliableTransport()
+	if err := r.queue(reliableChannelFileData, false, bytes.Repeat([]byte{1}, 3*reliableMSS)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.queue(reliableChannelMemberState, false, []byte("state")); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(925, 0)
+	first, ok := nextReliablePacket(r, now)
+	if !ok || first.Channel != reliableChannelFileData {
+		t.Fatalf("first packet = %#v, %t", first, ok)
+	}
+	second, ok := nextReliablePacket(r, now)
+	if !ok || second.Channel != reliableChannelMemberState {
+		t.Fatalf("second packet = %#v, %t; want member state", second, ok)
+	}
+}
+
+func TestReliableACKsCannotStarveData(t *testing.T) {
+	network := newFakeRoomNetwork()
+	client := testClient(t, func() roomNetwork { return network })
+	client.roomNetwork = network
+	remoteIdentity := testRemoteIdentity(t)
+	path, _ := NewPath(netip.MustParseAddrPort("192.0.2.87:9000"))
+	session := testPeeringSession(t, path)
+	session.authenticated = true
+	client.remotePeers[remoteIdentity.PeerID()] = &RemotePeer{identity: remoteIdentity, session: session}
+	now := time.Unix(930, 0)
+	for channel := uint16(1); channel <= maxReliableChannels; channel++ {
+		session.reliable.receive(reliableData(channel, false, 1, 1, 0, 1, []byte{1}), now)
+	}
+	if err := session.reliable.queue(1, false, []byte("outgoing")); err != nil {
+		t.Fatal(err)
+	}
+	fragment := session.reliable.outbound[0]
+
+	client.sendReliable(now)
+	if fragment.transmissions != 1 {
+		t.Fatal("ACK-only traffic starved queued data")
+	}
+}
+
+func TestRejectedReliableDataDoesNotPinACKScheduling(t *testing.T) {
+	r := newReliableTransport()
+	now := time.Unix(940, 0)
+	r.receive(reliableData(1, false, 1, 1, 0, 1, []byte("first")), now)
+	ack, reservation, ok := r.nextSend(now)
+	if !ok || !ack.AckOnly() {
+		t.Fatalf("first packet = %#v, %t; want ACK", ack, ok)
+	}
+	r.commit(reservation)
+	r.receive(reliableData(1, false, 2, 2, 0, 1, []byte("second")), now)
+	if err := r.queue(reliableChannelFileData, false, []byte("file")); err != nil {
+		t.Fatal(err)
+	}
+	data, reservation, ok := r.nextSend(now)
+	if !ok || data.AckOnly() {
+		t.Fatalf("second packet = %#v, %t; want data", data, ok)
+	}
+	r.reject(reservation)
+	next, _, ok := r.nextSend(now)
+	if !ok || !next.AckOnly() {
+		t.Fatalf("packet after rejection = %#v, %t; want ACK", next, ok)
+	}
+}
+
 func TestReliableSchedulerContinuesAfterPeerEnqueueFailure(t *testing.T) {
 	network := newFakeRoomNetwork()
 	client := testClient(t, func() roomNetwork { return network })
@@ -485,6 +635,35 @@ func TestFileDataReliableUsesBackgroundLane(t *testing.T) {
 	client.sendReliable(time.Unix(960, 0))
 	if len(network.background) != 1 || len(network.sentPackets) != 1 {
 		t.Fatalf("background packets = %d, all packets = %d", len(network.background), len(network.sentPackets))
+	}
+}
+
+func TestFileDataACKUsesControlLaneBeforeNewData(t *testing.T) {
+	network := newFakeRoomNetwork()
+	client := testClient(t, func() roomNetwork { return network })
+	client.roomNetwork = network
+	remoteIdentity := testRemoteIdentity(t)
+	path, _ := NewPath(netip.MustParseAddrPort("192.0.2.86:9000"))
+	session := testPeeringSession(t, path)
+	session.authenticated = true
+	client.remotePeers[remoteIdentity.PeerID()] = &RemotePeer{identity: remoteIdentity, session: session}
+	now := time.Unix(970, 0)
+	session.reliable.receive(reliableData(reliableChannelFileData, false, 1, 1, 0, 1, []byte("incoming")), now)
+	if err := session.reliable.queue(reliableChannelFileData, false, []byte("outgoing")); err != nil {
+		t.Fatal(err)
+	}
+
+	client.sendReliable(now)
+	if len(network.sentPackets) != 2 || len(network.background) != 1 {
+		t.Fatalf("all packets = %d, background packets = %d", len(network.sentPackets), len(network.background))
+	}
+	header, err := protocol.ParseEstablishedHeader(network.sentPackets[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := protocol.ParseReliable(network.sentPackets[0], client.roomTag, header.SessionID, session.ciphers.ControlSend)
+	if err != nil || !first.AckOnly() {
+		t.Fatalf("first packet = %#v, %v; want ACK-only", first, err)
 	}
 }
 
