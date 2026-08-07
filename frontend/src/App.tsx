@@ -1,10 +1,12 @@
-import { Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import * as Backend from "@wailsjs/go/app/App";
 import { ClipboardSetText, Quit, WindowIsMaximised, WindowMinimise, WindowToggleMaximise } from "@wailsjs/runtime/runtime";
 import Room from "./Room";
 import Settings from "./Settings";
 import { closePopoversEvent, nativePopoverOpen, nativePopoverSupported } from "./popover";
+import { parseRoomHistory, roomHistoryStorageKey, withRecentRoom } from "./room-history";
 import { createRemoteState } from "./sync";
+import type { RoomHistoryEntry } from "./room-history";
 import type { ActionProps, AppState, FriendlyStatus } from "./types";
 
 const maxInviteLength = 512;
@@ -12,7 +14,6 @@ const nicknameStorageKey = "bork.nickname";
 const echoCancellationDisabledStorageKey = "bork.audio.echoCancellation.disabled";
 const noiseSuppressionDisabledStorageKey = "bork.audio.noiseSuppression.disabled";
 const remoteLoudnessNormalizationDisabledStorageKey = "bork.audio.remoteLoudnessNormalization.disabled";
-const lobbySpectrum = [14, 22, 38, 58, 32, 70, 48, 82, 60, 92, 100, 92, 60, 82, 48, 70, 32, 58, 38, 22, 14];
 
 function hasNativeWindowBridge() {
   const host = window as typeof window & {
@@ -58,6 +59,7 @@ export default function App() {
   const customWindowControls = hasNativeWindowBridge();
   const [windowMaximised, setWindowMaximised] = createSignal(false);
   const [error, setError] = createSignal("");
+  const [roomHistory, setRoomHistory] = createSignal(readRoomHistory());
   let leaveRoomAction: (() => Promise<void>) | undefined;
   let nicknameRestoreStarted = false;
   let audioPreferencesRestoreStarted = false;
@@ -104,6 +106,13 @@ export default function App() {
     if (!current) {
       window.clearTimeout(copyTimer);
       setInviteCopied(false);
+    } else {
+      const name = state().room?.name;
+      if (name) {
+        void Backend.GetInvite().then((invite) => {
+          if (invite) updateRoomHistory(withRecentRoom(roomHistory(), { name, invite, visitedAt: Date.now() }));
+        }).catch(() => { /* history is optional */ });
+      }
     }
     if (!settingsOpen()) queueMicrotask(() => mainView?.focus({ preventScroll: true }));
   });
@@ -223,6 +232,14 @@ export default function App() {
     copyTimer = window.setTimeout(() => setInviteCopied(false), 1600);
   }
 
+  function updateRoomHistory(history: RoomHistoryEntry[]) {
+    setRoomHistory(history);
+    try {
+      if (history.length > 0) localStorage.setItem(roomHistoryStorageKey, JSON.stringify(history));
+      else localStorage.removeItem(roomHistoryStorageKey);
+    } catch { /* storage unavailable */ }
+  }
+
   return (
     <main class="shell" classList={{ maximised: customWindowControls && windowMaximised() }}>
       <header
@@ -288,7 +305,15 @@ export default function App() {
       <section ref={mainView} class="main-view" tabindex="-1">
         <Show
           when={inRoom()}
-          fallback={<Lobby busy={busy()} ready={operational()} runAction={runAction} />}
+          fallback={
+            <Lobby
+              busy={busy()}
+              ready={operational()}
+              history={roomHistory()}
+              runAction={runAction}
+              removeHistory={(invite) => updateRoomHistory(roomHistory().filter((entry) => entry.invite !== invite))}
+            />
+          }
         >
           <Room
             state={state()}
@@ -355,9 +380,40 @@ function CloseIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>;
 }
 
-function Lobby(props: ActionProps) {
+interface LobbyProps extends ActionProps {
+  history: readonly RoomHistoryEntry[];
+  removeHistory: (invite: string) => void;
+}
+
+type LobbyPage = "home" | "create" | "join";
+
+function Lobby(props: LobbyProps) {
   const [roomName, setRoomName] = createSignal("");
   const [invite, setInvite] = createSignal("");
+  const [page, setPage] = createSignal<LobbyPage>("home");
+  let createButton: HTMLButtonElement | undefined;
+  let joinButton: HTMLButtonElement | undefined;
+  let roomNameInput: HTMLInputElement | undefined;
+  let inviteInput: HTMLTextAreaElement | undefined;
+
+  function openPage(next: Exclude<LobbyPage, "home">) {
+    setPage(next);
+    queueMicrotask(() => (next === "create" ? roomNameInput : inviteInput)?.focus({ preventScroll: true }));
+  }
+
+  function returnHome() {
+    const previous = page();
+    if (previous === "home" || props.busy) return;
+    setPage("home");
+    queueMicrotask(() => (previous === "create" ? createButton : joinButton)?.focus({ preventScroll: true }));
+  }
+
+  function handleLobbyKeyDown(event: KeyboardEvent) {
+    if (event.key !== "Escape" || page() === "home" || props.busy) return;
+    event.preventDefault();
+    event.stopPropagation();
+    returnHome();
+  }
 
   async function createRoom(event: SubmitEvent) {
     event.preventDefault();
@@ -370,41 +426,135 @@ function Lobby(props: ActionProps) {
   }
 
   return (
-    <section class="lobby-view">
-      <div class="lobby-visual" aria-hidden="true">
-        <div class="lobby-spectrum">
-          {lobbySpectrum.map((level, index) => <i style={`--level:${level}%;--index:${index}`} />)}
-        </div>
-      </div>
-      <div class="invite-stack">
-        <form class="room-form" onSubmit={createRoom}>
-          <label for="roomName">创建房间</label>
-          <input
-            id="roomName"
-            autocomplete="off"
-            placeholder="给房间起个名字"
-            value={roomName()}
-            onInput={(event) => setRoomName(event.currentTarget.value)}
-            required
-          />
-          <button class="button primary" type="submit" disabled={props.busy || !props.ready}>创建并进入</button>
-        </form>
-        <div class="form-divider"><span>或者</span></div>
-        <form class="room-form compact" onSubmit={joinRoom}>
-          <label for="inviteInput">加入房间</label>
-          <textarea
-            id="inviteInput"
-            maxlength={maxInviteLength}
-            spellcheck={false}
-            autocomplete="off"
-            placeholder="粘贴房间邀请"
-            value={invite()}
-            onInput={(event) => setInvite(event.currentTarget.value)}
-            required
-          />
-          <button class="button quiet" type="submit" disabled={props.busy || !props.ready}>加入</button>
-        </form>
-      </div>
+    <section class="lobby-view" classList={{ "subview-open": page() !== "home" }} onKeyDown={handleLobbyKeyDown}>
+      <Show when={page() === "home"} fallback={
+        <section class="lobby-subview" aria-labelledby="lobbySubviewTitle">
+          <header class="lobby-subview-header">
+            <button class="lobby-subview-back" type="button" disabled={props.busy} aria-label="返回" title="返回" onClick={returnHome}>
+              <BackIcon />
+            </button>
+            <h1 id="lobbySubviewTitle">{page() === "create" ? "创建房间" : "加入房间"}</h1>
+          </header>
+          <Show when={page() === "create"} fallback={
+            <form class="lobby-form join" onSubmit={joinRoom}>
+              <textarea
+                ref={inviteInput}
+                id="inviteInput"
+                aria-label="房间邀请"
+                aria-describedby="inviteInputDescription"
+                maxlength={maxInviteLength}
+                spellcheck={false}
+                autocomplete="off"
+                placeholder="粘贴房间成员发送的邀请链接"
+                value={invite()}
+                onInput={(event) => setInvite(event.currentTarget.value)}
+                required
+              />
+              <p id="inviteInputDescription" class="lobby-input-description">链接格式：<code>bork://join/…</code></p>
+              <button class="lobby-submit" type="submit" disabled={props.busy || !props.ready} aria-label="加入房间">
+                <span>进入</span>
+                <ChevronIcon />
+              </button>
+            </form>
+          }>
+            <form class="lobby-form" onSubmit={createRoom}>
+              <input
+                ref={roomNameInput}
+                id="roomName"
+                aria-label="房间名称"
+                autocomplete="off"
+                placeholder="输入房间名称"
+                value={roomName()}
+                onInput={(event) => setRoomName(event.currentTarget.value)}
+                required
+              />
+              <button class="lobby-submit" type="submit" disabled={props.busy || !props.ready} aria-label="创建并进入房间">
+                <span>进入</span>
+                <ChevronIcon />
+              </button>
+            </form>
+          </Show>
+        </section>
+      }>
+        <section class="lobby-panel" aria-label="房间操作">
+          <div class="lobby-entry-actions">
+            <button
+              ref={createButton}
+              class="lobby-entry-button create"
+              type="button"
+              disabled={props.busy || !props.ready}
+              onClick={() => openPage("create")}
+            >
+              <CreateRoomIcon />
+              <span>创建房间</span>
+              <ChevronIcon />
+            </button>
+            <button
+              ref={joinButton}
+              class="lobby-entry-button"
+              type="button"
+              disabled={props.busy || !props.ready}
+              onClick={() => openPage("join")}
+            >
+              <JoinRoomIcon />
+              <span>加入房间</span>
+              <ChevronIcon />
+            </button>
+          </div>
+          <Show when={props.history.length > 0}>
+            <section class="room-history" aria-labelledby="roomHistoryLabel">
+              <div id="roomHistoryLabel" class="room-history-label">最近房间</div>
+              <ul class="room-history-list">
+                <For each={props.history}>{(room) => (
+                  <li class="room-history-item">
+                    <button
+                      class="room-history-tag"
+                      type="button"
+                      disabled={props.busy || !props.ready}
+                      title={`重新加入 ${room.name} · ${new Date(room.visitedAt).toLocaleString("zh-CN")}`}
+                      onClick={() => void props.runAction(() => Backend.JoinRoom(room.invite))}
+                    >
+                      <HistoryIcon />
+                      <span>{room.name}</span>
+                    </button>
+                    <button
+                      class="room-history-remove"
+                      type="button"
+                      aria-label={`从最近房间移除 ${room.name}`}
+                      title="移除记录"
+                      onClick={() => props.removeHistory(room.invite)}
+                    ><CloseIcon /></button>
+                  </li>
+                )}</For>
+              </ul>
+            </section>
+          </Show>
+        </section>
+      </Show>
     </section>
   );
+}
+
+function CreateRoomIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>;
+}
+
+function JoinRoomIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v14h-5M5 12h10M11 8l4 4-4 4" /></svg>;
+}
+
+function ChevronIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>;
+}
+
+function HistoryIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3L4.5 9M4.5 4.5V9H9M12 8v4.5l3 1.8" /></svg>;
+}
+
+function readRoomHistory() {
+  try {
+    return parseRoomHistory(localStorage.getItem(roomHistoryStorageKey));
+  } catch {
+    return [];
+  }
 }

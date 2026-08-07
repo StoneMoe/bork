@@ -251,40 +251,59 @@ export default function Settings(props: SettingsProps) {
           </div>
           <div class="diagnostic-section">
             <div class="diagnostic-heading"><span>本机端点</span></div>
-            <Show when={diagnostics().listenAddress}>
-              <code class="diagnostic-value">{`${diagnostics().listenAddress}（UDP）`}</code>
-            </Show>
-            <Show when={!diagnostics().listenAddress}>
+            <Show when={diagnostics().listenAddress} fallback={
               <small class="empty-diagnostic">{props.state.room ? "正在打开本机 UDP 端点。" : "加入房间后打开 UDP 端点。"}</small>
+            }>
+              <code class="diagnostic-value">{`${diagnostics().listenAddress}（UDP）`}</code>
             </Show>
           </div>
           <div class="diagnostic-section">
             <div class="diagnostic-heading"><span>本机候选地址</span><b>{candidates().length}</b></div>
-            <ol class="candidate-list">
-              <For each={candidates()}>{(candidate) => <CandidateRow candidate={candidate} />}</For>
-            </ol>
-            <Show when={candidates().length === 0}>
-              <div class="empty-diagnostic">{props.state.room ? "尚未发现可用的本机候选地址。" : "加入房间后开始收集本机候选地址。"}</div>
+            <Show when={candidates().length > 0} fallback={
+              <small class="empty-diagnostic">{props.state.room ? "尚未发现可用的本机候选地址。" : "加入房间后开始收集本机候选地址。"}</small>
+            }>
+              <ol class="candidate-list">
+                <For each={candidates()}>{(candidate) => <CandidateRow candidate={candidate} />}</For>
+              </ol>
+            </Show>
+          </div>
+          <div class="diagnostic-section">
+            <div class="diagnostic-heading"><span>远端候选地址</span><b>{discoveryHints().length}</b></div>
+            <Show when={discoveryHints().length > 0} fallback={
+              <small class="empty-diagnostic">{props.state.room ? "尚未收到其他成员的候选地址。" : "加入房间后开始收集远端候选地址。"}</small>
+            }>
+              <ol class="candidate-list">
+                <For each={discoveryHints()}>{(hint) => (
+                  <li>
+                    <code>{hint.address}</code>
+                    <div class="address-origin"><b>{discoveryHintSourceLabel(hint.source)}</b><small>{formatDiscoveryHintExpiry(hint.expiresAt, now())}</small></div>
+                  </li>
+                )}</For>
+              </ol>
             </Show>
           </div>
           <div class="diagnostic-section">
             <div class="diagnostic-heading"><span>STUN 探测</span></div>
-            <ol class="stun-list">
-              <For each={stun()}>{(result) => (
-                <li classList={{ failed: !result.mappedAddress }} title={result.error || ""}>
-                  <span>{result.server}</span>
-                  <b>{result.mappedAddress ? `${result.rttMillis || 1} ms` : "失败"}</b>
-                </li>
-              )}</For>
-            </ol>
-            <Show when={stun().length === 0}>
-              <div class="empty-diagnostic">{props.state.room ? "尚未获得 STUN 探测结果。" : "加入房间后开始 STUN 探测。"}</div>
+            <Show when={stun().length > 0} fallback={
+              <small class="empty-diagnostic">{props.state.room ? "尚未获得 STUN 探测结果。" : "加入房间后开始 STUN 探测。"}</small>
+            }>
+              <ol class="stun-list">
+                <For each={stun()}>{(result) => (
+                  <li classList={{ failed: !result.mappedAddress }} title={result.error || ""}>
+                    <span>{result.server}</span>
+                    <b>{result.mappedAddress ? `${result.rttMillis || 1} ms` : "失败"}</b>
+                  </li>
+                )}</For>
+              </ol>
             </Show>
           </div>
           <div class="diagnostic-section">
             <div class="diagnostic-heading"><span>Tracker 公告</span></div>
-            <div class="tracker-groups">
-              <For each={trackerGroups().map((group) => group.provider)}>{(provider, groupIndex) => {
+            <Show when={trackers().length > 0} fallback={
+              <small class="empty-diagnostic">{props.state.room ? "尚未产生 Tracker announce 记录。" : "加入房间后开始 Tracker announce。"}</small>
+            }>
+              <div class="tracker-groups">
+                <For each={trackerGroups().map((group) => group.provider)}>{(provider, groupIndex) => {
                 const group = () => trackerGroups().find((candidate) => candidate.provider === provider)!;
                 return (
                   <article class="tracker-group">
@@ -299,16 +318,16 @@ export default function Settings(props: SettingsProps) {
                           classList={{ failed: Boolean(tracker().error), "tooltip-dismissed": dismissedTrackerTooltip() === tooltipKey }}
                           tabindex="0"
                           aria-describedby={tooltipID()}
-                          onFocus={() => { if (dismissedTrackerTooltip() === tooltipKey) setDismissedTrackerTooltip(""); }}
+                          onFocus={(event) => {
+                            if (dismissedTrackerTooltip() === tooltipKey) setDismissedTrackerTooltip("");
+                            positionTrackerPeerPopover(event.currentTarget);
+                          }}
                           onBlur={(event) => {
                             if (dismissedTrackerTooltip() === tooltipKey && !event.currentTarget.matches(":hover")) setDismissedTrackerTooltip("");
                           }}
-                          onPointerDown={(event) => {
-                            if (dismissedTrackerTooltip() === tooltipKey) setDismissedTrackerTooltip("");
-                            event.currentTarget.focus({ preventScroll: true });
-                          }}
+                          onPointerEnter={(event) => positionTrackerPeerPopover(event.currentTarget)}
                           onPointerLeave={(event) => {
-                            if (dismissedTrackerTooltip() === tooltipKey && !event.currentTarget.matches(":focus")) setDismissedTrackerTooltip("");
+                            if (dismissedTrackerTooltip() === tooltipKey && !event.currentTarget.matches(":focus-visible")) setDismissedTrackerTooltip("");
                           }}
                           onKeyDown={(event) => {
                             if (event.key !== "Escape") return;
@@ -334,26 +353,9 @@ export default function Settings(props: SettingsProps) {
                     }}</For>
                   </article>
                 );
-              }}</For>
-            </div>
-            <Show when={trackers().length === 0}>
-              <div class="empty-diagnostic">{props.state.room ? "尚未产生 Tracker announce 记录。" : "加入房间后开始 Tracker announce。"}</div>
+                }}</For>
+              </div>
             </Show>
-          </div>
-          <div class="diagnostic-section">
-            <div class="diagnostic-heading"><span>发现线索</span><b>{discoveryHints().length}</b></div>
-            <ol class="candidate-list">
-              <For each={discoveryHints()}>{(hint) => (
-                <li>
-                  <code>{hint.address}</code>
-                  <div class="address-origin"><b>{discoveryHintSourceLabel(hint.source)}</b><small>{formatDiscoveryHintExpiry(hint.expiresAt, now())}</small></div>
-                </li>
-              )}</For>
-            </ol>
-            <Show when={discoveryHints().length === 0}>
-              <div class="empty-diagnostic">{props.state.room ? "尚未收到其他成员的发现线索。" : "加入房间后开始发现其他成员。"}</div>
-            </Show>
-            <p class="diagnostic-note">有效期是发现线索在本机缓存中的剩余时间；到期未刷新会移除该地址，不代表现有连接会断开。</p>
           </div>
           <Show when={diagnosticErrors().length > 0}>
             <div class="diagnostic-section">
@@ -373,6 +375,17 @@ function formatRelativeTime(value: string, now: number): string {
   if (!Number.isFinite(target)) return "等待 announce";
   const seconds = Math.max(0, Math.ceil((target - now) / 1000));
   return `${seconds} 秒后`;
+}
+
+function positionTrackerPeerPopover(row: HTMLElement) {
+  const popover = row.querySelector<HTMLElement>(".tracker-peer-popover");
+  const viewport = row.closest<HTMLElement>(".settings-content");
+  if (!popover || !viewport) return;
+  const rowBounds = row.getBoundingClientRect();
+  const viewportBounds = viewport.getBoundingClientRect();
+  const spaceAbove = rowBounds.top - viewportBounds.top;
+  const spaceBelow = viewportBounds.bottom - rowBounds.bottom;
+  popover.classList.toggle("above", popover.offsetHeight > spaceBelow && spaceAbove > spaceBelow);
 }
 
 function CandidateRow(props: { candidate: Candidate }) {

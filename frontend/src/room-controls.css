@@ -4,11 +4,7 @@
   overflow-y: auto;
   overscroll-behavior: contain;
   border-bottom: 1px solid var(--line);
-  scrollbar-width: thin;
-  scrollbar-color: #4f5870 transparent;
 }
-.member-list::-webkit-scrollbar { width: 8px; }
-.member-list::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 8px; background: #4f5870; background-clip: padding-box; }
 
 .room-control-row {
   min-width: 0;
