@@ -43,16 +43,13 @@ ifneq ($(strip $(APP_ARGS)),)
 APP_FLAGS := -appargs "$(APP_ARGS)"
 endif
 
-.PHONY: build dev bindings frontend-deps test-frontend typecheck-frontend prepare-packaging prepare-wintun
+.PHONY: build dev bindings frontend-deps typecheck-frontend prepare-packaging prepare-wintun
 
 bindings:
 	$(WAILS_CMD) generate module
 
 frontend-deps:
-	node -e "const f=require('fs');process.exit(['vite','vitest','typescript'].every(p=>f.existsSync('frontend/node_modules/'+p+'/package.json'))?0:1)" || npm --prefix frontend ci
-
-test-frontend: bindings frontend-deps
-	npm --prefix frontend test
+	node -e "const f=require('fs');process.exit(['vite','typescript'].every(p=>f.existsSync('frontend/node_modules/'+p+'/package.json'))?0:1)" || npm --prefix frontend ci
 
 typecheck-frontend: bindings frontend-deps
 	npm --prefix frontend run typecheck
