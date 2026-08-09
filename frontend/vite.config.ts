@@ -1,5 +1,5 @@
 import { fileURLToPath, URL } from "node:url";
-import { defineConfig } from "vitest/config";
+import { defineConfig } from "vite";
 import solid from "vite-plugin-solid";
 
 export default defineConfig({
@@ -12,8 +12,5 @@ export default defineConfig({
   build: {
     outDir: "../internal/webassets/dist",
     emptyOutDir: true,
-  },
-  test: {
-    environment: "node",
   },
 });
