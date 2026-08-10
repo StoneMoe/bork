@@ -39,30 +39,28 @@ func (budget *tokenBudget) allowCost(now time.Time, cost, rate, burst float64) b
 }
 
 type PeeringSession struct {
-	ciphers                       protocol.SessionCiphers
-	sessionID                     [16]byte
-	path                          Path
-	candidatePath                 *pathProbe
-	authenticated                 bool
-	everAuthenticated             bool
-	control                       controlFlow
-	reliable                      *reliableTransport
-	lastAuthenticatedPacketAt     time.Time
-	rttMillis                     int64
-	pendingPing                   pendingPing
-	lastHelloSentAt               time.Time
-	bridgeControlBudget           tokenBudget
-	lastTopologyAt                time.Time
-	topologySentGeneration        uint64
-	topologyReceivedGeneration    uint64
-	memberStateSentGeneration     uint64
-	remoteMemberState             memberState
-	screenStateSentGeneration     uint64
-	remoteScreenState             screenState
-	audioStreamID                 [16]byte
-	inboundFanout                 fanoutAssignment
-	virtualLANStateSentGeneration uint64
-	remoteVirtualLAN              virtualLANState
+	ciphers                    protocol.SessionCiphers
+	sessionID                  [16]byte
+	path                       Path
+	candidatePath              *pathProbe
+	authenticated              bool
+	everAuthenticated          bool
+	control                    controlFlow
+	reliable                   *reliableTransport
+	lastAuthenticatedPacketAt  time.Time
+	rttMillis                  int64
+	pendingPing                pendingPing
+	lastHelloSentAt            time.Time
+	bridgeControlBudget        tokenBudget
+	lastTopologyAt             time.Time
+	topologySentGeneration     uint64
+	topologyReceivedGeneration uint64
+	memberStateSentGeneration  uint64
+	remoteMemberState          memberState
+	screenStateSentGeneration  uint64
+	remoteScreenState          screenState
+	audioStreamID              [16]byte
+	inboundFanout              fanoutAssignment
 }
 
 func newPeeringSession(path Path, material protocol.SessionMaterial, now time.Time) *PeeringSession {

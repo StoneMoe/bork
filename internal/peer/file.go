@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	reliableChannelFileControl = 6
-	reliableChannelFileData    = 7
+	reliableChannelFileControl = 5
+	reliableChannelFileData    = 6
 	fileProtocolVersion        = 1
 	fileChunkSize              = 32 << 10
 	MaxFileTransferBytes       = 1 << 30

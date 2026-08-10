@@ -484,13 +484,11 @@ func (a *App) snapshot() AppSnapshot {
 		if room != nil {
 			peerSnapshot, networkSnapshot := room.client.StateSnapshot()
 			state.Room = &RoomState{
-				Name:             peerSnapshot.Name,
-				Phase:            peerSnapshot.Phase,
-				ScreenSharing:    peerSnapshot.ScreenSharing,
-				RemotePeers:      make([]RemotePeer, 0, len(peerSnapshot.RemotePeers)),
-				Transfers:        projectTransfers(peerSnapshot.Transfers, peerSnapshot.RemotePeers),
-				VirtualLAN:       projectVirtualLAN(peerSnapshot.VirtualLAN),
-				RemoteVirtualLAN: projectRemoteVirtualLAN(peerSnapshot.RemoteVirtualLAN, peerSnapshot.RemotePeers),
+				Name:          peerSnapshot.Name,
+				Phase:         peerSnapshot.Phase,
+				ScreenSharing: peerSnapshot.ScreenSharing,
+				RemotePeers:   make([]RemotePeer, 0, len(peerSnapshot.RemotePeers)),
+				Transfers:     projectTransfers(peerSnapshot.Transfers, peerSnapshot.RemotePeers),
 			}
 			for _, remotePeer := range peerSnapshot.RemotePeers {
 				state.Room.RemotePeers = append(state.Room.RemotePeers, projectRemotePeer(remotePeer))

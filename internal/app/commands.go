@@ -31,14 +31,6 @@ func (a *App) GetInvite() (string, error) {
 	return client.EncodedInvite(), nil
 }
 
-func (a *App) EnableVirtualLAN() error {
-	return a.runWaitingClientCommand((*peer.Client).EnableVirtualLAN)
-}
-
-func (a *App) DisableVirtualLAN() error {
-	return a.runWaitingClientCommand((*peer.Client).DisableVirtualLAN)
-}
-
 func (a *App) OfferFile(recipientPeerID string) (string, error) {
 	if err := a.waitForStartup(); err != nil {
 		return "", err
@@ -134,23 +126,6 @@ func (a *App) runClientCommand(command func(*peer.Client) error) error {
 		return errors.New("application is shutting down")
 	}
 	client, err := a.activeClient()
-	if err != nil {
-		return err
-	}
-	return command(client)
-}
-
-func (a *App) runWaitingClientCommand(command func(*peer.Client) error) error {
-	if err := a.waitForStartup(); err != nil {
-		return err
-	}
-	a.commandMu.Lock()
-	if a.isShuttingDown() {
-		a.commandMu.Unlock()
-		return errors.New("application is shutting down")
-	}
-	client, err := a.activeClient()
-	a.commandMu.Unlock()
 	if err != nil {
 		return err
 	}

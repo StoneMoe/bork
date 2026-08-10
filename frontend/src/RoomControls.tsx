@@ -19,15 +19,6 @@ interface RoomControlRowProps extends ActionProps {
 export function RoomControlRow(props: RoomControlRowProps) {
   const [fileShareOpen, setFileShareOpen] = createSignal(false);
   let fileShareButton: HTMLButtonElement | undefined;
-  const virtualLANActive = () => ["enabled", "conflict"].includes(props.state.room!.virtualLAN.status);
-  const virtualLANDescription = () => {
-    const virtualLAN = props.state.room!.virtualLAN;
-    if (virtualLAN.address) return virtualLAN.address;
-    if (virtualLAN.error) return "启用失败";
-    if (virtualLAN.status === "enabling") return "正在建立虚拟网络";
-    if (virtualLAN.status === "disabling") return "正在停用虚拟网络";
-    return "建立虚拟网络";
-  };
   const incomingFile = () => props.state.room?.transfers.some((transfer) => transfer.direction === "incoming" && transfer.status === "offered");
 
   return (
@@ -71,22 +62,6 @@ export function RoomControlRow(props: RoomControlRowProps) {
             <span>
               <strong>文件分享</strong>
               <small>{props.state.room?.transfers.length ? `${props.state.room.transfers.length} 条记录` : "选择成员发送"}</small>
-            </span>
-          </button>
-          <button
-            class="feature-button"
-            classList={{ active: virtualLANActive(), failed: props.state.room!.virtualLAN.status === "error" }}
-            type="button"
-            disabled={props.busy || !props.ready || ["enabling", "disabling"].includes(props.state.room!.virtualLAN.status)}
-            aria-label={virtualLANActive() ? "停用虚拟局域网" : "建立虚拟网络"}
-            aria-pressed={virtualLANActive()}
-            title={props.state.room!.virtualLAN.error || props.state.room!.virtualLAN.address || "建立虚拟网络"}
-            onClick={() => props.runAction(virtualLANActive() ? Backend.DisableVirtualLAN : Backend.EnableVirtualLAN)}
-          >
-            <VirtualLANIcon />
-            <span>
-              <strong>{virtualLANActive() ? "停用虚拟局域网" : props.state.room!.virtualLAN.status === "enabling" ? "正在启用…" : "虚拟局域网"}</strong>
-              <small>{virtualLANDescription()}</small>
             </span>
           </button>
         </div>
@@ -359,7 +334,6 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
             <span><small>连接</small><b>{remoteTransport(selectedRemote()!)} · {selectedRemote()!.rttMillis || 1} ms</b></span>
             <span><small>{selectedRemote()!.transport === "bridge" ? "下一跳" : "远端地址"}</small><code>{selectedRemote()!.address}</code></span>
             <span><small>状态</small><b>{remoteStatus(selectedRemote()!)}</b></span>
-            <span><small>Virtual LAN</small><code>{props.state.room?.remoteVirtualLAN.find((entry) => entry.peerId === selectedRemote()!.peerId)?.address || "未启用"}</code></span>
           </div>
         )}>
           <div class="member-info-grid">
@@ -368,7 +342,6 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
             <span><small>本机端点</small><code>{props.state.diagnostics.listenAddress || "尚未打开"}</code></span>
             <span><small>房间状态</small><b>{props.state.room?.phase || "未知"}</b></span>
             <span><small>音频状态</small><b>{localStatus()}</b></span>
-            <span><small>Virtual LAN</small><code>{props.state.room?.virtualLAN.address || "未启用"}</code></span>
           </div>
         </Show>
       </aside>
@@ -692,15 +665,6 @@ function FileShareIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M6 3h8l4 4v14H6zM14 3v5h5M9 14h6M12 11v6" />
-    </svg>
-  );
-}
-
-function VirtualLANIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <circle cx="5" cy="12" r="2.5" /><circle cx="19" cy="6" r="2.5" /><circle cx="19" cy="18" r="2.5" />
-      <path d="M7.5 11 16.5 7M7.5 13l9 4" />
     </svg>
   );
 }

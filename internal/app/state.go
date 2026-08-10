@@ -28,27 +28,11 @@ type RemotePeer struct {
 }
 
 type RoomState struct {
-	Name             string             `json:"name"`
-	Phase            string             `json:"phase"`
-	ScreenSharing    bool               `json:"screenSharing"`
-	RemotePeers      []RemotePeer       `json:"remotePeers"`
-	Transfers        []FileTransfer     `json:"transfers"`
-	VirtualLAN       VirtualLAN         `json:"virtualLAN"`
-	RemoteVirtualLAN []RemoteVirtualLAN `json:"remoteVirtualLAN"`
-}
-
-type VirtualLAN struct {
-	Status    string `json:"status"`
-	Address   string `json:"address"`
-	Interface string `json:"interface"`
-	Error     string `json:"error"`
-}
-
-type RemoteVirtualLAN struct {
-	PeerID   string `json:"peerId"`
-	Nickname string `json:"nickname"`
-	Address  string `json:"address"`
-	Conflict bool   `json:"conflict"`
+	Name          string         `json:"name"`
+	Phase         string         `json:"phase"`
+	ScreenSharing bool           `json:"screenSharing"`
+	RemotePeers   []RemotePeer   `json:"remotePeers"`
+	Transfers     []FileTransfer `json:"transfers"`
 }
 
 type FileTransfer struct {
@@ -131,25 +115,6 @@ func projectTransfers(transfers []peer.FileTransferSnapshot, remotePeers []peer.
 			value.SavedPath = transfer.Path
 		}
 		projected = append(projected, value)
-	}
-	return projected
-}
-
-func projectVirtualLAN(snapshot peer.VirtualLANSnapshot) VirtualLAN {
-	if snapshot.Status == "" {
-		snapshot.Status = "disabled"
-	}
-	return VirtualLAN{Status: snapshot.Status, Address: snapshot.Address, Interface: snapshot.Interface, Error: snapshot.Error}
-}
-
-func projectRemoteVirtualLAN(snapshots []peer.RemoteVirtualLANSnapshot, remotePeers []peer.RemotePeerSnapshot) []RemoteVirtualLAN {
-	nicknames := make(map[string]string, len(remotePeers))
-	for _, remotePeer := range remotePeers {
-		nicknames[remotePeer.PeerID] = remotePeer.Nickname
-	}
-	projected := make([]RemoteVirtualLAN, 0, len(snapshots))
-	for _, snapshot := range snapshots {
-		projected = append(projected, RemoteVirtualLAN{PeerID: snapshot.PeerID, Nickname: nicknames[snapshot.PeerID], Address: snapshot.Address, Conflict: snapshot.Conflict})
 	}
 	return projected
 }

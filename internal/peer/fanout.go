@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
+	"slices"
 	"sort"
 	"time"
 
@@ -127,10 +128,10 @@ func constrainFanoutToActivePaths(plan outboundFanout, peers map[string]*RemoteP
 	sort.Strings(targets)
 	for _, targetID := range targets {
 		forwarderID := forced[targetID]
-		if !containsPeerID(plan.destinations, forwarderID) {
+		if !slices.Contains(plan.destinations, forwarderID) {
 			plan.destinations = append(plan.destinations, forwarderID)
 		}
-		if !containsPeerID(plan.assignments[forwarderID], targetID) {
+		if !slices.Contains(plan.assignments[forwarderID], targetID) {
 			plan.assignments[forwarderID] = append(plan.assignments[forwarderID], targetID)
 			sort.Strings(plan.assignments[forwarderID])
 		}
@@ -253,10 +254,6 @@ func (c *Client) handleReliableMessage(sender *RemotePeer, message deliveredReli
 	}
 	if message.channel == reliableChannelScreenState {
 		c.handleScreenState(sender, message.payload)
-		return
-	}
-	if message.channel == reliableChannelVirtualLAN {
-		c.handleVirtualLANState(sender, message.payload)
 		return
 	}
 	if message.channel == reliableChannelFileControl || message.channel == reliableChannelFileData {

@@ -14,9 +14,8 @@ import (
 type TrafficClass byte
 
 const (
-	TrafficAudio TrafficClass = 1 + iota
+	TrafficAudio TrafficClass = iota + 1
 	TrafficInteractive
-	TrafficCustomRealtime
 )
 
 type GroupDatagramHeader struct {
@@ -32,7 +31,7 @@ type GroupDatagram struct {
 }
 
 func validTrafficClass(class TrafficClass) bool {
-	return class >= TrafficAudio && class <= TrafficCustomRealtime
+	return class >= TrafficAudio && class <= TrafficInteractive
 }
 
 func NewGroupDatagramCipher(groupKey [32]byte) cipher.AEAD {

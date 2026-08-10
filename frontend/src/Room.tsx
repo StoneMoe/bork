@@ -99,12 +99,6 @@ export default function Room(props: RoomProps) {
     const peerCount = remotePeers().length;
     if (previousPeerCount > 0 && peerCount === 0) {
       if (captureBusy() || displayStream || currentCaptureID || props.state.room?.screenSharing) void stopScreenShare(true);
-      if (["enabling", "enabled", "conflict"].includes(props.state.room?.virtualLAN.status || "")) {
-        void Backend.DisableVirtualLAN().catch((cause) => {
-          const message = cause instanceof Error ? cause.message : String(cause || "虚拟局域网停用失败");
-          props.reportError(message.replace(/^Error:\s*/, ""));
-        });
-      }
       queueMicrotask(() => {
         const active = document.activeElement;
         if (!active || active === document.body || !active.isConnected) focusRoomFallback();

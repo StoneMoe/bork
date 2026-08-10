@@ -629,7 +629,6 @@ func (c *Client) handleSessionPacketOnPath(data []byte, packetPath Path) {
 		}
 		if candidateSession {
 			if remotePeer.session != nil && remotePeer.session != peerSess {
-				c.removeVirtualLANPeer(remotePeer.identity.PeerID())
 				remotePeer.session.authenticated = false
 			}
 			remotePeer.session = peerSess
@@ -656,7 +655,6 @@ func (c *Client) handleSessionPacketOnPath(data []byte, packetPath Path) {
 	if peerSess.authenticated && (!wasAuthenticated || promoted) {
 		c.queueMemberStates()
 		c.queueScreenStates()
-		c.queueVirtualLANStates()
 	}
 	if remotePeerChanged {
 		c.rememberTopologyPeer(remotePeer.identity, now)
@@ -701,7 +699,6 @@ func (c *Client) expireRemotePeers() {
 				}
 			}
 			if peerSess.authenticated && peerSess.lastAuthenticatedPacketAt.Before(failoverCutoff) {
-				c.removeVirtualLANPeer(peerID)
 				topologyChanged = topologyChanged || peerSess.path.IsDirect()
 				peerSess.authenticated = false
 				peerSess.pendingPing = pendingPing{}

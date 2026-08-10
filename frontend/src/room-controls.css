@@ -23,7 +23,7 @@
   max-width: 440px;
   flex: 1;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 7px;
 }
 
@@ -42,11 +42,10 @@
   text-align: left;
 }
 
-.feature-button:not(.active):not(.attention):not(.failed):not(.open):hover:not(:disabled),
-.feature-button:not(.active):not(.attention):not(.failed):not(.open):focus-visible { border-color: rgba(145, 167, 232, 0.52); color: #eef1fa; background-color: rgba(145, 167, 232, 0.045); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14); }
+.feature-button:not(.active):not(.attention):not(.open):hover:not(:disabled),
+.feature-button:not(.active):not(.attention):not(.open):focus-visible { border-color: rgba(145, 167, 232, 0.52); color: #eef1fa; background-color: rgba(145, 167, 232, 0.045); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14); }
 .feature-button.active { border-color: rgba(103, 225, 174, 0.34); color: #83dfba; background: rgba(103, 225, 174, 0.045); box-shadow: inset 0 0 0 1px rgba(103, 225, 174, 0.06); }
 .feature-button.attention { border-color: rgba(225, 184, 103, 0.5); color: #e4c47f; }
-.feature-button.failed { border-color: rgba(217, 135, 122, 0.44); color: var(--danger); }
 .feature-button.open { border-color: rgba(145, 167, 232, 0.52); color: #dce4fb; background: rgba(145, 167, 232, 0.07); box-shadow: inset 0 0 0 1px rgba(145, 167, 232, 0.08); }
 .feature-button:disabled { cursor: wait; opacity: 0.52; }
 .feature-button svg { width: 19px; height: 19px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.6; }

@@ -43,14 +43,12 @@ type roomNetwork interface {
 type roomNetworkFactory func() roomNetwork
 
 type ClientSnapshot struct {
-	Name             string
-	Phase            string
-	ScreenSharing    bool
-	RemotePeers      []RemotePeerSnapshot
-	Transfers        []FileTransferSnapshot
-	VirtualLAN       VirtualLANSnapshot
-	RemoteVirtualLAN []RemoteVirtualLANSnapshot
-	Connectivity     ConnectivitySnapshot
+	Name          string
+	Phase         string
+	ScreenSharing bool
+	RemotePeers   []RemotePeerSnapshot
+	Transfers     []FileTransferSnapshot
+	Connectivity  ConnectivitySnapshot
 }
 
 type ConnectivitySnapshot struct {
@@ -76,8 +74,6 @@ type Client struct {
 	screenVideoChunks  chan ScreenVideoChunk
 	fileCommands       chan fileCommand
 	fileWorkResults    chan fileWorkResult
-	virtualLANCommands chan virtualLANCommand
-	virtualLANEvents   chan virtualLANEvent
 	loopReady          chan struct{}
 	loopDone           chan struct{}
 	fileContext        context.Context
@@ -112,15 +108,6 @@ type Client struct {
 	screenVideoSendSequence    uint64
 	screenVideoChunkID         uint32
 	fileTransfers              map[[16]byte]*fileTransfer
-	localVirtualLAN            virtualLANState
-	virtualLANSendSequence     uint64
-	virtualLANStatus           string
-	virtualLANError            string
-	virtualLANInterface        string
-	virtualLANWorker           *virtualLANWorker
-	virtualLANPending          chan error
-	virtualLANCreate           virtualLANCreate
-	virtualLANConfigure        virtualLANConfigure
 
 	stateChanges chan struct{}
 	started      atomic.Bool
@@ -149,7 +136,7 @@ func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, 
 		roomInvite:           roomInvite,
 		logger:               logger,
 		networkFactory:       networkFactory,
-		snapshot:             ClientSnapshot{Name: roomInvite.DisplayName, Phase: "gathering", RemotePeers: []RemotePeerSnapshot{}, RemoteVirtualLAN: []RemoteVirtualLANSnapshot{}},
+		snapshot:             ClientSnapshot{Name: roomInvite.DisplayName, Phase: "gathering", RemotePeers: []RemotePeerSnapshot{}},
 		roomTag:              roomInvite.RoomTag(),
 		admissionKey:         roomInvite.AdmissionKey(),
 		discoveredAddresses:  make(map[netip.AddrPort]discoveredAddress),
@@ -161,8 +148,6 @@ func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, 
 		screenVideoChunks:    make(chan ScreenVideoChunk, maxCompletedScreenVideoChunks),
 		fileCommands:         make(chan fileCommand),
 		fileWorkResults:      make(chan fileWorkResult, 64),
-		virtualLANCommands:   make(chan virtualLANCommand),
-		virtualLANEvents:     make(chan virtualLANEvent, maxVirtualLANEvents),
 		loopReady:            make(chan struct{}),
 		loopDone:             make(chan struct{}),
 		localMemberState:     memberState{generation: 1},
@@ -172,10 +157,6 @@ func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, 
 		groupReceivers:       make(map[groupStreamKey]*groupReceiveState),
 		screenVideoReceivers: make(map[groupStreamKey]*screenVideoReceiveState),
 		fileTransfers:        make(map[[16]byte]*fileTransfer),
-		localVirtualLAN:      virtualLANState{generation: 1},
-		virtualLANStatus:     "disabled",
-		virtualLANCreate:     createVirtualLANDevice,
-		virtualLANConfigure:  configureVirtualLANPlatform,
 		fanoutDirty:          true,
 	}
 	copy(client.groupSenderID[:], localIdentity.PublicKey())
@@ -202,7 +183,6 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	ctx, cancel := context.WithCancel(parent)
 	c.fileContext = ctx
 	defer func() {
-		c.stopVirtualLAN()
 		c.stopFileTransfers()
 		cancel()
 		c.fileWorkers.Wait()
@@ -284,10 +264,6 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 			c.handleFileCommand(command)
 		case result := <-c.fileWorkResults:
 			c.handleFileWorkResult(result)
-		case command := <-c.virtualLANCommands:
-			c.handleVirtualLANCommand(command)
-		case event := <-c.virtualLANEvents:
-			c.handleVirtualLANEvent(event)
 		case _, ok := <-networkChanges:
 			if !ok {
 				networkChanges = nil
@@ -341,7 +317,6 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 		case now := <-reliableTicker.C:
 			c.queueMemberStates()
 			c.queueScreenStates()
-			c.queueVirtualLANStates()
 			c.sendReliable(now)
 		case now := <-cleanupTicker.C:
 			c.expireRemotePeers()
@@ -402,7 +377,6 @@ func (c *Client) StateSnapshot() (ClientSnapshot, networking.RoomSnapshot) {
 	snapshot := c.snapshot
 	snapshot.RemotePeers = append([]RemotePeerSnapshot{}, snapshot.RemotePeers...)
 	snapshot.Transfers = append([]FileTransferSnapshot{}, snapshot.Transfers...)
-	snapshot.RemoteVirtualLAN = append([]RemoteVirtualLANSnapshot{}, snapshot.RemoteVirtualLAN...)
 	snapshot.Connectivity.DiscoveryHints = append([]DiscoveryHintSnapshot{}, snapshot.Connectivity.DiscoveryHints...)
 	return snapshot, c.networkSnapshot.Clone()
 }
@@ -447,14 +421,12 @@ func (c *Client) publishStateChange() {
 
 func (c *Client) refreshSnapshotLocked() {
 	c.snapshot = ClientSnapshot{
-		Name:             c.roomInvite.DisplayName,
-		Phase:            c.phase(),
-		ScreenSharing:    c.localScreenState.active,
-		RemotePeers:      c.remotePeerSnapshots(),
-		Transfers:        c.fileTransferSnapshots(),
-		VirtualLAN:       c.virtualLANSnapshot(),
-		RemoteVirtualLAN: c.remoteVirtualLANSnapshots(),
-		Connectivity:     c.connectivitySnapshot(),
+		Name:          c.roomInvite.DisplayName,
+		Phase:         c.phase(),
+		ScreenSharing: c.localScreenState.active,
+		RemotePeers:   c.remotePeerSnapshots(),
+		Transfers:     c.fileTransferSnapshots(),
+		Connectivity:  c.connectivitySnapshot(),
 	}
 }
 

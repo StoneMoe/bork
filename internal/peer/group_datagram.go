@@ -93,7 +93,7 @@ func (c *Client) sendGroupMedia(frame media.SendFrame) {
 
 func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.PeerPort) {
 	header, err := protocol.ParseGroupDatagramHeader(packet.Data, c.roomTag)
-	if err != nil || (header.Class != protocol.TrafficAudio && header.Class != protocol.TrafficInteractive && header.Class != protocol.TrafficCustomRealtime) || header.SenderID == c.groupSenderID {
+	if err != nil || (header.Class != protocol.TrafficAudio && header.Class != protocol.TrafficInteractive) || header.SenderID == c.groupSenderID {
 		return
 	}
 	remoteIdentity, err := identity.FromPublicKey(ed25519.PublicKey(header.SenderID[:]))
@@ -102,10 +102,6 @@ func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.P
 	}
 	remote := c.remotePeers[remoteIdentity.PeerID()]
 	if remote == nil || remote.session == nil || !remote.session.authenticated {
-		return
-	}
-	if header.Class == protocol.TrafficCustomRealtime {
-		c.handleVirtualLANDatagram(remote, header, packet)
 		return
 	}
 	if !c.authenticatedDirectSource(packet.From) {
@@ -149,9 +145,6 @@ func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.P
 			var oldestAt time.Time
 			found := false
 			for candidate, retained := range c.groupReceivers {
-				if candidate.class == protocol.TrafficCustomRealtime {
-					continue
-				}
 				if !found || retained.lastSeen.Before(oldestAt) {
 					oldestKey = candidate
 					oldestAt = retained.lastSeen
@@ -228,9 +221,6 @@ func (c *Client) authenticatedDirectSource(address netip.AddrPort) bool {
 
 func (c *Client) expireGroupStreams(now time.Time) {
 	for key, state := range c.groupReceivers {
-		if key.class == protocol.TrafficCustomRealtime {
-			continue
-		}
 		if state.lastSeen.Add(groupStreamIdle).Before(now) {
 			delete(c.groupReceivers, key)
 			c.removeScreenVideoAssembly(key)
