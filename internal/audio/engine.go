@@ -67,7 +67,6 @@ type Engine struct {
 	echoCancellation            atomic.Bool
 	noiseSuppression            atomic.Bool
 	remoteLoudnessNormalization atomic.Bool
-	targetBitrate               atomic.Int64
 	statusChanges               chan struct{}
 	closed                      bool
 }
@@ -96,27 +95,12 @@ func New(options Options, logger *slog.Logger) (*Engine, error) {
 	engine.echoCancellation.Store(true)
 	engine.noiseSuppression.Store(true)
 	engine.remoteLoudnessNormalization.Store(true)
-	engine.targetBitrate.Store(defaultVoiceBitrate)
 	if err := engine.refreshDevicesLocked(); err != nil {
 		_ = audioContext.Uninit()
 		audioContext.Free()
 		return nil, err
 	}
 	return engine, nil
-}
-
-// RecommendedVoiceBitrate lowers per-speaker bitrate continuously as room
-// membership grows. It is a quality adaptation, not a membership limit.
-func RecommendedVoiceBitrate(members int) int {
-	if members <= 16 {
-		return defaultVoiceBitrate
-	}
-	bitrate := int(float64(defaultVoiceBitrate) * math.Sqrt(16/float64(members)))
-	return max(minimumVoiceBitrate, min(defaultVoiceBitrate, bitrate))
-}
-
-func (e *Engine) SetVoiceBitrate(bitrate int) {
-	e.targetBitrate.Store(int64(max(minimumVoiceBitrate, min(defaultVoiceBitrate, bitrate))))
 }
 
 func preferredBackends() []malgo.Backend {
@@ -616,7 +600,6 @@ func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrame
 	processedNoiseSuppression := e.noiseSuppression.Load()
 	var lastProcessedTimestamp uint32
 	var localSpeaking speakingHold
-	encoderBitrate := defaultVoiceBitrate
 	appliedCaptureGain := float32(e.captureGain.Load()) / 100
 	for {
 		select {
@@ -670,14 +653,6 @@ func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrame
 				appliedCaptureGain = applyGainRamp(frame.Samples[:], appliedCaptureGain, targetGain)
 				if run.active.Load() && !captureMuted && localSpeaking.update(speakingFrame(frame.Samples[:])) {
 					e.setLocalSpeaking(run, generation, localSpeaking.active())
-				}
-				targetBitrate := int(e.targetBitrate.Load())
-				if targetBitrate != encoderBitrate {
-					if err := encoder.codec.SetBitrate(targetBitrate); err != nil {
-						e.setRuntimeError(fmt.Errorf("configure Opus bitrate: %w", err))
-					} else {
-						encoderBitrate = targetBitrate
-					}
 				}
 				payload, err := encoder.Encode(frame.Samples[:])
 				timestamp := frame.Timestamp

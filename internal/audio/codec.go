@@ -6,10 +6,7 @@ import (
 	"github.com/thesyncim/gopus"
 )
 
-const (
-	defaultVoiceBitrate = 24000
-	minimumVoiceBitrate = 12000
-)
+const defaultVoiceBitrate = 24000
 
 type opusEncoder struct {
 	codec         *gopus.Encoder

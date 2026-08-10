@@ -413,8 +413,6 @@ func (a *App) reconcileAudioLocked(room *roomSession) {
 	if audioEngine == nil || !isActiveRoom {
 		return
 	}
-	remotePeerCount := room.client.RemotePeerCount()
-	audioEngine.SetVoiceBitrate(audio.RecommendedVoiceBitrate(remotePeerCount + 1))
 	status := audioEngine.Status()
 	if status.Running || !status.Available {
 		return
