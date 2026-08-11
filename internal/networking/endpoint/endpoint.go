@@ -36,33 +36,6 @@ const (
 	maxInteractiveWriteTime   = 50 * time.Millisecond
 	maxNonAudioWriteTime      = 2 * time.Millisecond
 	controlWriteTimeout       = time.Second
-	controlSourceRate         = 64.0
-	controlSourceBurst        = 64.0
-	controlGlobalRate         = 512.0
-	controlGlobalBurst        = 256.0
-	maxControlSources         = 256
-	reliableSourceRate        = 2048.0
-	reliableSourceBurst       = 256.0
-	reliableGlobalRate        = 8192.0
-	reliableGlobalBurst       = 1024.0
-	maxReliableSources        = 256
-	bridgeSourceRate          = 2048.0
-	bridgeSourceBurst         = 256.0
-	bridgeGlobalRate          = 8192.0
-	bridgeGlobalBurst         = 1024.0
-	maxBridgeSources          = 256
-	audioGlobalRate           = 10000.0
-	audioGlobalBurst          = 1000.0
-	// A forwarder may aggregate audio streams; the peer layer still applies
-	// the signed per-stream 120 pps limit after authentication.
-	audioIPRate            = 2000.0
-	audioIPBurst           = 400.0
-	maxAudioSources        = 256
-	interactiveSourceRate  = 1000.0
-	interactiveSourceBurst = 300.0
-	interactiveGlobalRate  = 5000.0
-	interactiveGlobalBurst = 1000.0
-	maxInteractiveSources  = 256
 )
 
 type Datagram struct {
@@ -117,26 +90,6 @@ type pendingTracker struct {
 	server         netip.AddrPort
 	expectedAction uint32
 	result         chan []byte
-}
-
-type tokenBucket struct {
-	tokens    float64
-	updatedAt time.Time
-}
-
-type ingressSource struct {
-	bucket   tokenBucket
-	lastSeen time.Time
-}
-
-type ingressLimiter struct {
-	sourceRate  float64
-	sourceBurst float64
-	globalRate  float64
-	globalBurst float64
-	maxSources  int
-	global      tokenBucket
-	sources     map[netip.AddrPort]ingressSource
 }
 
 type Endpoint struct {
@@ -504,11 +457,6 @@ func unsupportedAddressFamily(err error) bool {
 
 func (e *Endpoint) readLoop(conn *net.UDPConn) error {
 	buffer := make([]byte, udpReceiveBufferSize)
-	controlLimiter := newIngressLimiter(controlSourceRate, controlSourceBurst, controlGlobalRate, controlGlobalBurst, maxControlSources)
-	reliableLimiter := newIngressLimiter(reliableSourceRate, reliableSourceBurst, reliableGlobalRate, reliableGlobalBurst, maxReliableSources)
-	bridgeLimiter := newIngressLimiter(bridgeSourceRate, bridgeSourceBurst, bridgeGlobalRate, bridgeGlobalBurst, maxBridgeSources)
-	audioIPLimiter := newIngressLimiter(audioIPRate, audioIPBurst, audioGlobalRate, audioGlobalBurst, maxAudioSources)
-	interactiveLimiter := newIngressLimiter(interactiveSourceRate, interactiveSourceBurst, interactiveGlobalRate, interactiveGlobalBurst, maxInteractiveSources)
 	for {
 		count, remote, err := conn.ReadFromUDPAddrPort(buffer)
 		if err != nil {
@@ -553,30 +501,6 @@ func (e *Endpoint) readLoop(conn *net.UDPConn) error {
 			continue
 		}
 		receivedAt := time.Now()
-		switch class {
-		case packetControl:
-			controlSource := netip.AddrPortFrom(remote.Addr(), 0)
-			if !controlLimiter.allow(controlSource, receivedAt) {
-				continue
-			}
-		case packetReliable:
-			if !reliableLimiter.allow(remote, receivedAt) {
-				continue
-			}
-		case packetBridge:
-			if !bridgeLimiter.allow(remote, receivedAt) {
-				continue
-			}
-		case packetAudio:
-			audioIPSource := netip.AddrPortFrom(remote.Addr(), 0)
-			if !audioIPLimiter.allow(audioIPSource, receivedAt) {
-				continue
-			}
-		case packetInteractive:
-			if !interactiveLimiter.allow(remote, receivedAt) {
-				continue
-			}
-		}
 		packetData := append([]byte(nil), buffer[:count]...)
 		packet := Datagram{Data: packetData, From: remote, ReceivedAt: receivedAt}
 		switch class {
@@ -591,58 +515,6 @@ func (e *Endpoint) readLoop(conn *net.UDPConn) error {
 		case packetInteractive:
 			enqueueFresh(e.interactivePackets, packet)
 		}
-	}
-}
-
-func newIngressLimiter(sourceRate, sourceBurst, globalRate, globalBurst float64, maxSources int) *ingressLimiter {
-	return &ingressLimiter{
-		sourceRate:  sourceRate,
-		sourceBurst: sourceBurst,
-		globalRate:  globalRate,
-		globalBurst: globalBurst,
-		maxSources:  maxSources,
-		sources:     make(map[netip.AddrPort]ingressSource),
-	}
-}
-
-func (l *ingressLimiter) allow(source netip.AddrPort, now time.Time) bool {
-	l.global.refill(now, l.globalRate, l.globalBurst)
-	if l.global.tokens < 1 {
-		return false
-	}
-	entry, exists := l.sources[source]
-	if !exists {
-		if len(l.sources) >= l.maxSources {
-			var oldest netip.AddrPort
-			var oldestAt time.Time
-			for address, candidate := range l.sources {
-				if !oldest.IsValid() || candidate.lastSeen.Before(oldestAt) {
-					oldest = address
-					oldestAt = candidate.lastSeen
-				}
-			}
-			delete(l.sources, oldest)
-		}
-	}
-	entry.lastSeen = now
-	entry.bucket.refill(now, l.sourceRate, l.sourceBurst)
-	if entry.bucket.tokens < 1 {
-		l.sources[source] = entry
-		return false
-	}
-	entry.bucket.tokens--
-	l.global.tokens--
-	l.sources[source] = entry
-	return true
-}
-
-func (b *tokenBucket) refill(now time.Time, rate, burst float64) {
-	if b.updatedAt.IsZero() {
-		b.tokens = burst
-		b.updatedAt = now
-	} else if now.After(b.updatedAt) {
-		b.tokens = min(burst, b.tokens+now.Sub(b.updatedAt).Seconds()*rate)
-		b.updatedAt = now
 	}
 }
 

@@ -14,11 +14,7 @@ import (
 )
 
 const (
-	groupPacketsPerSecond       = 120.0
-	groupPacketBurst            = 24.0
-	screenVideoPacketsPerSecond = 192.0
-	screenVideoPacketBurst      = float64(maxScreenVideoFragments)
-	groupStreamIdle             = 30 * time.Second
+	groupStreamIdle = 30 * time.Second
 	// Signed room members can create arbitrary StreamIDs; bound retained replay
 	// state without imposing a member or concurrent-speaker product limit.
 	maxGroupReceiveStreams = 4096
@@ -32,7 +28,6 @@ type groupStreamKey struct {
 
 type groupReceiveState struct {
 	sequenceWindow
-	tokenBudget
 	lastSeen time.Time
 }
 
@@ -163,13 +158,6 @@ func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.P
 	now := packet.ReceivedAt
 	if now.IsZero() {
 		now = time.Now()
-	}
-	rate, burst := groupPacketsPerSecond, groupPacketBurst
-	if header.Class == protocol.TrafficInteractive {
-		rate, burst = screenVideoPacketsPerSecond, screenVideoPacketBurst
-	}
-	if !state.allowCost(now, 1, rate, burst) {
-		return
 	}
 	state.lastSeen = now
 	if header.Class == protocol.TrafficInteractive {

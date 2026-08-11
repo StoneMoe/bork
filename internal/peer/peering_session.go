@@ -18,26 +18,6 @@ type pathProbe struct {
 	pendingPing pendingPing
 }
 
-type tokenBudget struct {
-	tokens    float64
-	updatedAt time.Time
-}
-
-func (budget *tokenBudget) allowCost(now time.Time, cost, rate, burst float64) bool {
-	if budget.updatedAt.IsZero() {
-		budget.tokens = burst
-		budget.updatedAt = now
-	} else if now.After(budget.updatedAt) {
-		budget.tokens = min(burst, budget.tokens+now.Sub(budget.updatedAt).Seconds()*rate)
-		budget.updatedAt = now
-	}
-	if cost <= 0 || budget.tokens < cost {
-		return false
-	}
-	budget.tokens -= cost
-	return true
-}
-
 type PeeringSession struct {
 	ciphers                    protocol.SessionCiphers
 	sessionID                  [16]byte
@@ -51,7 +31,6 @@ type PeeringSession struct {
 	rttMillis                  int64
 	pendingPing                pendingPing
 	lastHelloSentAt            time.Time
-	bridgeControlBudget        tokenBudget
 	lastTopologyAt             time.Time
 	topologySentGeneration     uint64
 	topologyReceivedGeneration uint64

@@ -13,10 +13,8 @@ import (
 )
 
 const (
-	topologyClaimTTL   = 30 * time.Second
-	bridgeControlRate  = 256 * 1024.0
-	bridgeControlBurst = 128 * 1024.0
-	knownPeerTTL       = 2 * topologyClaimTTL
+	topologyClaimTTL = 30 * time.Second
+	knownPeerTTL     = 2 * topologyClaimTTL
 )
 
 type topologyPeer struct {
@@ -178,9 +176,6 @@ func (c *Client) handleBridgePacket(packet endpoint.Datagram) {
 		return
 	}
 	now := time.Now()
-	if !adjacent.bridgeControlBudget.allowCost(now, float64(len(packet.Data)), bridgeControlRate, bridgeControlBurst) {
-		return
-	}
 	adjacent.lastAuthenticatedPacketAt = now
 	c.rememberAuthenticatedPath(outerPath, now)
 
