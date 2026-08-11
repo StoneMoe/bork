@@ -191,7 +191,7 @@ func (a *App) createRoom(roomInvite invite.Invite) error {
 	if hasRoom {
 		return errors.New("leave the current room before joining another")
 	}
-	client, err := peer.NewClient(roomInvite, a.config.NetworkOptions(), a.logger)
+	client, err := peer.NewClient(roomInvite, a.config.Network.Options(), a.logger)
 	if err != nil {
 		return err
 	}

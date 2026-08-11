@@ -8,135 +8,97 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 
+	"bork/internal/networking"
 	"bork/internal/networking/discovery/tracker"
 	"bork/internal/networking/endpoint"
 
 	"gopkg.in/yaml.v3"
 )
 
-const (
-	behaviorConfigFilename = "config.yml"
-	maxBehaviorConfigSize  = 64 * 1024
-)
+type AppConfig struct {
+	FilePath string        `yaml:"-"`
+	Network  NetworkConfig `yaml:"network"`
+}
 
-var (
-	userConfigDir      = os.UserConfigDir
-	linkConfigFile     = os.Link
-	defaultSTUNServers = []string{
-		"stun.cloudflare.com:3478",
-		"stun.miwifi.com:3478",
-	}
-	defaultTrackerURLs = []string{
-		"https://tracker.zhuqiy.com/announce",
-		"http://tracker.renfei.net:8080/announce",
-	}
-	legacyDefaultTrackerURLs = []string{
-		"https://tracker.zhuqiy.com/announce",
-		"http://tracker.renfei.net:8080/announce",
-		"http://tracker.mywaifu.best:6969/announce",
-	}
-)
-
-type behaviorConfig struct {
+type NetworkConfig struct {
 	UDPListen   string   `yaml:"udp_listen"`
 	STUNServers []string `yaml:"stun_servers"`
 	TrackerURLs []string `yaml:"tracker_urls"`
 	PortMapping bool     `yaml:"port_mapping"`
 }
 
-type behaviorYAML struct {
-	Network *networkYAML `yaml:"network,omitempty"`
-}
-
-type networkYAML struct {
-	UDPListen   *string   `yaml:"udp_listen,omitempty"`
-	STUNServers *[]string `yaml:"stun_servers,omitempty"`
-	TrackerURLs *[]string `yaml:"tracker_urls,omitempty"`
-	PortMapping *bool     `yaml:"port_mapping,omitempty"`
-}
-
-type persistedBehaviorYAML struct {
-	Network behaviorConfig `yaml:"network"`
-}
-
-func defaultBehaviorConfig() behaviorConfig {
-	return behaviorConfig{
-		UDPListen: endpoint.DefaultOptions().ListenAddress, STUNServers: append([]string{}, defaultSTUNServers...),
-		TrackerURLs: append([]string{}, defaultTrackerURLs...), PortMapping: true,
-	}
-}
-
-func behaviorConfigPath() (string, error) {
-	base, err := userConfigDir()
+func LoadAppConfig() (AppConfig, error) {
+	base, err := os.UserConfigDir()
 	if err != nil {
-		return "", fmt.Errorf("locate user config directory: %w", err)
+		return AppConfig{}, fmt.Errorf("locate user config directory: %w", err)
 	}
-	path := filepath.Join(base, "bork", behaviorConfigFilename)
-	resolved, err := filepath.Abs(path)
+	path := filepath.Join(base, "bork", "config.yml")
+	config, err := loadAppConfigFile(path)
 	if err != nil {
-		return "", fmt.Errorf("resolve config path: %w", err)
+		return AppConfig{}, err
 	}
-	return resolved, nil
+	config.FilePath = path
+	return config, nil
 }
 
-func loadBehaviorConfig(path string) (behaviorConfig, error) {
-	config := defaultBehaviorConfig()
-	contents, exists, err := readBehaviorConfig(path)
+func loadAppConfigFile(path string) (AppConfig, error) {
+	config := AppConfig{
+		Network: NetworkConfig{
+			UDPListen:   endpoint.DefaultOptions().ListenAddress,
+			STUNServers: []string{"stun.cloudflare.com:3478", "stun.miwifi.com:3478"},
+			TrackerURLs: []string{"https://tracker.zhuqiy.com/announce", "http://tracker.renfei.net:8080/announce"},
+			PortMapping: true,
+		},
+	}
+	contents, exists, err := readAppConfig(path)
 	if err != nil {
-		return behaviorConfig{}, fmt.Errorf("load client config %q: %w", path, err)
+		return AppConfig{}, fmt.Errorf("load client config %q: %w", path, err)
 	}
 	if !exists || len(bytes.TrimSpace(contents)) == 0 {
 		return config, nil
 	}
 	decoder := yaml.NewDecoder(bytes.NewReader(contents))
 	decoder.KnownFields(true)
-	var encoded behaviorYAML
-	if err := decoder.Decode(&encoded); err != nil {
-		return behaviorConfig{}, fmt.Errorf("parse client config %q: %w", path, err)
+	if err := decoder.Decode(&config); err != nil {
+		return AppConfig{}, fmt.Errorf("parse client config %q: %w", path, err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		if err == nil {
-			return behaviorConfig{}, fmt.Errorf("parse client config %q: multiple YAML documents are not allowed", path)
+			return AppConfig{}, fmt.Errorf("parse client config %q: multiple YAML documents are not allowed", path)
 		}
-		return behaviorConfig{}, fmt.Errorf("parse client config %q: %w", path, err)
+		return AppConfig{}, fmt.Errorf("parse client config %q: %w", path, err)
 	}
-	if encoded.Network != nil {
-		if encoded.Network.UDPListen != nil {
-			config.UDPListen = strings.TrimSpace(*encoded.Network.UDPListen)
-		}
-		if encoded.Network.STUNServers != nil {
-			config.STUNServers = append([]string{}, (*encoded.Network.STUNServers)...)
-		}
-		if encoded.Network.TrackerURLs != nil {
-			config.TrackerURLs = append([]string{}, (*encoded.Network.TrackerURLs)...)
-			if slices.Equal(config.TrackerURLs, legacyDefaultTrackerURLs) {
-				config.TrackerURLs = append([]string{}, defaultTrackerURLs...)
-			}
-		}
-		if encoded.Network.PortMapping != nil {
-			config.PortMapping = *encoded.Network.PortMapping
-		}
+	config.Network.UDPListen = strings.TrimSpace(config.Network.UDPListen)
+	if err := validateUDPListen(config.Network.UDPListen); err != nil {
+		return AppConfig{}, fmt.Errorf("validate client config %q: %w", path, err)
 	}
-	if err := validateUDPListen(config.UDPListen); err != nil {
-		return behaviorConfig{}, fmt.Errorf("validate client config %q: %w", path, err)
-	}
-	config.STUNServers, err = validateSTUNServers(config.STUNServers)
+	config.Network.STUNServers, err = validateSTUNServers(config.Network.STUNServers)
 	if err != nil {
-		return behaviorConfig{}, fmt.Errorf("validate client config %q: %w", path, err)
+		return AppConfig{}, fmt.Errorf("validate client config %q: %w", path, err)
 	}
-	config.TrackerURLs, err = validateTrackerURLs(config.TrackerURLs)
+	config.Network.TrackerURLs, err = validateTrackerURLs(config.Network.TrackerURLs)
 	if err != nil {
-		return behaviorConfig{}, fmt.Errorf("validate client config %q: %w", path, err)
+		return AppConfig{}, fmt.Errorf("validate client config %q: %w", path, err)
 	}
 	return config, nil
 }
 
-func readBehaviorConfig(path string) ([]byte, bool, error) {
+func (c NetworkConfig) Options() networking.Options {
+	options := endpoint.DefaultOptions()
+	options.ListenAddress = c.UDPListen
+	options.STUNServers = append([]string{}, c.STUNServers...)
+	return networking.Options{
+		Endpoint:          options,
+		TrackerURLs:       append([]string{}, c.TrackerURLs...),
+		EnablePortMapping: c.PortMapping,
+	}
+}
+
+func readAppConfig(path string) ([]byte, bool, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
@@ -144,8 +106,8 @@ func readBehaviorConfig(path string) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	if !info.Mode().IsRegular() || info.Size() > maxBehaviorConfigSize {
-		return nil, false, errors.New("config must be a regular file no larger than 64 KiB")
+	if !info.Mode().IsRegular() {
+		return nil, false, errors.New("config must be a regular file")
 	}
 	file, err := os.Open(path)
 	if err != nil {
@@ -159,21 +121,18 @@ func readBehaviorConfig(path string) ([]byte, bool, error) {
 	if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
 		return nil, false, errors.New("config changed while opening")
 	}
-	contents, err := io.ReadAll(io.LimitReader(file, maxBehaviorConfigSize+1))
+	contents, err := io.ReadAll(file)
 	if err != nil {
 		return nil, false, err
-	}
-	if len(contents) > maxBehaviorConfigSize {
-		return nil, false, errors.New("config is larger than 64 KiB")
 	}
 	return contents, true, nil
 }
 
-func (c Config) EnsureConfigFile() error {
-	if c.ConfigFile == "" {
+func (c AppConfig) EnsureFile() error {
+	if c.FilePath == "" {
 		return errors.New("client config path is empty")
 	}
-	if info, err := os.Lstat(c.ConfigFile); err == nil {
+	if info, err := os.Lstat(c.FilePath); err == nil {
 		if !info.Mode().IsRegular() {
 			return errors.New("client config is not a regular file")
 		}
@@ -181,13 +140,11 @@ func (c Config) EnsureConfigFile() error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect client config: %w", err)
 	}
-	parent := filepath.Dir(c.ConfigFile)
+	parent := filepath.Dir(c.FilePath)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return fmt.Errorf("create client config directory: %w", err)
 	}
-	contents, err := yaml.Marshal(persistedBehaviorYAML{Network: behaviorConfig{
-		UDPListen: c.UDPListen, STUNServers: c.STUNServers, TrackerURLs: c.TrackerURLs, PortMapping: c.PortMapping,
-	}})
+	contents, err := yaml.Marshal(c)
 	if err != nil {
 		return fmt.Errorf("encode client config: %w", err)
 	}
@@ -212,14 +169,14 @@ func (c Config) EnsureConfigFile() error {
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("close temporary client config: %w", err)
 	}
-	if err := publishConfigNoReplace(temporaryPath, c.ConfigFile); err != nil {
+	if err := publishConfigNoReplace(temporaryPath, c.FilePath); err != nil {
 		return fmt.Errorf("publish client config: %w", err)
 	}
 	return nil
 }
 
 func publishConfigNoReplace(temporaryPath, targetPath string) error {
-	linkErr := linkConfigFile(temporaryPath, targetPath)
+	linkErr := os.Link(temporaryPath, targetPath)
 	if linkErr == nil {
 		return nil
 	}
@@ -227,7 +184,7 @@ func publishConfigNoReplace(temporaryPath, targetPath string) error {
 		if !info.Mode().IsRegular() {
 			return errors.New("client config appeared as a non-regular file")
 		}
-		_, loadErr := loadBehaviorConfig(targetPath)
+		_, loadErr := loadAppConfigFile(targetPath)
 		return loadErr
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"bork/internal/app"
 	"bork/internal/config"
@@ -20,20 +21,31 @@ func main() {
 }
 
 func run(args []string) int {
-	cfg, err := config.ParseConfig(args, os.Stderr)
-	if errors.Is(err, flag.ErrHelp) {
-		return 0
-	}
-	if err != nil {
+	flags := flag.NewFlagSet("bork", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	showVersion := flags.Bool("version", false, "print version and exit")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		fmt.Fprintf(os.Stderr, "bork: %v\n", err)
 		return 2
 	}
-	if cfg.ShowVersion {
+	if flags.NArg() != 0 {
+		fmt.Fprintf(os.Stderr, "bork: unexpected positional arguments: %s\n", strings.Join(flags.Args(), " "))
+		return 2
+	}
+	if *showVersion {
 		fmt.Printf("bork %s\n", version)
 		return 0
 	}
 
-	if err := cfg.EnsureConfigFile(); err != nil {
+	cfg, err := config.LoadAppConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bork: %v\n", err)
+		return 2
+	}
+	if err := cfg.EnsureFile(); err != nil {
 		fmt.Fprintf(os.Stderr, "bork: %v\n", err)
 		return 2
 	}

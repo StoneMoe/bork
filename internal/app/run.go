@@ -3,6 +3,7 @@ package app
 import (
 	"embed"
 	"log/slog"
+	"path/filepath"
 
 	"bork/internal/config"
 
@@ -10,9 +11,10 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	"github.com/wailsapp/wails/v2/pkg/options/mac"
+	"github.com/wailsapp/wails/v2/pkg/options/windows"
 )
 
-func RunGUI(cfg config.Config, assets embed.FS, logger *slog.Logger) error {
+func RunGUI(cfg config.AppConfig, assets embed.FS, logger *slog.Logger) error {
 	application := NewApp(cfg, logger)
 	return wails.Run(&options.App{
 		Title:     "Bork",
@@ -22,6 +24,9 @@ func RunGUI(cfg config.Config, assets embed.FS, logger *slog.Logger) error {
 		MinHeight: 600,
 		Frameless: true,
 		Mac:       &mac.Options{},
+		Windows: &windows.Options{
+			WebviewUserDataPath: filepath.Dir(cfg.FilePath),
+		},
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},

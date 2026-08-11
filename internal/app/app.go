@@ -22,7 +22,7 @@ import (
 const stateCoalesceInterval = 50 * time.Millisecond
 
 type App struct {
-	config         config.Config
+	config         config.AppConfig
 	logger         *slog.Logger
 	emit           func(context.Context, string, ...interface{})
 	openFileDialog func(context.Context, wailsruntime.OpenDialogOptions) (string, error)
@@ -69,7 +69,7 @@ type roomStateChange struct {
 	terminal bool
 }
 
-func NewApp(cfg config.Config, logger *slog.Logger) *App {
+func NewApp(cfg config.AppConfig, logger *slog.Logger) *App {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -98,13 +98,6 @@ func (a *App) startup(ctx context.Context) {
 		a.setAudioInitError(nil)
 	}
 	a.startAudioWatcher(ctx)
-	encodedInvite, err := a.config.LoadInvite()
-	if err == nil && encodedInvite != "" {
-		err = a.joinRoom(encodedInvite)
-	}
-	if err != nil {
-		a.recordError(err)
-	}
 	a.commandMu.Unlock()
 
 	a.markStateChanged()

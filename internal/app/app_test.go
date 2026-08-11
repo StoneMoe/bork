@@ -9,7 +9,7 @@ import (
 )
 
 func TestSnapshotScopesPeerIDToRoom(t *testing.T) {
-	application := NewApp(config.Config{}, nil)
+	application := NewApp(config.AppConfig{}, nil)
 	if state := application.snapshot(); state.Room != nil {
 		t.Fatal("lobby snapshot contains a room identity")
 	}
@@ -18,7 +18,7 @@ func TestSnapshotScopesPeerIDToRoom(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := peer.NewClient(roomInvite, application.config.NetworkOptions(), nil)
+	first, err := peer.NewClient(roomInvite, application.config.Network.Options(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func TestSnapshotScopesPeerIDToRoom(t *testing.T) {
 		t.Fatal("stopping room retained its PeerID")
 	}
 	application.room = nil
-	second, err := peer.NewClient(roomInvite, application.config.NetworkOptions(), nil)
+	second, err := peer.NewClient(roomInvite, application.config.Network.Options(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -6,7 +6,6 @@ WAILS_CMD := cd $(WAILS_DIR) && $(WAILS)
 VERSION ?= $(shell node -p "require('./cmd/bork/wails.json').info.productVersion")
 PLATFORMS ?=
 TAGS ?=
-APP_ARGS ?=
 BUILD_FLAGS ?=
 DEV_FLAGS ?=
 
@@ -31,10 +30,6 @@ ifneq ($(strip $(PLATFORMS)),)
 PLATFORM_FLAGS := -platform "$(PLATFORMS)"
 endif
 
-ifneq ($(strip $(APP_ARGS)),)
-APP_FLAGS := -appargs "$(APP_ARGS)"
-endif
-
 .PHONY: build dev bindings frontend-deps typecheck-frontend prepare-packaging
 
 bindings:
@@ -57,4 +52,4 @@ build: prepare-packaging
 	$(WAILS_CMD) build -clean -trimpath -ldflags "-s -w -X main.version=$(VERSION)" $(PLATFORM_FLAGS) $(TAG_FLAGS) $(BUILD_FLAGS)
 
 dev: prepare-packaging
-	$(WAILS_CMD) dev $(APP_FLAGS) $(TAG_FLAGS) $(DEV_FLAGS)
+	$(WAILS_CMD) dev $(TAG_FLAGS) $(DEV_FLAGS)
