@@ -6,7 +6,6 @@ import type { AppState } from "./types";
 
 const emptyState = new app.AppSnapshot({
   revision: 0,
-  peerId: "",
   nickname: "",
   audio: {
     available: false,

@@ -706,8 +706,11 @@ func (c *Client) expireRemotePeers() {
 				changed = true
 			}
 		}
-		if peerSess != nil && !peerSess.everAuthenticated && peerSess.lastAuthenticatedPacketAt.Before(cutoff) {
-			delete(c.remotePeers, peerID)
+		if peerSess != nil && peerSess.lastAuthenticatedPacketAt.Before(cutoff) {
+			peer.session = nil
+			if peer.candidateSession == nil {
+				delete(c.remotePeers, peerID)
+			}
 		}
 	}
 	for peerID, peer := range c.remotePeers {

@@ -14,14 +14,12 @@ import (
 )
 
 func (a *App) GetSnapshot() AppSnapshot {
-	<-a.startupDone
+	a.waitForStartup()
 	return a.snapshot()
 }
 
 func (a *App) GetInvite() (string, error) {
-	if err := a.waitForStartup(); err != nil {
-		return "", err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
 	client, err := a.activeClient()
@@ -32,9 +30,7 @@ func (a *App) GetInvite() (string, error) {
 }
 
 func (a *App) OfferFile(recipientPeerID string) (string, error) {
-	if err := a.waitForStartup(); err != nil {
-		return "", err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	if a.isShuttingDown() {
 		a.commandMu.Unlock()
@@ -61,9 +57,7 @@ func (a *App) OfferFile(recipientPeerID string) (string, error) {
 }
 
 func (a *App) AcceptFile(transferID string) error {
-	if err := a.waitForStartup(); err != nil {
-		return err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	if a.isShuttingDown() {
 		a.commandMu.Unlock()
@@ -117,9 +111,7 @@ func (a *App) CancelFile(transferID string) error {
 }
 
 func (a *App) runClientCommand(command func(*peer.Client) error) error {
-	if err := a.waitForStartup(); err != nil {
-		return err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
 	if a.isShuttingDown() {
@@ -133,9 +125,7 @@ func (a *App) runClientCommand(command func(*peer.Client) error) error {
 }
 
 func (a *App) runAudioCommand(command func(*audio.Engine) error) error {
-	if err := a.waitForStartup(); err != nil {
-		return err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
 	if a.isShuttingDown() {
@@ -160,9 +150,7 @@ func safeFilename(name string) string {
 }
 
 func (a *App) CreateRoom(displayName string) error {
-	if err := a.waitForStartup(); err != nil {
-		return err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
 	roomInvite, err := invite.New(displayName)
@@ -173,9 +161,7 @@ func (a *App) CreateRoom(displayName string) error {
 }
 
 func (a *App) JoinRoom(encodedInvite string) error {
-	if err := a.waitForStartup(); err != nil {
-		return err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
 	return a.joinRoom(encodedInvite)
@@ -194,22 +180,21 @@ func (a *App) joinRoom(encodedInvite string) error {
 
 func (a *App) createRoom(roomInvite invite.Invite) error {
 	a.stateMu.RLock()
-	localIdentity := a.localIdentity
 	nickname := a.nickname
 	audioEngine := a.audioEngine
 	hasRoom := a.room != nil
 	shuttingDown := a.shuttingDown
 	a.stateMu.RUnlock()
-	if localIdentity == nil {
-		return errors.New("user identity is unavailable")
-	}
 	if shuttingDown {
 		return errors.New("application is shutting down")
 	}
 	if hasRoom {
 		return errors.New("leave the current room before joining another")
 	}
-	client := peer.NewClient(localIdentity, roomInvite, a.config.NetworkOptions(), a.logger)
+	client, err := peer.NewClient(roomInvite, a.config.NetworkOptions(), a.logger)
+	if err != nil {
+		return err
+	}
 	captureMuted := false
 	playbackMuted := false
 	if audioEngine != nil {
@@ -229,9 +214,7 @@ func (a *App) createRoom(roomInvite invite.Invite) error {
 }
 
 func (a *App) LeaveRoom() error {
-	if err := a.waitForStartup(); err != nil {
-		return err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	if a.isShuttingDown() {
 		a.commandMu.Unlock()
@@ -259,9 +242,7 @@ func (a *App) LeaveRoom() error {
 }
 
 func (a *App) StartScreenShare(codec string, width, height int) (uint32, error) {
-	if err := a.waitForStartup(); err != nil {
-		return 0, err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
 	if a.isShuttingDown() {
@@ -288,9 +269,7 @@ func (a *App) StartScreenShare(codec string, width, height int) (uint32, error) 
 }
 
 func (a *App) SendScreenVideoChunk(captureID uint32, timestamp uint64, duration uint32, keyFrame bool, bytesBase64 string) (bool, error) {
-	if err := a.waitForStartup(); err != nil {
-		return false, err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
 	if a.isShuttingDown() {
@@ -310,9 +289,7 @@ func (a *App) SendScreenVideoChunk(captureID uint32, timestamp uint64, duration 
 }
 
 func (a *App) StopScreenShare(captureID uint32) error {
-	if err := a.waitForStartup(); err != nil {
-		return err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
 	if a.isShuttingDown() {
@@ -352,9 +329,7 @@ func (a *App) SetPlaybackMuted(muted bool) error {
 }
 
 func (a *App) setMuted(captureMuted, playbackMuted *bool) error {
-	if err := a.waitForStartup(); err != nil {
-		return err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
 	if a.isShuttingDown() {
@@ -405,9 +380,7 @@ func (a *App) SetNoiseSuppression(enabled bool) error {
 }
 
 func (a *App) SetNickname(nickname string) error {
-	if err := a.waitForStartup(); err != nil {
-		return err
-	}
+	a.waitForStartup()
 	nickname, err := peer.NormalizeNickname(nickname)
 	if err != nil {
 		return err
@@ -445,9 +418,7 @@ func (a *App) SetNickname(nickname string) error {
 }
 
 func (a *App) SetAudioDevices(captureID, playbackID string) error {
-	if err := a.waitForStartup(); err != nil {
-		return err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
 	if a.isShuttingDown() {
@@ -471,9 +442,7 @@ func (a *App) SetAudioDevices(captureID, playbackID string) error {
 }
 
 func (a *App) RefreshAudioDevices() error {
-	if err := a.waitForStartup(); err != nil {
-		return err
-	}
+	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
 	if a.isShuttingDown() {

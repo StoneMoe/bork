@@ -113,7 +113,11 @@ type Client struct {
 	started      atomic.Bool
 }
 
-func NewClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, networkOptions networking.Options, logger *slog.Logger) *Client {
+func NewClient(roomInvite invite.Invite, networkOptions networking.Options, logger *slog.Logger) (*Client, error) {
+	localIdentity, err := identity.New()
+	if err != nil {
+		return nil, err
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -126,7 +130,7 @@ func NewClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, 
 			return networking.NewRoomNetwork(roomInvite.RoomTag(), roomInvite.TrackerHash(), trackerIdentity, networkOptions, logger)
 		},
 		logger,
-	)
+	), nil
 }
 
 func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, networkFactory roomNetworkFactory, logger *slog.Logger) *Client {
@@ -382,6 +386,8 @@ func (c *Client) StateSnapshot() (ClientSnapshot, networking.RoomSnapshot) {
 }
 
 func (c *Client) EncodedInvite() string { return c.roomInvite.Encode() }
+
+func (c *Client) PeerID() string { return c.localIdentity.PeerID() }
 
 func (c *Client) applyNetworkSnapshot(snapshot networking.RoomSnapshot) {
 	if !slices.Equal(c.networkSnapshot.Endpoint.Candidates, snapshot.Endpoint.Candidates) {

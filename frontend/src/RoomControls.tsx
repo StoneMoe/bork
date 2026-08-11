@@ -329,7 +329,7 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
         <Show when={selectedMember() === "local"} fallback={selectedRemote() && (
           <div class="member-info-grid">
             <span><small>昵称</small><b>{remoteName(selectedRemote()!)}</b></span>
-            <span><small>PeerID</small><code>{selectedRemote()!.peerId}</code></span>
+            <span><small>本次入房 PeerID</small><code>{selectedRemote()!.peerId}</code></span>
             <span><small>Session</small><code>{selectedRemote()!.sessionId || "未知"}</code></span>
             <span><small>连接</small><b>{remoteTransport(selectedRemote()!)} · {selectedRemote()!.rttMillis || 1} ms</b></span>
             <span><small>{selectedRemote()!.transport === "bridge" ? "下一跳" : "远端地址"}</small><code>{selectedRemote()!.address}</code></span>
@@ -338,7 +338,7 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
         )}>
           <div class="member-info-grid">
             <span><small>昵称</small><b>{props.state.nickname || "本机"}</b></span>
-            <span><small>PeerID</small><code>{props.state.peerId || "正在载入"}</code></span>
+            <span><small>本次入房 PeerID</small><code>{props.state.room?.peerId || "不可用"}</code></span>
             <span><small>本机端点</small><code>{props.state.diagnostics.listenAddress || "尚未打开"}</code></span>
             <span><small>房间状态</small><b>{props.state.room?.phase || "未知"}</b></span>
             <span><small>音频状态</small><b>{localStatus()}</b></span>

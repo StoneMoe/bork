@@ -29,6 +29,7 @@ type RemotePeer struct {
 
 type RoomState struct {
 	Name          string         `json:"name"`
+	PeerID        string         `json:"peerId"`
 	Phase         string         `json:"phase"`
 	ScreenSharing bool           `json:"screenSharing"`
 	RemotePeers   []RemotePeer   `json:"remotePeers"`
@@ -71,7 +72,6 @@ type AppError struct {
 
 type AppSnapshot struct {
 	Revision    uint64       `json:"revision"`
-	PeerID      string       `json:"peerId"`
 	Nickname    string       `json:"nickname"`
 	Room        *RoomState   `json:"room,omitempty"`
 	Audio       audio.Status `json:"audio"`

@@ -246,8 +246,8 @@ export default function Settings(props: SettingsProps) {
           hidden={activeTab() !== "network"}
         >
           <div class="diagnostic-section">
-            <div class="diagnostic-heading"><span>用户身份</span></div>
-            <code class="diagnostic-value">{props.state.peerId || "正在载入"}</code>
+            <div class="diagnostic-heading"><span>当前房间 PeerID</span></div>
+            <code class="diagnostic-value">{props.state.room?.peerId || "未加入房间"}</code>
           </div>
           <div class="diagnostic-section">
             <div class="diagnostic-heading"><span>本机端点</span></div>

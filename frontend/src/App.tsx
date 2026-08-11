@@ -36,7 +36,7 @@ function closeOpenPopovers() {
 }
 
 function humanStatus(state: AppState): FriendlyStatus {
-  if (!state.peerId || !state.room) return {};
+  if (!state.room) return {};
   if (state.room.phase === "gathering") {
     return {
       title: "正在准备连接",
@@ -69,7 +69,7 @@ export default function App() {
   let settingsButton: HTMLButtonElement | undefined;
   const remote = createRemoteState(setError);
   const state = remote.state;
-  const operational = createMemo(() => Boolean(state().peerId));
+  const operational = createMemo(() => state().revision > 0);
   const inRoom = createMemo(() => Boolean(state().room));
   const friendly = createMemo(() => humanStatus(state()));
   let previousRoomState = inRoom();

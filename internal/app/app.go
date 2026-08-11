@@ -10,7 +10,6 @@ import (
 
 	"bork/internal/audio"
 	"bork/internal/config"
-	"bork/internal/identity"
 	"bork/internal/media"
 	"bork/internal/networking/discovery/tracker"
 	"bork/internal/networking/endpoint"
@@ -34,7 +33,6 @@ type App struct {
 
 	appContext  context.Context
 	startupDone chan struct{}
-	startupErr  error
 
 	stateRevision        uint64
 	statePending         chan struct{}
@@ -42,8 +40,6 @@ type App struct {
 	stateNotifierStopped chan struct{}
 	notificationsClosed  bool
 
-	localIdentity       *identity.LocalIdentity
-	identityLease       *identity.Lease
 	nickname            string
 	room                *roomSession
 	audioEngine         *audio.Engine
@@ -96,41 +92,28 @@ func (a *App) startup(ctx context.Context) {
 	a.startStateNotifier(ctx)
 
 	a.commandMu.Lock()
-	startupErr := a.initializeIdentity()
-	if startupErr == nil {
-		if err := a.initializeAudio(); err != nil {
-			a.setAudioInitError(err)
-		} else {
-			a.setAudioInitError(nil)
-		}
-		a.startAudioWatcher(ctx)
-		encodedInvite, err := a.config.LoadInvite()
-		if err == nil && encodedInvite != "" {
-			err = a.joinRoom(encodedInvite)
-		}
-		if err != nil {
-			a.recordError(err)
-		}
-	} else if errors.Is(startupErr, identity.ErrAlreadyActive) {
-		a.recordError(errors.New("当前身份已在另一个 Bork 实例中使用。请先关闭已有实例"))
+	if err := a.initializeAudio(); err != nil {
+		a.setAudioInitError(err)
 	} else {
-		a.recordError(startupErr)
+		a.setAudioInitError(nil)
+	}
+	a.startAudioWatcher(ctx)
+	encodedInvite, err := a.config.LoadInvite()
+	if err == nil && encodedInvite != "" {
+		err = a.joinRoom(encodedInvite)
+	}
+	if err != nil {
+		a.recordError(err)
 	}
 	a.commandMu.Unlock()
 
-	a.stateMu.Lock()
-	a.startupErr = startupErr
-	a.stateMu.Unlock()
 	a.markStateChanged()
 	close(a.startupDone)
 
 }
 
-func (a *App) waitForStartup() error {
+func (a *App) waitForStartup() {
 	<-a.startupDone
-	a.stateMu.RLock()
-	defer a.stateMu.RUnlock()
-	return a.startupErr
 }
 
 func (a *App) startStateNotifier(parent context.Context) {
@@ -222,44 +205,15 @@ func (a *App) publishRoomChange(change roomStateChange) {
 	a.markStateChanged()
 }
 
-func (a *App) initializeIdentity() error {
-	a.stateMu.RLock()
-	existingIdentity := a.localIdentity
-	shuttingDown := a.shuttingDown
-	a.stateMu.RUnlock()
-	if shuttingDown {
-		return errors.New("application is shutting down")
-	}
-	if existingIdentity != nil {
-		return nil
-	}
-	localIdentity, err := identity.LoadOrCreate(a.config.DataDir)
-	if err == nil {
-		var identityLease *identity.Lease
-		identityLease, err = identity.Acquire(localIdentity)
-		if err == nil {
-			a.stateMu.Lock()
-			a.localIdentity = localIdentity
-			a.identityLease = identityLease
-			a.stateMu.Unlock()
-		}
-	}
-	if err != nil {
-		a.logger.Error("initialise identity", "error", err)
-	}
-	return err
-}
-
 func (a *App) initializeAudio() error {
 	a.stateMu.RLock()
-	hasIdentity := a.localIdentity != nil
 	existingAudioEngine := a.audioEngine
 	shuttingDown := a.shuttingDown
 	a.stateMu.RUnlock()
 	if shuttingDown {
 		return errors.New("application is shutting down")
 	}
-	if !hasIdentity || existingAudioEngine != nil {
+	if existingAudioEngine != nil {
 		return nil
 	}
 	audioEngine, err := audio.New(audio.Options{MaxEncodedFrameBytes: protocol.MaxGroupDatagramPayload}, a.logger)
@@ -447,7 +401,6 @@ func (a *App) snapshot() AppSnapshot {
 	for {
 		a.stateMu.RLock()
 		revision := a.stateRevision
-		localIdentity := a.localIdentity
 		nickname := a.nickname
 		room := a.room
 		if room != nil && room.stopping {
@@ -473,9 +426,6 @@ func (a *App) snapshot() AppSnapshot {
 			Diagnostics: diagnostics,
 			Error:       lastError,
 		}
-		if localIdentity != nil {
-			state.PeerID = localIdentity.PeerID()
-		}
 		if audioEngine != nil {
 			state.Audio = audioEngine.Status()
 		} else if audioInitError != "" {
@@ -485,6 +435,7 @@ func (a *App) snapshot() AppSnapshot {
 			peerSnapshot, networkSnapshot := room.client.StateSnapshot()
 			state.Room = &RoomState{
 				Name:          peerSnapshot.Name,
+				PeerID:        room.client.PeerID(),
 				Phase:         peerSnapshot.Phase,
 				ScreenSharing: peerSnapshot.ScreenSharing,
 				RemotePeers:   make([]RemotePeer, 0, len(peerSnapshot.RemotePeers)),
@@ -571,9 +522,9 @@ func (a *App) shutdown(context.Context) {
 
 	a.stateMu.Lock()
 	stopAudioWatcher, audioWatcherDone := a.stopAudioWatcher, a.audioWatcherDone
-	audioEngine, identityLease := a.audioEngine, a.identityLease
+	audioEngine := a.audioEngine
 	a.stopAudioWatcher, a.audioWatcherDone = nil, nil
-	a.audioEngine, a.identityLease = nil, nil
+	a.audioEngine = nil
 	a.stateMu.Unlock()
 	if stopAudioWatcher != nil {
 		stopAudioWatcher()
@@ -584,11 +535,6 @@ func (a *App) shutdown(context.Context) {
 	if audioEngine != nil {
 		if err := audioEngine.Close(); err != nil {
 			a.logger.Warn("close voice audio", "error", err)
-		}
-	}
-	if identityLease != nil {
-		if err := identityLease.Close(); err != nil {
-			a.logger.Warn("release identity lease", "error", err)
 		}
 	}
 }

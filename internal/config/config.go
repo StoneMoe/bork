@@ -16,7 +16,6 @@ import (
 type Config struct {
 	Invite      string   `json:"-"`
 	InviteFile  string   `json:"-"`
-	DataDir     string   `json:"-"`
 	UDPListen   string   `json:"-"`
 	STUNServers []string `json:"-"`
 	TrackerURLs []string `json:"-"`
@@ -32,7 +31,6 @@ func ParseConfig(args []string, output io.Writer) (Config, error) {
 	flags.SetOutput(output)
 	flags.StringVar(&cfg.Invite, "join", "", "join a room using an encoded invite")
 	flags.StringVar(&cfg.InviteFile, "join-file", "", "read the room invite from a file")
-	flags.StringVar(&cfg.DataDir, "data-dir", "", "directory for the persistent user identity")
 	flags.BoolVar(&cfg.ShowVersion, "version", false, "print version and exit")
 	flags.Usage = func() {
 		fmt.Fprintln(output, "Usage: bork [options]")

@@ -105,8 +105,8 @@ func (i Invite) TrackerHash() [TrackerHashSize]byte {
 
 // GroupMediaKey returns the room-scoped symmetric key that seals realtime
 // group datagrams. It is a group transport key, not forward-secret group E2EE:
-// every RoomSeed holder can decrypt, while sender signatures prevent another
-// member from forging the claimed sender identity.
+// every RoomSeed holder can decrypt, while signatures bind packets to a
+// transient NodeID for forwarding and replay checks, not member authorization.
 func (i Invite) GroupMediaKey() [32]byte {
 	derived := i.derive("bork/group-media/v1", 32)
 	var key [32]byte
