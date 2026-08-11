@@ -18,7 +18,7 @@ const (
 	PacketGroupDatagram PacketType = 5
 	PacketReliable      PacketType = 6
 
-	prefixSize            = 4 + 1 + 1 + 16
+	prefixSize            = 4 + 1 + 16
 	establishedHeaderSize = prefixSize + 16 + 8
 	aeadTagSize           = 16
 
@@ -46,7 +46,7 @@ var Magic = [4]byte{'B', 'R', 'K', '0' + Version}
 
 func appendPrefix(destination []byte, packetType PacketType, roomTag [16]byte) []byte {
 	destination = append(destination, Magic[:]...)
-	destination = append(destination, Version, byte(packetType))
+	destination = append(destination, byte(packetType))
 	destination = append(destination, roomTag[:]...)
 	return destination
 }
@@ -56,11 +56,11 @@ func ParsePrefix(packet []byte) (PacketType, [16]byte, error) {
 	if len(packet) < prefixSize {
 		return 0, roomTag, errors.New("Bork packet is truncated")
 	}
-	if string(packet[:4]) != string(Magic[:]) || packet[4] != Version {
-		return 0, roomTag, errors.New("Bork packet magic or version is invalid")
+	if string(packet[:4]) != string(Magic[:]) {
+		return 0, roomTag, errors.New("Bork packet magic is invalid")
 	}
-	copy(roomTag[:], packet[6:prefixSize])
-	return PacketType(packet[5]), roomTag, nil
+	copy(roomTag[:], packet[5:prefixSize])
+	return PacketType(packet[4]), roomTag, nil
 }
 
 func ValidPacketSize(packetType PacketType, size int) bool {
