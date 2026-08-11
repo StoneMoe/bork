@@ -355,8 +355,8 @@ func (c *Client) handlePacket(packet endpoint.Datagram, mediaPort media.PeerPort
 		if pathErr == nil {
 			c.handleReliablePacketOnPath(packet.Data, path)
 		}
-	case protocol.PacketGroupDatagram:
-		c.handleGroupDatagram(packet, mediaPort)
+	case protocol.PacketRoomDatagram:
+		c.handleRoomDatagram(packet, mediaPort)
 	case protocol.PacketBridgeControl:
 		c.handleBridgePacket(packet)
 	}

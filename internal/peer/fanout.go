@@ -318,7 +318,7 @@ func (c *Client) sendRealtimePacketsToPeers(class protocol.TrafficClass, packets
 	return admitted
 }
 
-func (c *Client) forwardGroupDatagram(senderID string, class protocol.TrafficClass, packet endpoint.Datagram, deadline time.Time) {
+func (c *Client) forwardRoomDatagram(senderID string, class protocol.TrafficClass, packet endpoint.Datagram, deadline time.Time) {
 	if c.roomNetwork == nil {
 		return
 	}

@@ -209,7 +209,7 @@ func (a *App) initializeAudio() error {
 	if existingAudioEngine != nil {
 		return nil
 	}
-	audioEngine, err := audio.New(audio.Options{MaxEncodedFrameBytes: protocol.MaxGroupDatagramPayload}, a.logger)
+	audioEngine, err := audio.New(audio.Options{MaxEncodedFrameBytes: protocol.MaxRoomDatagramPayload}, a.logger)
 	if err != nil {
 		a.logger.Warn("initialise voice audio", "error", err)
 		return err

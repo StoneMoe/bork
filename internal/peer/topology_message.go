@@ -55,7 +55,7 @@ func (c *Client) marshalTopologyMessage(generation uint64, recipientID string, r
 	if generation == 0 {
 		return nil, errors.New("topology generation is zero")
 	}
-	if c.groupStreamID == ([16]byte{}) {
+	if c.audioStreamID == ([16]byte{}) {
 		return nil, errors.New("topology audio stream is zero")
 	}
 	candidates := make([]netip.AddrPort, 0, len(c.networkSnapshot.Endpoint.Candidates))
@@ -86,7 +86,7 @@ func (c *Client) marshalTopologyMessage(generation uint64, recipientID string, r
 		}
 		neighbors = append(neighbors, entry)
 	}
-	return encodeTopologyMessage(topologyMessage{generation: generation, audioStreamID: c.groupStreamID, candidates: candidates, neighbors: neighbors})
+	return encodeTopologyMessage(topologyMessage{generation: generation, audioStreamID: c.audioStreamID, candidates: candidates, neighbors: neighbors})
 }
 
 func encodeTopologyMessage(message topologyMessage) ([]byte, error) {

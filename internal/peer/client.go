@@ -92,13 +92,13 @@ type Client struct {
 	remotePeers                map[string]*RemotePeer
 	topologyGeneration         uint64
 	topology                   map[string]*topologyPeer
-	groupSenderID              [32]byte
-	groupStreamID              [16]byte
-	groupProtector             cipher.AEAD
-	groupSendSequence          uint64
-	groupStreamPendingTopology bool
-	groupReceivers             map[groupStreamKey]*groupReceiveState
-	screenVideoReceivers       map[groupStreamKey]*screenVideoReceiveState
+	roomDatagramSenderID       [32]byte
+	audioStreamID              [16]byte
+	roomDatagramProtector      cipher.AEAD
+	audioSendSequence          uint64
+	audioStreamPendingTopology bool
+	roomDatagramReceivers      map[roomDatagramStreamKey]*roomDatagramReceiveState
+	screenVideoReceivers       map[roomDatagramStreamKey]*screenVideoReceiveState
 	screenVideoRetainedBytes   int
 	fanout                     outboundFanout
 	fanoutDirty                bool
@@ -134,36 +134,36 @@ func NewClient(roomInvite invite.Invite, networkOptions networking.Options, logg
 }
 
 func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, networkFactory roomNetworkFactory, logger *slog.Logger) *Client {
-	groupProtector := protocol.NewGroupDatagramCipher(roomInvite.GroupMediaKey())
+	roomDatagramProtector := protocol.NewRoomDatagramCipher(roomInvite.RoomDatagramKey())
 	client := &Client{
-		localIdentity:        localIdentity,
-		roomInvite:           roomInvite,
-		logger:               logger,
-		networkFactory:       networkFactory,
-		snapshot:             ClientSnapshot{Name: roomInvite.DisplayName, Phase: "gathering", RemotePeers: []RemotePeerSnapshot{}},
-		roomTag:              roomInvite.RoomTag(),
-		admissionKey:         roomInvite.AdmissionKey(),
-		discoveredAddresses:  make(map[netip.AddrPort]discoveredAddress),
-		remotePeers:          make(map[string]*RemotePeer),
-		topology:             make(map[string]*topologyPeer),
-		stateChanges:         make(chan struct{}, 1),
-		memberStateUpdates:   make(chan struct{}, 1),
-		screenCommands:       make(chan screenCommand),
-		screenVideoChunks:    make(chan ScreenVideoChunk, maxCompletedScreenVideoChunks),
-		fileCommands:         make(chan fileCommand),
-		fileWorkResults:      make(chan fileWorkResult, 64),
-		loopReady:            make(chan struct{}),
-		loopDone:             make(chan struct{}),
-		localMemberState:     memberState{generation: 1},
-		localScreenState:     screenState{generation: 1},
-		topologyGeneration:   1,
-		groupProtector:       groupProtector,
-		groupReceivers:       make(map[groupStreamKey]*groupReceiveState),
-		screenVideoReceivers: make(map[groupStreamKey]*screenVideoReceiveState),
-		fileTransfers:        make(map[[16]byte]*fileTransfer),
-		fanoutDirty:          true,
+		localIdentity:         localIdentity,
+		roomInvite:            roomInvite,
+		logger:                logger,
+		networkFactory:        networkFactory,
+		snapshot:              ClientSnapshot{Name: roomInvite.DisplayName, Phase: "gathering", RemotePeers: []RemotePeerSnapshot{}},
+		roomTag:               roomInvite.RoomTag(),
+		admissionKey:          roomInvite.AdmissionKey(),
+		discoveredAddresses:   make(map[netip.AddrPort]discoveredAddress),
+		remotePeers:           make(map[string]*RemotePeer),
+		topology:              make(map[string]*topologyPeer),
+		stateChanges:          make(chan struct{}, 1),
+		memberStateUpdates:    make(chan struct{}, 1),
+		screenCommands:        make(chan screenCommand),
+		screenVideoChunks:     make(chan ScreenVideoChunk, maxCompletedScreenVideoChunks),
+		fileCommands:          make(chan fileCommand),
+		fileWorkResults:       make(chan fileWorkResult, 64),
+		loopReady:             make(chan struct{}),
+		loopDone:              make(chan struct{}),
+		localMemberState:      memberState{generation: 1},
+		localScreenState:      screenState{generation: 1},
+		topologyGeneration:    1,
+		roomDatagramProtector: roomDatagramProtector,
+		roomDatagramReceivers: make(map[roomDatagramStreamKey]*roomDatagramReceiveState),
+		screenVideoReceivers:  make(map[roomDatagramStreamKey]*screenVideoReceiveState),
+		fileTransfers:         make(map[[16]byte]*fileTransfer),
+		fanoutDirty:           true,
 	}
-	copy(client.groupSenderID[:], localIdentity.PublicKey())
+	copy(client.roomDatagramSenderID[:], localIdentity.PublicKey())
 	return client
 }
 
@@ -181,7 +181,7 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	if err := c.rotateHelloEpoch(); err != nil {
 		return err
 	}
-	c.initGroupStream()
+	c.initAudioStream()
 	c.applyDesiredMemberState()
 
 	ctx, cancel := context.WithCancel(parent)
@@ -239,7 +239,7 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 				}
 				handled = true
 			case <-sendReady:
-				mediaPort.ConsumeSend(c.sendGroupMedia)
+				mediaPort.ConsumeSend(c.sendAudioFrame)
 				realtimeEvents++
 				handled = true
 			default:
@@ -311,7 +311,7 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 			}
 			c.handlePacket(packet, mediaPort)
 		case <-sendReady:
-			mediaPort.ConsumeSend(c.sendGroupMedia)
+			mediaPort.ConsumeSend(c.sendAudioFrame)
 		case now := <-helloTicker.C:
 			c.sendHellos(now)
 			c.sendBridgeHellos(now)
@@ -329,7 +329,7 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 				c.publishStateChange()
 			}
 			c.expireTopology(now)
-			c.expireGroupStreams(now)
+			c.expireRoomDatagramStreams(now)
 			c.expireScreenVideoChunks(now)
 		case err := <-networkResult:
 			if ctx.Err() != nil {

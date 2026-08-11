@@ -26,7 +26,7 @@ const (
 	screenStateSize                    = 31
 	screenVideoFragmentVersion         = 1
 	screenVideoFragmentHeaderSize      = 35
-	maxScreenVideoFragmentBytes        = protocol.MaxGroupDatagramPayload - screenVideoFragmentHeaderSize
+	maxScreenVideoFragmentBytes        = protocol.MaxRoomDatagramPayload - screenVideoFragmentHeaderSize
 	maxScreenVideoFragments            = (MaxScreenVideoChunkBytes + maxScreenVideoFragmentBytes - 1) / maxScreenVideoFragmentBytes
 	maxScreenVideoDurationMicros       = 1_000_000
 	maxScreenVideoTimestamp            = (1 << 53) - 1
@@ -278,7 +278,7 @@ func encodeScreenVideoFragments(metadata screenVideoMetadata, data []byte) ([][]
 }
 
 func decodeScreenVideoFragment(payload []byte) (decodedScreenVideoFragment, error) {
-	if len(payload) <= screenVideoFragmentHeaderSize || len(payload) > protocol.MaxGroupDatagramPayload || payload[0] != screenVideoFragmentVersion || payload[1]&^screenVideoFlagKeyFrame != 0 {
+	if len(payload) <= screenVideoFragmentHeaderSize || len(payload) > protocol.MaxRoomDatagramPayload || payload[0] != screenVideoFragmentVersion || payload[1]&^screenVideoFlagKeyFrame != 0 {
 		return decodedScreenVideoFragment{}, errors.New("screen video fragment encoding is invalid")
 	}
 	codec, ok := screenVideoCodecName(payload[2])
@@ -491,11 +491,11 @@ func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFram
 	packets := make([][]byte, 0, len(fragments))
 	for _, fragment := range fragments {
 		c.screenVideoSendSequence++
-		header := protocol.GroupDatagramHeader{
-			Class: protocol.TrafficInteractive, SenderID: c.groupSenderID,
+		header := protocol.RoomDatagramHeader{
+			Class: protocol.TrafficInteractive, SenderID: c.roomDatagramSenderID,
 			StreamID: c.localScreenState.streamID, Sequence: c.screenVideoSendSequence,
 		}
-		packet, marshalErr := protocol.MarshalGroupDatagram(c.roomTag, header, c.screenVideoChunkID, fragment, c.groupProtector, c.localIdentity)
+		packet, marshalErr := protocol.MarshalRoomDatagram(c.roomTag, header, c.screenVideoChunkID, fragment, c.roomDatagramProtector, c.localIdentity)
 		if marshalErr != nil {
 			return false, marshalErr
 		}
@@ -525,7 +525,7 @@ func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFram
 	return c.sendRealtimePacketsToPeers(protocol.TrafficInteractive, packets, ready, now.Add(screenVideoChunkTTL), 0), nil
 }
 
-func (c *Client) acceptScreenVideoFragment(key groupStreamKey, chunkID uint32, fragment decodedScreenVideoFragment, packet []byte, now time.Time) *completedScreenVideoChunk {
+func (c *Client) acceptScreenVideoFragment(key roomDatagramStreamKey, chunkID uint32, fragment decodedScreenVideoFragment, packet []byte, now time.Time) *completedScreenVideoChunk {
 	state := c.screenVideoReceivers[key]
 	if state == nil {
 		state = &screenVideoReceiveState{assemblies: make(map[uint32]*screenVideoAssembly)}
@@ -609,7 +609,7 @@ func (c *Client) makeScreenVideoRetentionRoom(current *screenVideoAssembly, cost
 		return false
 	}
 	for cost > maxScreenVideoRetainedBytes-c.screenVideoRetainedBytes {
-		var oldestKey groupStreamKey
+		var oldestKey roomDatagramStreamKey
 		var oldestChunkID uint32
 		var oldestAt time.Time
 		found := false
@@ -631,7 +631,7 @@ func (c *Client) makeScreenVideoRetentionRoom(current *screenVideoAssembly, cost
 	return true
 }
 
-func (c *Client) removeScreenVideoAssembly(key groupStreamKey) {
+func (c *Client) removeScreenVideoAssembly(key roomDatagramStreamKey) {
 	state := c.screenVideoReceivers[key]
 	if state == nil {
 		return
@@ -642,7 +642,7 @@ func (c *Client) removeScreenVideoAssembly(key groupStreamKey) {
 	state.assemblies = nil
 }
 
-func (c *Client) removeScreenVideoChunkAssembly(key groupStreamKey, chunkID uint32) {
+func (c *Client) removeScreenVideoChunkAssembly(key roomDatagramStreamKey, chunkID uint32) {
 	state := c.screenVideoReceivers[key]
 	if state == nil || state.assemblies[chunkID] == nil {
 		return

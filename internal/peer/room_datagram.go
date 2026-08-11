@@ -14,63 +14,63 @@ import (
 )
 
 const (
-	groupStreamIdle = 30 * time.Second
+	roomDatagramStreamIdle = 30 * time.Second
 	// Signed room members can create arbitrary StreamIDs; bound retained replay
 	// state without imposing a member or concurrent-speaker product limit.
-	maxGroupReceiveStreams = 4096
+	maxRoomDatagramReceiveStreams = 4096
 )
 
-type groupStreamKey struct {
+type roomDatagramStreamKey struct {
 	sender [32]byte
 	stream [16]byte
 	class  protocol.TrafficClass
 }
 
-type groupReceiveState struct {
+type roomDatagramReceiveState struct {
 	sequenceWindow
 	lastSeen time.Time
 }
 
-func (c *Client) initGroupStream() {
-	previous := c.groupStreamID
-	c.groupStreamID = [16]byte{}
-	for c.groupStreamID == ([16]byte{}) {
-		rand.Read(c.groupStreamID[:])
+func (c *Client) initAudioStream() {
+	previous := c.audioStreamID
+	c.audioStreamID = [16]byte{}
+	for c.audioStreamID == ([16]byte{}) {
+		rand.Read(c.audioStreamID[:])
 	}
-	c.groupSendSequence = 0
+	c.audioSendSequence = 0
 	if previous != ([16]byte{}) {
 		c.markTopologyDirty()
 	}
 }
 
-func (c *Client) sendGroupMedia(frame media.SendFrame) {
-	if len(frame.Payload) == 0 || len(frame.Payload) > protocol.MaxGroupDatagramPayload || c.roomNetwork == nil || c.groupProtector == nil {
+func (c *Client) sendAudioFrame(frame media.SendFrame) {
+	if len(frame.Payload) == 0 || len(frame.Payload) > protocol.MaxRoomDatagramPayload || c.roomNetwork == nil || c.roomDatagramProtector == nil {
 		return
 	}
 	now := time.Now()
 	if !frame.Deadline.IsZero() && now.After(frame.Deadline) {
 		return
 	}
-	if c.groupStreamPendingTopology {
+	if c.audioStreamPendingTopology {
 		c.queueTopologySnapshots(now, false)
-		if !c.groupStreamTopologyReady() {
+		if !c.audioStreamTopologyReady() {
 			return
 		}
-		c.groupStreamPendingTopology = false
+		c.audioStreamPendingTopology = false
 	}
 	c.refreshFanout(now)
-	if c.groupSendSequence == math.MaxUint64 {
-		c.initGroupStream()
-		c.groupStreamPendingTopology = true
+	if c.audioSendSequence == math.MaxUint64 {
+		c.initAudioStream()
+		c.audioStreamPendingTopology = true
 		c.queueTopologySnapshots(now, true)
 		return
 	}
-	c.groupSendSequence++
-	header := protocol.GroupDatagramHeader{
-		Class: protocol.TrafficAudio, SenderID: c.groupSenderID,
-		StreamID: c.groupStreamID, Sequence: c.groupSendSequence,
+	c.audioSendSequence++
+	header := protocol.RoomDatagramHeader{
+		Class: protocol.TrafficAudio, SenderID: c.roomDatagramSenderID,
+		StreamID: c.audioStreamID, Sequence: c.audioSendSequence,
 	}
-	packet, err := protocol.MarshalGroupDatagram(c.roomTag, header, frame.Timestamp, frame.Payload, c.groupProtector, c.localIdentity)
+	packet, err := protocol.MarshalRoomDatagram(c.roomTag, header, frame.Timestamp, frame.Payload, c.roomDatagramProtector, c.localIdentity)
 	if err != nil {
 		return
 	}
@@ -86,9 +86,9 @@ func (c *Client) sendGroupMedia(frame media.SendFrame) {
 	c.sendRealtimeToPeers(protocol.TrafficAudio, packet, destinations, frame.Deadline, frame.Generation)
 }
 
-func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.PeerPort) {
-	header, err := protocol.ParseGroupDatagramHeader(packet.Data, c.roomTag)
-	if err != nil || (header.Class != protocol.TrafficAudio && header.Class != protocol.TrafficInteractive) || header.SenderID == c.groupSenderID {
+func (c *Client) handleRoomDatagram(packet endpoint.Datagram, mediaPort media.PeerPort) {
+	header, err := protocol.ParseRoomDatagramHeader(packet.Data, c.roomTag)
+	if err != nil || (header.Class != protocol.TrafficAudio && header.Class != protocol.TrafficInteractive) || header.SenderID == c.roomDatagramSenderID {
 		return
 	}
 	remoteIdentity, err := identity.FromPublicKey(ed25519.PublicKey(header.SenderID[:]))
@@ -108,16 +108,16 @@ func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.P
 	if header.Class == protocol.TrafficInteractive && (!remote.session.remoteScreenState.active || remote.session.remoteScreenState.streamID != header.StreamID) {
 		return
 	}
-	key := groupStreamKey{sender: header.SenderID, stream: header.StreamID, class: header.Class}
-	state := c.groupReceivers[key]
+	key := roomDatagramStreamKey{sender: header.SenderID, stream: header.StreamID, class: header.Class}
+	state := c.roomDatagramReceivers[key]
 	newState := state == nil
 	if state == nil {
-		state = &groupReceiveState{}
+		state = &roomDatagramReceiveState{}
 	}
 	if !state.mayAccept(header.Sequence) {
 		return
 	}
-	decoded, err := protocol.ParseGroupDatagram(packet.Data, c.roomTag, header, c.groupProtector)
+	decoded, err := protocol.ParseRoomDatagram(packet.Data, c.roomTag, header, c.roomDatagramProtector)
 	if err != nil {
 		return
 	}
@@ -135,11 +135,11 @@ func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.P
 		return
 	}
 	if newState {
-		if len(c.groupReceivers) >= maxGroupReceiveStreams {
-			var oldestKey groupStreamKey
+		if len(c.roomDatagramReceivers) >= maxRoomDatagramReceiveStreams {
+			var oldestKey roomDatagramStreamKey
 			var oldestAt time.Time
 			found := false
-			for candidate, retained := range c.groupReceivers {
+			for candidate, retained := range c.roomDatagramReceivers {
 				if !found || retained.lastSeen.Before(oldestAt) {
 					oldestKey = candidate
 					oldestAt = retained.lastSeen
@@ -149,11 +149,11 @@ func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.P
 			if !found {
 				return
 			}
-			delete(c.groupReceivers, oldestKey)
+			delete(c.roomDatagramReceivers, oldestKey)
 			c.removeScreenVideoAssembly(oldestKey)
 			delete(c.screenVideoReceivers, oldestKey)
 		}
-		c.groupReceivers[key] = state
+		c.roomDatagramReceivers[key] = state
 	}
 	now := packet.ReceivedAt
 	if now.IsZero() {
@@ -175,7 +175,7 @@ func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.P
 		})
 		return
 	}
-	c.forwardGroupDatagram(remoteIdentity.PeerID(), header.Class, packet, now.Add(10*time.Millisecond))
+	c.forwardRoomDatagram(remoteIdentity.PeerID(), header.Class, packet, now.Add(10*time.Millisecond))
 	if mediaPort != nil {
 		mediaPort.SubmitReceived(media.ReceivedFrame{
 			SourceID: remoteIdentity.PeerID(), StreamID: header.StreamID,
@@ -185,7 +185,7 @@ func (c *Client) handleGroupDatagram(packet endpoint.Datagram, mediaPort media.P
 	}
 }
 
-func (c *Client) groupStreamTopologyReady() bool {
+func (c *Client) audioStreamTopologyReady() bool {
 	for _, peer := range c.remotePeers {
 		session := peer.session
 		if session == nil || !session.authenticated {
@@ -207,10 +207,10 @@ func (c *Client) authenticatedDirectSource(address netip.AddrPort) bool {
 	return false
 }
 
-func (c *Client) expireGroupStreams(now time.Time) {
-	for key, state := range c.groupReceivers {
-		if state.lastSeen.Add(groupStreamIdle).Before(now) {
-			delete(c.groupReceivers, key)
+func (c *Client) expireRoomDatagramStreams(now time.Time) {
+	for key, state := range c.roomDatagramReceivers {
+		if state.lastSeen.Add(roomDatagramStreamIdle).Before(now) {
+			delete(c.roomDatagramReceivers, key)
 			c.removeScreenVideoAssembly(key)
 			delete(c.screenVideoReceivers, key)
 		}

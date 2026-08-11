@@ -148,8 +148,8 @@ func (e *Endpoint) classifyRoomPacket(packet []byte) packetClass {
 		return packetDrop
 	}
 	switch packetType {
-	case protocol.PacketGroupDatagram:
-		header, err := protocol.ParseGroupDatagramHeader(packet, e.roomTag)
+	case protocol.PacketRoomDatagram:
+		header, err := protocol.ParseRoomDatagramHeader(packet, e.roomTag)
 		if err != nil {
 			return packetDrop
 		}

@@ -15,7 +15,7 @@ const (
 	PacketPing          PacketType = 2
 	PacketPong          PacketType = 3
 	PacketBridgeControl PacketType = 4
-	PacketGroupDatagram PacketType = 5
+	PacketRoomDatagram  PacketType = 5
 	PacketReliable      PacketType = 6
 
 	prefixSize            = 4 + 1 + 16
@@ -32,12 +32,12 @@ const (
 
 	MaxDatagramSize = 1200
 
-	// Group datagrams are sealed once per stream and forwarded verbatim. The
+	// Room datagrams are sealed once per stream and forwarded verbatim. The
 	// authenticated cleartext header exposes only scheduling/routing metadata.
-	groupDatagramHeaderSize    = prefixSize + 1 + 32 + 16 + 8
-	groupDatagramSignatureSize = ed25519.SignatureSize
-	MaxGroupDatagramPayload    = MaxDatagramSize - groupDatagramHeaderSize - 4 - aeadTagSize - groupDatagramSignatureSize
-	groupDatagramMinPacketSize = groupDatagramHeaderSize + 4 + 1 + aeadTagSize + groupDatagramSignatureSize
+	roomDatagramHeaderSize    = prefixSize + 1 + 32 + 16 + 8
+	roomDatagramSignatureSize = ed25519.SignatureSize
+	MaxRoomDatagramPayload    = MaxDatagramSize - roomDatagramHeaderSize - 4 - aeadTagSize - roomDatagramSignatureSize
+	roomDatagramMinPacketSize = roomDatagramHeaderSize + 4 + 1 + aeadTagSize + roomDatagramSignatureSize
 )
 
 type PacketType byte
@@ -71,8 +71,8 @@ func ValidPacketSize(packetType PacketType, size int) bool {
 		return size == controlPacketSize
 	case PacketBridgeControl:
 		return size >= bridgeMinPacketSize && size <= MaxDatagramSize
-	case PacketGroupDatagram:
-		return size >= groupDatagramMinPacketSize && size <= MaxDatagramSize
+	case PacketRoomDatagram:
+		return size >= roomDatagramMinPacketSize && size <= MaxDatagramSize
 	case PacketReliable:
 		return size >= establishedHeaderSize+reliablePlaintextFixedSize+aeadTagSize && size <= MaxBridgeInnerSize
 	default:
