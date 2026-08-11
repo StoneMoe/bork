@@ -536,6 +536,12 @@ func applyGainRamp(samples []float32, from, to float32) float32 {
 	return to
 }
 
+func playbackGainFactor(percent int64) float32 {
+	// A squared curve adds perceptual range while keeping 100% at unity.
+	gain := float32(percent) / 100
+	return gain * gain
+}
+
 type notificationTone struct {
 	phase             float64
 	frequency         float64
@@ -704,7 +710,7 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 	mixer := newMixer(e.maxEncodedFrameBytes)
 	nextIndex := uint64(1)
 	discard := make([]float32, FrameSamples)
-	appliedPlaybackGain := float32(e.playbackGain.Load()) / 100
+	appliedPlaybackGain := playbackGainFactor(e.playbackGain.Load())
 	var notification notificationTone
 	mixFrame := func(destination []float32, consumeNotification bool) (bool, error) {
 		mixer.loudnessNormalization = e.remoteLoudnessNormalization.Load()
@@ -728,7 +734,7 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 		if consumeNotification {
 			localOnly = notification.mix(destination, e.playbackMuted.Load())
 		}
-		targetGain := float32(e.playbackGain.Load()) / 100
+		targetGain := playbackGainFactor(e.playbackGain.Load())
 		appliedPlaybackGain = applyGainRamp(destination, appliedPlaybackGain, targetGain)
 		return localOnly, err
 	}
