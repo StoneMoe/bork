@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/brand/readme-banner.svg" alt="Bork - Voice first. No center." width="100%">
+  <img src="assets/brand/appicon.png" alt="Bork" width="240">
 </p>
 
 Bork 是一个低资源占用、低延迟、去中心化的游戏语音软件。
