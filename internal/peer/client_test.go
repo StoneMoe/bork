@@ -41,14 +41,14 @@ func TestNewClientUsesEphemeralRoomIdentity(t *testing.T) {
 func TestExpireRemotePeersDropsStaleSessionRecord(t *testing.T) {
 	now := time.Now()
 	stale := now.Add(-remotePeerTimeout - time.Second)
-	freshCandidate := &PeeringSession{lastAuthenticatedPacketAt: now}
+	freshPending := &PeeringSession{lastAuthenticatedPacketAt: now}
 	client := &Client{remotePeers: map[string]*RemotePeer{
 		"gone": {
-			session: &PeeringSession{everAuthenticated: true, lastAuthenticatedPacketAt: stale},
+			activeSession: &PeeringSession{everAuthenticated: true, lastAuthenticatedPacketAt: stale},
 		},
-		"candidate": {
-			session:          &PeeringSession{everAuthenticated: true, lastAuthenticatedPacketAt: stale},
-			candidateSession: freshCandidate,
+		"pending": {
+			activeSession:  &PeeringSession{everAuthenticated: true, lastAuthenticatedPacketAt: stale},
+			pendingSession: freshPending,
 		},
 	}}
 
@@ -57,8 +57,8 @@ func TestExpireRemotePeersDropsStaleSessionRecord(t *testing.T) {
 	if _, exists := client.remotePeers["gone"]; exists {
 		t.Fatal("stale remote session record was retained")
 	}
-	peer := client.remotePeers["candidate"]
-	if peer == nil || peer.session != nil || peer.candidateSession != freshCandidate {
-		t.Fatal("fresh candidate session was not preserved")
+	peer := client.remotePeers["pending"]
+	if peer == nil || peer.activeSession != nil || peer.pendingSession != freshPending {
+		t.Fatal("fresh pending session was not preserved")
 	}
 }

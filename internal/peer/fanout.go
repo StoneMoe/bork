@@ -38,11 +38,11 @@ func (c *Client) refreshFanout(now time.Time) {
 	direct := make(map[string]struct{})
 	listeners := make([]string, 0, len(c.remotePeers))
 	for peerID, peer := range c.remotePeers {
-		if peer.session == nil || !peer.session.authenticated {
+		if peer.activeSession == nil || !peer.activeSession.authenticated {
 			continue
 		}
 		listeners = append(listeners, peerID)
-		if peer.session.path.IsDirect() {
+		if peer.activeSession.path.IsDirect() {
 			direct[peerID] = struct{}{}
 		}
 	}
@@ -53,20 +53,20 @@ func (c *Client) refreshFanout(now time.Time) {
 		plan.generation = 1
 	}
 	type deployment struct {
-		session *PeeringSession
-		payload []byte
+		activeSession *PeeringSession
+		payload       []byte
 	}
 	deployments := make([]deployment, 0, len(plan.assignments)+len(c.fanout.assignments))
 	for _, peerID := range plan.destinations {
 		peer := c.remotePeers[peerID]
-		if peer == nil || peer.session == nil || !peer.session.authenticated || !peer.session.path.IsDirect() || peer.session.reliable == nil {
+		if peer == nil || peer.activeSession == nil || !peer.activeSession.authenticated || !peer.activeSession.path.IsDirect() || peer.activeSession.reliable == nil {
 			return
 		}
 		payload, err := marshalFanoutAssignment(plan.generation, plan.assignments[peerID], c.remotePeers)
-		if err != nil || peer.session.reliable.canQueue(reliableChannelFanout, true, len(payload)) != nil {
+		if err != nil || peer.activeSession.reliable.canQueue(reliableChannelFanout, true, len(payload)) != nil {
 			return
 		}
-		deployments = append(deployments, deployment{session: peer.session, payload: payload})
+		deployments = append(deployments, deployment{activeSession: peer.activeSession, payload: payload})
 	}
 	oldOnly := make([]string, 0, len(c.fanout.assignments))
 	for peerID := range c.fanout.assignments {
@@ -77,18 +77,18 @@ func (c *Client) refreshFanout(now time.Time) {
 	sort.Strings(oldOnly)
 	for _, peerID := range oldOnly {
 		peer := c.remotePeers[peerID]
-		if peer == nil || peer.session == nil || !peer.session.authenticated || !peer.session.path.IsDirect() || peer.session.reliable == nil {
+		if peer == nil || peer.activeSession == nil || !peer.activeSession.authenticated || !peer.activeSession.path.IsDirect() || peer.activeSession.reliable == nil {
 			continue
 		}
 		payload, err := marshalFanoutAssignment(plan.generation, nil, c.remotePeers)
-		if err != nil || peer.session.reliable.canQueue(reliableChannelFanout, true, len(payload)) != nil {
+		if err != nil || peer.activeSession.reliable.canQueue(reliableChannelFanout, true, len(payload)) != nil {
 			return
 		}
-		deployments = append(deployments, deployment{session: peer.session, payload: payload})
+		deployments = append(deployments, deployment{activeSession: peer.activeSession, payload: payload})
 	}
 	for _, deployment := range deployments {
 		// Preflight above is atomic under the client's single-owner loop.
-		_ = deployment.session.reliable.queue(reliableChannelFanout, true, deployment.payload)
+		_ = deployment.activeSession.reliable.queue(reliableChannelFanout, true, deployment.payload)
 	}
 	plan.activateAt = now.Add(fanoutActivationDelay)
 	c.fanout = plan
@@ -99,15 +99,15 @@ func constrainFanoutToActivePaths(plan outboundFanout, peers map[string]*RemoteP
 	forced := make(map[string]string)
 	targets := make([]string, 0)
 	for targetID, peer := range peers {
-		if peer == nil || peer.session == nil || !peer.session.authenticated || peer.session.path.IsDirect() {
+		if peer == nil || peer.activeSession == nil || !peer.activeSession.authenticated || peer.activeSession.path.IsDirect() {
 			continue
 		}
-		intermediary, err := identityFromRaw(peer.session.path.Intermediary())
+		intermediary, err := identityFromRaw(peer.activeSession.path.Intermediary())
 		if err != nil {
 			continue
 		}
 		forwarder := peers[intermediary.PeerID()]
-		if forwarder == nil || forwarder.session == nil || !forwarder.session.authenticated || !forwarder.session.path.IsDirect() || forwarder.session.path.Address() != peer.session.path.Address() {
+		if forwarder == nil || forwarder.activeSession == nil || !forwarder.activeSession.authenticated || !forwarder.activeSession.path.IsDirect() || forwarder.activeSession.path.Address() != peer.activeSession.path.Address() {
 			continue
 		}
 		forced[targetID] = intermediary.PeerID()
@@ -145,7 +145,7 @@ func (c *Client) fanoutReady(now time.Time) bool {
 	}
 	for _, forwarderID := range c.fanout.destinations {
 		forwarder := c.remotePeers[forwarderID]
-		if forwarder == nil || forwarder.session == nil || !forwarder.session.authenticated || forwarder.session.reliable == nil || forwarder.session.reliable.pendingChannel(reliableChannelFanout) {
+		if forwarder == nil || forwarder.activeSession == nil || !forwarder.activeSession.authenticated || forwarder.activeSession.reliable == nil || forwarder.activeSession.reliable.pendingChannel(reliableChannelFanout) {
 			return false
 		}
 	}
@@ -263,14 +263,14 @@ func (c *Client) handleReliableMessage(sender *RemotePeer, message deliveredReli
 	if message.channel != reliableChannelFanout {
 		return
 	}
-	if sender.session == nil {
+	if sender.activeSession == nil {
 		return
 	}
 	generation, encodedListeners, err := parseFanoutAssignment(message.payload)
 	if err != nil {
 		return
 	}
-	if generation <= sender.session.inboundFanout.generation {
+	if generation <= sender.activeSession.inboundFanout.generation {
 		return
 	}
 	listeners := make([]string, 0, len(encodedListeners))
@@ -287,7 +287,7 @@ func (c *Client) handleReliableMessage(sender *RemotePeer, message deliveredReli
 		seen[peerID] = struct{}{}
 		listeners = append(listeners, peerID)
 	}
-	sender.session.inboundFanout = fanoutAssignment{generation: generation, listeners: listeners}
+	sender.activeSession.inboundFanout = fanoutAssignment{generation: generation, listeners: listeners}
 }
 
 func (c *Client) sendRealtimePacketsToPeers(class protocol.TrafficClass, packets [][]byte, peerIDs []string, deadline time.Time, generation uint64) bool {
@@ -301,11 +301,11 @@ func (c *Client) sendRealtimePacketsToPeers(class protocol.TrafficClass, packets
 	}
 	for _, peerID := range peerIDs {
 		peer := c.remotePeers[peerID]
-		if peer == nil || peer.session == nil || !peer.session.authenticated || !peer.session.path.IsDirect() {
+		if peer == nil || peer.activeSession == nil || !peer.activeSession.authenticated || !peer.activeSession.path.IsDirect() {
 			continue
 		}
 		for _, packet := range packets {
-			batch.Datagrams = append(batch.Datagrams, endpoint.RealtimeDatagram{Data: packet, Destination: peer.session.path.Address()})
+			batch.Datagrams = append(batch.Datagrams, endpoint.RealtimeDatagram{Data: packet, Destination: peer.activeSession.path.Address()})
 			if len(batch.Datagrams) == endpoint.MaxRealtimeBatchDatagrams {
 				admitted = c.roomNetwork.SendRealtimeBatch(batch) == nil || admitted
 				batch.Datagrams = make([]endpoint.RealtimeDatagram, 0, endpoint.MaxRealtimeBatchDatagrams)
@@ -323,10 +323,10 @@ func (c *Client) forwardRoomDatagram(senderID string, class protocol.TrafficClas
 		return
 	}
 	sender := c.remotePeers[senderID]
-	if sender == nil || sender.session == nil || !sender.session.authenticated || !sender.session.path.IsDirect() || sender.session.path.Address() != packet.From {
+	if sender == nil || sender.activeSession == nil || !sender.activeSession.authenticated || !sender.activeSession.path.IsDirect() || sender.activeSession.path.Address() != packet.From {
 		return
 	}
-	assignment := sender.session.inboundFanout
+	assignment := sender.activeSession.inboundFanout
 	if assignment.generation == 0 {
 		return
 	}

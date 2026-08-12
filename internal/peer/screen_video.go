@@ -441,27 +441,27 @@ func (c *Client) queueScreenStates() {
 		return
 	}
 	for _, peer := range c.remotePeers {
-		session := peer.session
-		if session == nil || !session.authenticated || session.reliable == nil || session.screenStateSentGeneration == c.localScreenState.generation {
+		activeSession := peer.activeSession
+		if activeSession == nil || !activeSession.authenticated || activeSession.reliable == nil || activeSession.screenStateSentGeneration == c.localScreenState.generation {
 			continue
 		}
-		if session.reliable.queue(reliableChannelScreenState, false, payload) != nil {
+		if activeSession.reliable.queue(reliableChannelScreenState, false, payload) != nil {
 			continue
 		}
-		session.screenStateSentGeneration = c.localScreenState.generation
+		activeSession.screenStateSentGeneration = c.localScreenState.generation
 	}
 }
 
-func (c *Client) screenStateReady(session *PeeringSession) bool {
-	return session != nil && session.authenticated && session.reliable != nil && session.screenStateSentGeneration == c.localScreenState.generation && !session.reliable.pendingChannel(reliableChannelScreenState)
+func (c *Client) screenStateReady(activeSession *PeeringSession) bool {
+	return activeSession != nil && activeSession.authenticated && activeSession.reliable != nil && activeSession.screenStateSentGeneration == c.localScreenState.generation && !activeSession.reliable.pendingChannel(reliableChannelScreenState)
 }
 
 func (c *Client) handleScreenState(sender *RemotePeer, payload []byte) {
 	state, err := decodeScreenState(payload)
-	if err != nil || sender == nil || sender.session == nil || state.generation <= sender.session.remoteScreenState.generation {
+	if err != nil || sender == nil || sender.activeSession == nil || state.generation <= sender.activeSession.remoteScreenState.generation {
 		return
 	}
-	sender.session.remoteScreenState = state
+	sender.activeSession.remoteScreenState = state
 	c.removeScreenVideoAssembliesForSender(rawPeerIdentity(sender.identity))
 	c.publishStateChange()
 }
@@ -507,7 +507,7 @@ func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFram
 	if !c.fanoutReady(now) {
 		destinations = make([]string, 0, len(c.remotePeers))
 		for peerID, peer := range c.remotePeers {
-			if peer.session != nil && peer.session.authenticated && peer.session.path.IsDirect() {
+			if peer.activeSession != nil && peer.activeSession.authenticated && peer.activeSession.path.IsDirect() {
 				destinations = append(destinations, peerID)
 			}
 		}
@@ -515,7 +515,7 @@ func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFram
 	}
 	ready := make([]string, 0, len(destinations))
 	for _, peerID := range destinations {
-		if peer := c.remotePeers[peerID]; peer != nil && c.screenStateReady(peer.session) {
+		if peer := c.remotePeers[peerID]; peer != nil && c.screenStateReady(peer.activeSession) {
 			ready = append(ready, peerID)
 		}
 	}
@@ -675,10 +675,10 @@ func (c *Client) forwardScreenVideoChunk(senderID string, source netip.AddrPort,
 		return
 	}
 	sender := c.remotePeers[senderID]
-	if sender == nil || sender.session == nil || !sender.session.authenticated || !sender.session.path.IsDirect() || sender.session.path.Address() != source {
+	if sender == nil || sender.activeSession == nil || !sender.activeSession.authenticated || !sender.activeSession.path.IsDirect() || sender.activeSession.path.Address() != source {
 		return
 	}
-	assignment := sender.session.inboundFanout
+	assignment := sender.activeSession.inboundFanout
 	if assignment.generation == 0 {
 		return
 	}

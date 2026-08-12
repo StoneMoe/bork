@@ -120,22 +120,22 @@ func (c *Client) queueMemberStates() {
 		return
 	}
 	for _, peer := range c.remotePeers {
-		session := peer.session
-		if session == nil || !session.authenticated || session.reliable == nil || session.memberStateSentGeneration == c.localMemberState.generation {
+		activeSession := peer.activeSession
+		if activeSession == nil || !activeSession.authenticated || activeSession.reliable == nil || activeSession.memberStateSentGeneration == c.localMemberState.generation {
 			continue
 		}
-		if session.reliable.queue(reliableChannelMemberState, false, payload) != nil {
+		if activeSession.reliable.queue(reliableChannelMemberState, false, payload) != nil {
 			continue
 		}
-		session.memberStateSentGeneration = c.localMemberState.generation
+		activeSession.memberStateSentGeneration = c.localMemberState.generation
 	}
 }
 
 func (c *Client) handleMemberState(sender *RemotePeer, payload []byte) {
 	state, err := decodeMemberState(payload)
-	if err != nil || sender == nil || sender.session == nil || state.generation <= sender.session.remoteMemberState.generation {
+	if err != nil || sender == nil || sender.activeSession == nil || state.generation <= sender.activeSession.remoteMemberState.generation {
 		return
 	}
-	sender.session.remoteMemberState = state
+	sender.activeSession.remoteMemberState = state
 	c.publishStateChange()
 }

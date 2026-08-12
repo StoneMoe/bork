@@ -35,19 +35,19 @@ type topologyMessage struct {
 func (c *Client) queueTopologySnapshots(now time.Time, force bool) {
 	generation := c.topologyGeneration
 	for peerID, peer := range c.remotePeers {
-		session := peer.session
-		if session == nil || !session.authenticated || session.reliable == nil {
+		activeSession := peer.activeSession
+		if activeSession == nil || !activeSession.authenticated || activeSession.reliable == nil {
 			continue
 		}
-		if !force && session.topologySentGeneration == generation && now.Sub(session.lastTopologyAt) < topologyRefresh {
+		if !force && activeSession.topologySentGeneration == generation && now.Sub(activeSession.lastTopologyAt) < topologyRefresh {
 			continue
 		}
-		payload, err := c.marshalTopologyMessage(generation, peerID, session.path.Address())
-		if err != nil || session.reliable.queue(reliableChannelTopology, true, payload) != nil {
+		payload, err := c.marshalTopologyMessage(generation, peerID, activeSession.path.Address())
+		if err != nil || activeSession.reliable.queue(reliableChannelTopology, true, payload) != nil {
 			continue
 		}
-		session.topologySentGeneration = generation
-		session.lastTopologyAt = now
+		activeSession.topologySentGeneration = generation
+		activeSession.lastTopologyAt = now
 	}
 }
 
@@ -72,7 +72,7 @@ func (c *Client) marshalTopologyMessage(generation uint64, recipientID string, r
 	}
 	peerIDs := make([]string, 0, len(c.remotePeers))
 	for peerID, peer := range c.remotePeers {
-		if peerID != recipientID && peer.session != nil && peer.session.authenticated && peer.session.path.IsDirect() {
+		if peerID != recipientID && peer.activeSession != nil && peer.activeSession.authenticated && peer.activeSession.path.IsDirect() {
 			peerIDs = append(peerIDs, peerID)
 		}
 	}
@@ -81,7 +81,7 @@ func (c *Client) marshalTopologyMessage(generation uint64, recipientID string, r
 	for _, peerID := range peerIDs {
 		peer := c.remotePeers[peerID]
 		entry := topologyEntry{peerID: rawPeerIdentity(peer.identity)}
-		if address := peer.session.path.Address(); usableTopologyAddress(address, recipientAddress) {
+		if address := peer.activeSession.path.Address(); usableTopologyAddress(address, recipientAddress) {
 			entry.addresses = []netip.AddrPort{address}
 		}
 		neighbors = append(neighbors, entry)
@@ -236,16 +236,16 @@ func (c *Client) handleTopologySnapshot(sender *RemotePeer, payload []byte) {
 
 func (c *Client) handleTopologySnapshotAt(sender *RemotePeer, payload []byte, now time.Time) {
 	message, err := decodeTopologyMessage(payload)
-	if err != nil || sender == nil || sender.session == nil || message.generation < sender.session.topologyReceivedGeneration {
+	if err != nil || sender == nil || sender.activeSession == nil || message.generation < sender.activeSession.topologyReceivedGeneration {
 		return
 	}
-	if message.generation > sender.session.topologyReceivedGeneration {
-		sender.session.topologyReceivedGeneration = message.generation
-		sender.session.audioStreamID = message.audioStreamID
+	if message.generation > sender.activeSession.topologyReceivedGeneration {
+		sender.activeSession.topologyReceivedGeneration = message.generation
+		sender.activeSession.audioStreamID = message.audioStreamID
 	}
 	c.recordTopologyClaims(sender.identity, message.neighbors, now)
 	for _, address := range message.candidates {
-		if usableTopologyAddress(address, sender.session.path.Address()) {
+		if usableTopologyAddress(address, sender.activeSession.path.Address()) {
 			c.addDiscoveryHintAt(discovery.Hint{Address: address, Source: discovery.SourceTopology, ExpiresAt: now.Add(topologyHintTTL)}, now)
 		}
 	}
@@ -255,7 +255,7 @@ func (c *Client) handleTopologySnapshotAt(sender *RemotePeer, payload []byte, no
 			continue
 		}
 		for _, address := range entry.addresses {
-			if usableTopologyAddress(address, sender.session.path.Address()) {
+			if usableTopologyAddress(address, sender.activeSession.path.Address()) {
 				c.addDiscoveryHintAt(discovery.Hint{Address: address, Source: discovery.SourceTopology, ExpiresAt: now.Add(topologyHintTTL)}, now)
 			}
 		}

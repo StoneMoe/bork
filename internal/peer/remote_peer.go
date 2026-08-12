@@ -3,9 +3,9 @@ package peer
 import "bork/internal/identity"
 
 type RemotePeer struct {
-	identity         identity.Identity
-	session          *PeeringSession
-	candidateSession *PeeringSession
+	identity       identity.Identity
+	activeSession  *PeeringSession
+	pendingSession *PeeringSession
 }
 
 type RemotePeerSnapshot struct {

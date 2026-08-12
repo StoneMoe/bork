@@ -78,7 +78,7 @@ func (c *Client) sendAudioFrame(frame media.SendFrame) {
 	if !c.fanoutReady(now) {
 		destinations = make([]string, 0, len(c.remotePeers))
 		for peerID, peer := range c.remotePeers {
-			if peer.session != nil && peer.session.authenticated && peer.session.path.IsDirect() {
+			if peer.activeSession != nil && peer.activeSession.authenticated && peer.activeSession.path.IsDirect() {
 				destinations = append(destinations, peerID)
 			}
 		}
@@ -96,16 +96,16 @@ func (c *Client) handleRoomDatagram(packet endpoint.Datagram, mediaPort media.Pe
 		return
 	}
 	remote := c.remotePeers[remoteIdentity.PeerID()]
-	if remote == nil || remote.session == nil || !remote.session.authenticated {
+	if remote == nil || remote.activeSession == nil || !remote.activeSession.authenticated {
 		return
 	}
 	if !c.authenticatedDirectSource(packet.From) {
 		return
 	}
-	if header.Class == protocol.TrafficAudio && (remote.session.audioStreamID == ([16]byte{}) || remote.session.audioStreamID != header.StreamID) {
+	if header.Class == protocol.TrafficAudio && (remote.activeSession.audioStreamID == ([16]byte{}) || remote.activeSession.audioStreamID != header.StreamID) {
 		return
 	}
-	if header.Class == protocol.TrafficInteractive && (!remote.session.remoteScreenState.active || remote.session.remoteScreenState.streamID != header.StreamID) {
+	if header.Class == protocol.TrafficInteractive && (!remote.activeSession.remoteScreenState.active || remote.activeSession.remoteScreenState.streamID != header.StreamID) {
 		return
 	}
 	key := roomDatagramStreamKey{sender: header.SenderID, stream: header.StreamID, class: header.Class}
@@ -127,7 +127,7 @@ func (c *Client) handleRoomDatagram(packet endpoint.Datagram, mediaPort media.Pe
 			return
 		}
 		fragment, err = decodeScreenVideoFragment(decoded.Payload)
-		if err != nil || !screenVideoFragmentMatchesState(fragment, remote.session.remoteScreenState) {
+		if err != nil || !screenVideoFragmentMatchesState(fragment, remote.activeSession.remoteScreenState) {
 			return
 		}
 	}
@@ -167,7 +167,7 @@ func (c *Client) handleRoomDatagram(packet endpoint.Datagram, mediaPort media.Pe
 		}
 		c.forwardScreenVideoChunk(remoteIdentity.PeerID(), packet.From, complete.packets, complete.deadline)
 		c.deliverScreenVideoChunk(ScreenVideoChunk{
-			PeerID: remoteIdentity.PeerID(), SessionID: remote.session.sessionID, Generation: complete.metadata.generation, StreamID: header.StreamID,
+			PeerID: remoteIdentity.PeerID(), SessionID: remote.activeSession.sessionID, Generation: complete.metadata.generation, StreamID: header.StreamID,
 			ChunkID: complete.chunkID,
 			Codec:   complete.metadata.codec, Width: complete.metadata.width, Height: complete.metadata.height,
 			Timestamp: complete.metadata.timestamp, Duration: complete.metadata.duration,
@@ -187,11 +187,11 @@ func (c *Client) handleRoomDatagram(packet endpoint.Datagram, mediaPort media.Pe
 
 func (c *Client) audioStreamTopologyReady() bool {
 	for _, peer := range c.remotePeers {
-		session := peer.session
-		if session == nil || !session.authenticated {
+		activeSession := peer.activeSession
+		if activeSession == nil || !activeSession.authenticated {
 			continue
 		}
-		if session.reliable == nil || session.topologySentGeneration != c.topologyGeneration || session.reliable.pendingChannel(reliableChannelTopology) {
+		if activeSession.reliable == nil || activeSession.topologySentGeneration != c.topologyGeneration || activeSession.reliable.pendingChannel(reliableChannelTopology) {
 			return false
 		}
 	}
@@ -200,7 +200,7 @@ func (c *Client) audioStreamTopologyReady() bool {
 
 func (c *Client) authenticatedDirectSource(address netip.AddrPort) bool {
 	for _, peer := range c.remotePeers {
-		if peer.session != nil && peer.session.authenticated && peer.session.path.IsDirect() && peer.session.path.Address() == address {
+		if peer.activeSession != nil && peer.activeSession.authenticated && peer.activeSession.path.IsDirect() && peer.activeSession.path.Address() == address {
 			return true
 		}
 	}

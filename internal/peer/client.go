@@ -405,7 +405,7 @@ func (c *Client) applyNetworkSnapshot(snapshot networking.RoomSnapshot) {
 
 func (c *Client) phase() string {
 	for _, peer := range c.remotePeers {
-		if peer.session != nil && peer.session.authenticated {
+		if peer.activeSession != nil && peer.activeSession.authenticated {
 			return "connected"
 		}
 	}

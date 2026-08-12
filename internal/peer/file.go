@@ -173,7 +173,7 @@ func (c *Client) handleFileCommand(command fileCommand) {
 
 func (c *Client) startFileOffer(peerID, path string) (string, error) {
 	peer := c.remotePeers[peerID]
-	if peer == nil || peer.session == nil || !peer.session.authenticated {
+	if peer == nil || peer.activeSession == nil || !peer.activeSession.authenticated {
 		return "", errors.New("recipient is not authenticated")
 	}
 	if c.activeFileTransfer(peerID, "outgoing") != nil {
@@ -191,7 +191,7 @@ func (c *Client) startFileOffer(peerID, path string) (string, error) {
 	}
 	now := time.Now()
 	workContext, cancelWork := context.WithCancel(c.fileContext)
-	transfer := &fileTransfer{id: id, peerID: peerID, sessionID: peer.session.sessionID, direction: "outgoing", path: path, name: filepath.Base(path), status: "preparing", updatedAt: now, working: true, workContext: workContext, cancelWork: cancelWork}
+	transfer := &fileTransfer{id: id, peerID: peerID, sessionID: peer.activeSession.sessionID, direction: "outgoing", path: path, name: filepath.Base(path), status: "preparing", updatedAt: now, working: true, workContext: workContext, cancelWork: cancelWork}
 	c.fileTransfers[id] = transfer
 	c.startFileWork(fileWorkResult{kind: fileWorkOffer, transferID: hex.EncodeToString(id[:])}, func(result *fileWorkResult) {
 		file, err := os.Open(path)
@@ -388,7 +388,7 @@ func (c *Client) handleFileWorkResult(result fileWorkResult) {
 }
 
 func (c *Client) handleFileMessage(sender *RemotePeer, message deliveredReliableMessage) {
-	if sender == nil || sender.session == nil {
+	if sender == nil || sender.activeSession == nil {
 		return
 	}
 	if message.channel == reliableChannelFileControl {
@@ -401,7 +401,7 @@ func (c *Client) handleFileMessage(sender *RemotePeer, message deliveredReliable
 			return
 		}
 		transfer := c.fileTransfers[id]
-		if transfer == nil || transfer.peerID != sender.identity.PeerID() || transfer.sessionID != sender.session.sessionID || fileTerminal(transfer.status) {
+		if transfer == nil || transfer.peerID != sender.identity.PeerID() || transfer.sessionID != sender.activeSession.sessionID || fileTerminal(transfer.status) {
 			return
 		}
 		switch kind {
@@ -421,7 +421,7 @@ func (c *Client) handleFileMessage(sender *RemotePeer, message deliveredReliable
 			c.finishFileTransfer(transfer, "canceled", "canceled by peer")
 		case fileControlACK:
 			if transfer.direction == "outgoing" && transfer.status == "waiting" && value >= transfer.transferred && value <= transfer.size && value-transfer.transferred <= fileChunkSize && (value > transfer.transferred || transfer.size == 0) {
-				sender.session.reliable.discardOutboundChannel(reliableChannelFileData)
+				sender.activeSession.reliable.discardOutboundChannel(reliableChannelFileData)
 				transfer.transferred, transfer.updatedAt = value, time.Now()
 				if value == transfer.size {
 					c.finishFileTransfer(transfer, "completed", "")
@@ -439,7 +439,7 @@ func (c *Client) handleFileMessage(sender *RemotePeer, message deliveredReliable
 	}
 	id, offset, data, err := decodeFileData(message.payload)
 	transfer := c.fileTransfers[id]
-	if err != nil || transfer == nil || transfer.direction != "incoming" || transfer.status != "transferring" || transfer.working || transfer.peerID != sender.identity.PeerID() || transfer.sessionID != sender.session.sessionID || offset != transfer.transferred || uint64(len(data)) > transfer.size-transfer.transferred {
+	if err != nil || transfer == nil || transfer.direction != "incoming" || transfer.status != "transferring" || transfer.working || transfer.peerID != sender.identity.PeerID() || transfer.sessionID != sender.activeSession.sessionID || offset != transfer.transferred || uint64(len(data)) > transfer.size-transfer.transferred {
 		return
 	}
 	transfer.working = true
@@ -461,7 +461,7 @@ func (c *Client) receiveFileOffer(sender *RemotePeer, id [16]byte, offer decoded
 		return
 	}
 	workContext, cancelWork := context.WithCancel(c.fileContext)
-	transfer := &fileTransfer{id: id, peerID: sender.identity.PeerID(), sessionID: sender.session.sessionID, direction: "incoming", name: offer.name, status: "offered", size: offer.size, digest: offer.digest, updatedAt: time.Now(), workContext: workContext, cancelWork: cancelWork}
+	transfer := &fileTransfer{id: id, peerID: sender.identity.PeerID(), sessionID: sender.activeSession.sessionID, direction: "incoming", name: offer.name, status: "offered", size: offer.size, digest: offer.digest, updatedAt: time.Now(), workContext: workContext, cancelWork: cancelWork}
 	c.fileTransfers[id] = transfer
 	c.pruneFileTransfers()
 	c.publishStateChange()
@@ -501,10 +501,10 @@ func (c *Client) queueFileControl(transfer *fileTransfer, kind byte, value uint6
 
 func (c *Client) queueFilePayload(transfer *fileTransfer, channel uint16, ordered bool, payload []byte) error {
 	peer := c.remotePeers[transfer.peerID]
-	if peer == nil || peer.session == nil || !peer.session.authenticated || peer.session.sessionID != transfer.sessionID {
+	if peer == nil || peer.activeSession == nil || !peer.activeSession.authenticated || peer.activeSession.sessionID != transfer.sessionID {
 		return errors.New("file transfer session is unavailable")
 	}
-	return peer.session.reliable.queue(channel, ordered, payload)
+	return peer.activeSession.reliable.queue(channel, ordered, payload)
 }
 
 func encodeFileOffer(transfer *fileTransfer) ([]byte, error) {
@@ -646,11 +646,11 @@ func (c *Client) finishFileTransfer(transfer *fileTransfer, status, reason strin
 		transfer.cancelWork()
 		transfer.cancelWork = nil
 	}
-	if peer := c.remotePeers[transfer.peerID]; peer != nil && peer.session != nil && peer.session.sessionID == transfer.sessionID {
+	if peer := c.remotePeers[transfer.peerID]; peer != nil && peer.activeSession != nil && peer.activeSession.sessionID == transfer.sessionID {
 		if transfer.direction == "outgoing" {
-			peer.session.reliable.discardOutboundChannel(reliableChannelFileData)
+			peer.activeSession.reliable.discardOutboundChannel(reliableChannelFileData)
 		} else {
-			peer.session.reliable.discardInboundChannel(reliableChannelFileData)
+			peer.activeSession.reliable.discardInboundChannel(reliableChannelFileData)
 		}
 	}
 	if transfer.file != nil {
@@ -678,7 +678,7 @@ func (c *Client) expireFileTransfers(now time.Time) {
 			continue
 		}
 		peer := c.remotePeers[transfer.peerID]
-		if peer == nil || peer.session == nil || !peer.session.authenticated || peer.session.sessionID != transfer.sessionID {
+		if peer == nil || peer.activeSession == nil || !peer.activeSession.authenticated || peer.activeSession.sessionID != transfer.sessionID {
 			c.finishFileTransfer(transfer, "failed", "peer session ended")
 			continue
 		}
