@@ -112,6 +112,7 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
   let memberInfoGeneration = 0;
   const localSpeaking = () => props.state.audio.speaking && !props.state.audio.captureMuted;
   const remoteSpeaking = (remotePeer: RemotePeer) => !remotePeer.muted && props.state.audio.speakingPeerIds.includes(remotePeer.peerId);
+  const localName = () => props.state.nickname || props.state.room?.peerId.slice(0, 14) || "佚名";
   const remoteName = (remotePeer: RemotePeer) => remotePeer.nickname || remotePeer.peerId.slice(0, 14);
   const memberStatus = (captureMuted: boolean, playbackMuted: boolean, screenSharing: boolean) => [
     captureMuted ? "麦克风已静音" : "",
@@ -232,12 +233,12 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
                 ref={localNameButton}
                 class="member-name member-name-trigger"
                 type="button"
-                aria-label={`查看 ${props.state.nickname || "本机"} 的详细信息`}
+                aria-label={`查看 ${localName()} 的详细信息`}
                 aria-controls={memberInfoPopoverID}
                 aria-haspopup="dialog"
                 aria-expanded={memberInfoOpen() && selectedMember() === "local"}
                 onClick={(event) => openMemberInfo("local", event.currentTarget)}
-              >{props.state.nickname || "本机"}</button>
+              >{localName()}</button>
               <Show when={props.state.audio.captureMuted}>
                 <span class="member-muted-icon" role="img" aria-label="麦克风已静音" title="麦克风已静音"><MicrophoneIcon muted /></span>
               </Show>
@@ -251,7 +252,7 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
             <span class="visually-hidden">{localSpeaking() ? "正在说话" : "未在说话"}</span>
           </span>
           <span class="member-network">
-            <strong class="member-connection local">本机</strong>
+            <strong class="member-connection local">你</strong>
           </span>
         </div>
         <For each={props.remotePeers.map((peer) => peer.peerId)}>{(peerID) => {
@@ -329,7 +330,6 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
         <Show when={selectedMember() === "local"} fallback={selectedRemote() && (
           <div class="member-info-grid">
             <span><small>昵称</small><b>{remoteName(selectedRemote()!)}</b></span>
-            <span><small>本次入房 PeerID</small><code>{selectedRemote()!.peerId}</code></span>
             <span><small>Session</small><code>{selectedRemote()!.sessionId || "未知"}</code></span>
             <span><small>连接</small><b>{remoteTransport(selectedRemote()!)} · {selectedRemote()!.rttMillis || 1} ms</b></span>
             <span><small>{selectedRemote()!.transport === "bridge" ? "下一跳" : "远端地址"}</small><code>{selectedRemote()!.address}</code></span>
@@ -338,7 +338,6 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
         )}>
           <div class="member-info-grid">
             <span><small>昵称</small><b>{props.state.nickname || "本机"}</b></span>
-            <span><small>本次入房 PeerID</small><code>{props.state.room?.peerId || "不可用"}</code></span>
             <span><small>本机端点</small><code>{props.state.diagnostics.listenAddress || "尚未打开"}</code></span>
             <span><small>房间状态</small><b>{props.state.room?.phase || "未知"}</b></span>
             <span><small>音频状态</small><b>{localStatus()}</b></span>

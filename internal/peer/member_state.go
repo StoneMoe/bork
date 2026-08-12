@@ -11,8 +11,8 @@ import (
 const (
 	reliableChannelMemberState = 3
 	memberStateVersion         = 2
-	maxNicknameRunes           = 64
-	maxNicknameBytes           = 256
+	maxNicknameRunes           = 32
+	maxNicknameBytes           = 128
 )
 
 type memberState struct {

@@ -5,7 +5,6 @@ import { EventsOn } from "@wailsjs/runtime/runtime";
 import type { AppState } from "./types";
 
 const emptyState = new app.AppSnapshot({
-  revision: 0,
   nickname: "",
   audio: {
     available: false,
@@ -37,6 +36,7 @@ const emptyState = new app.AppSnapshot({
 
 export function createRemoteState(reportError: (message: string) => void) {
   const [state, setState] = createSignal<AppState>(emptyState);
+  const [ready, setReady] = createSignal(false);
   let disposed = false;
   let requested = false;
   let pulling: Promise<void> | undefined;
@@ -51,9 +51,8 @@ export function createRemoteState(reportError: (message: string) => void) {
         try {
           const next = await GetSnapshot();
           if (disposed) return;
-          if (next.revision >= state().revision) {
-            setState(next);
-          }
+          setState(next);
+          setReady(true);
           if (next.error && next.error.id > lastErrorId) {
             lastErrorId = next.error.id;
             reportError(next.error.message);
@@ -80,5 +79,5 @@ export function createRemoteState(reportError: (message: string) => void) {
     });
   });
 
-  return { state, refresh };
+  return { state, ready, refresh };
 }

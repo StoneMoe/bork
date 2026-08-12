@@ -1,6 +1,15 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import * as Backend from "@wailsjs/go/app/App";
-import { ClipboardSetText, Quit, WindowIsMaximised, WindowMinimise, WindowToggleMaximise } from "@wailsjs/runtime/runtime";
+import {
+  ClipboardSetText,
+  Quit,
+  WindowFullscreen,
+  WindowIsFullscreen,
+  WindowIsMaximised,
+  WindowMinimise,
+  WindowToggleMaximise,
+  WindowUnfullscreen,
+} from "@wailsjs/runtime/runtime";
 import Room from "./Room";
 import Settings from "./Settings";
 import { closePopoversEvent, nativePopoverOpen, nativePopoverSupported } from "./popover";
@@ -14,7 +23,6 @@ const nicknameStorageKey = "bork.nickname";
 const echoCancellationDisabledStorageKey = "bork.audio.echoCancellation.disabled";
 const noiseSuppressionDisabledStorageKey = "bork.audio.noiseSuppression.disabled";
 const remoteLoudnessNormalizationDisabledStorageKey = "bork.audio.remoteLoudnessNormalization.disabled";
-
 function hasNativeWindowBridge() {
   const host = window as typeof window & {
     chrome?: { webview?: { postMessage?: unknown } };
@@ -28,7 +36,7 @@ function closeOpenPopovers() {
   const focused = document.activeElement;
   document.dispatchEvent(new Event(closePopoversEvent));
   if (nativePopoverSupported) {
-    document.querySelectorAll<HTMLElement>("[popover]").forEach((popover) => {
+    document.querySelectorAll<HTMLElement>("[popover]:not([popover='manual'])").forEach((popover) => {
       if (nativePopoverOpen(popover)) popover.hidePopover();
     });
   }
@@ -58,6 +66,7 @@ export default function App() {
   const [audioPreferencesStorageReady, setAudioPreferencesStorageReady] = createSignal(false);
   const customWindowControls = hasNativeWindowBridge();
   const [windowMaximised, setWindowMaximised] = createSignal(false);
+  const [screenFullscreen, setScreenFullscreen] = createSignal(false);
   const [error, setError] = createSignal("");
   const [roomHistory, setRoomHistory] = createSignal(readRoomHistory());
   let leaveRoomAction: (() => Promise<void>) | undefined;
@@ -65,15 +74,44 @@ export default function App() {
   let audioPreferencesRestoreStarted = false;
   let copyTimer: number | undefined;
   let windowStateGeneration = 0;
+  let screenFullscreenOwned = false;
   let mainView: HTMLElement | undefined;
   let settingsButton: HTMLButtonElement | undefined;
   const remote = createRemoteState(setError);
   const state = remote.state;
-  const operational = createMemo(() => state().revision > 0);
+  const operational = remote.ready;
   const inRoom = createMemo(() => Boolean(state().room));
   const friendly = createMemo(() => humanStatus(state()));
   let previousRoomState = inRoom();
   onCleanup(() => window.clearTimeout(copyTimer));
+
+  function requestScreenFullscreen(fullscreen: boolean) {
+    screenFullscreenOwned = fullscreen;
+    setScreenFullscreen(fullscreen);
+    if (fullscreen) WindowFullscreen();
+    else WindowUnfullscreen();
+  }
+
+  function toggleScreenFullscreen() {
+    requestScreenFullscreen(!screenFullscreen());
+  }
+
+  function exitScreenFullscreen() {
+    if (screenFullscreenOwned) requestScreenFullscreen(false);
+  }
+
+  onMount(() => {
+    const syncAfterResize = async () => {
+      try {
+        const fullscreen = await WindowIsFullscreen();
+        setScreenFullscreen(fullscreen);
+        if (!fullscreen) screenFullscreenOwned = false;
+      } catch { /* runtime unavailable in browser previews */ }
+    };
+    window.addEventListener("resize", syncAfterResize);
+    onCleanup(() => window.removeEventListener("resize", syncAfterResize));
+  });
+
   onMount(() => {
     if (!customWindowControls) return;
     let active = true;
@@ -318,11 +356,14 @@ export default function App() {
           <Room
             state={state()}
             friendly={friendly()}
+            screenFullscreen={screenFullscreen()}
             busy={busy()}
             ready={operational()}
             runAction={runAction}
             reportError={setError}
             registerLeaveAction={(action) => { leaveRoomAction = action; }}
+            toggleScreenFullscreen={toggleScreenFullscreen}
+            exitScreenFullscreen={exitScreenFullscreen}
           />
         </Show>
       </section>

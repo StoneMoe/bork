@@ -2,18 +2,29 @@ import { For, Show, createEffect, createSignal, onCleanup } from "solid-js";
 import * as Backend from "@wailsjs/go/app/App";
 import { EventsOn } from "@wailsjs/runtime/runtime";
 import { RoomControlRow, RoomMemberList } from "./RoomControls";
-import type { ActionProps, AppState, FriendlyStatus, RemotePeer } from "./types";
+import { nativePopoverOpen, nativePopoverSupported } from "./popover";
+import type { ActionProps, AppState, FriendlyStatus } from "./types";
 
 const screenVideoCodecs = ["avc1.42E01F", "avc1.4D401F"] as const;
 const screenVideoFrameRate = 15;
 const screenVideoFrameDuration = Math.round(1_000_000 / screenVideoFrameRate);
 const maxScreenVideoChunkBytes = 256 * 1024;
+const screenViewportMargin = 8;
+const screenStageMinWidth = 220;
+const screenStageDoubleMinWidth = 360;
+const screenStageMinHeight = 124;
+const screenResizeDirections = ["n", "ne", "e", "se", "s", "sw", "w", "nw"] as const;
+
+type ScreenResizeDirection = typeof screenResizeDirections[number];
 
 interface RoomProps extends ActionProps {
   state: AppState;
   friendly: FriendlyStatus;
+  screenFullscreen: boolean;
   reportError: (message: string) => void;
   registerLeaveAction: (action: (() => Promise<void>) | undefined) => void;
+  toggleScreenFullscreen: () => void;
+  exitScreenFullscreen: () => void;
 }
 
 export default function Room(props: RoomProps) {
@@ -40,14 +51,32 @@ export default function Room(props: RoomProps) {
   let remoteVideoRun = 0;
   let remoteNeedsKeyframe = true;
   let remoteLastChunkID = 0;
+  let screenStage: HTMLElement | undefined;
+  const screenStageObserver = new ResizeObserver(() => {
+    if (screenStage?.isConnected) clampScreenStage(screenStage);
+  });
+  screenStageObserver.observe(document.documentElement);
   const pendingScreenKeyframes = new Map<string, ScreenVideoChunkEvent>();
   let waitingRegion: HTMLDivElement | undefined;
   let roomPeersRegion: HTMLElement | undefined;
 
   const remotePeers = () => props.state.room?.remotePeers ?? [];
   const remoteSharers = () => remotePeers().filter((peer) => peer.screenSharing);
-  const remoteName = (peer: RemotePeer) => peer.nickname || peer.peerId.slice(0, 14);
+  const selectedSharerName = () => {
+    const peer = remoteSharers().find((candidate) => candidate.peerId === selectedSharer()) ?? remoteSharers()[0];
+    return peer?.nickname || peer?.peerId.slice(0, 14) || "房间成员";
+  };
   let previousPeerCount = remotePeers().length;
+  const keepScreenStageOnTop = (event: Event) => {
+    if (!nativePopoverSupported || event.target === screenStage || (event as ToggleEvent).newState !== "open") return;
+    queueMicrotask(() => {
+      const stage = screenStage;
+      if (!stage?.isConnected || !nativePopoverOpen(stage)) return;
+      stage.hidePopover();
+      stage.showPopover();
+    });
+  };
+  document.addEventListener("beforetoggle", keepScreenStageOnTop, true);
   props.registerLeaveAction(leaveRoom);
 
   function focusRoomFallback() {
@@ -107,14 +136,128 @@ export default function Room(props: RoomProps) {
     previousPeerCount = peerCount;
   });
 
+  createEffect(() => {
+    if (!localStream() && remoteSharers().length === 0) props.exitScreenFullscreen();
+  });
+
   function selectSharer(peerID: string) {
     if (selectedSharer() === peerID) return;
     resetRemoteScreenVideo();
     setSelectedSharer(peerID);
   }
 
+  function startScreenStageDrag(event: PointerEvent) {
+    if (event.button !== 0 || !event.isPrimary || props.screenFullscreen) return;
+    const stage = event.currentTarget as HTMLElement;
+    const bounds = stage.getBoundingClientRect();
+    stage.style.left = `${bounds.left}px`;
+    stage.style.top = `${bounds.top}px`;
+    stage.style.right = "auto";
+    stage.style.bottom = "auto";
+    trackScreenStagePointer(event, "dragging", (next) => {
+      const maxLeft = Math.max(screenViewportMargin, window.innerWidth - stage.offsetWidth - screenViewportMargin);
+      const maxTop = Math.max(screenViewportMargin, window.innerHeight - stage.offsetHeight - screenViewportMargin);
+      const left = Math.min(maxLeft, Math.max(screenViewportMargin, bounds.left + next.clientX - event.clientX));
+      const top = Math.min(maxTop, Math.max(screenViewportMargin, bounds.top + next.clientY - event.clientY));
+      stage.style.left = `${left}px`;
+      stage.style.top = `${top}px`;
+    });
+  }
+
+  function startScreenStageResize(event: PointerEvent, direction: ScreenResizeDirection) {
+    if (event.button !== 0 || !event.isPrimary || !screenStage || props.screenFullscreen) return;
+    event.stopPropagation();
+    const stage = screenStage;
+    const bounds = stage.getBoundingClientRect();
+    stage.style.left = `${bounds.left}px`;
+    stage.style.top = `${bounds.top}px`;
+    stage.style.right = "auto";
+    stage.style.bottom = "auto";
+    stage.style.width = `${bounds.width}px`;
+    stage.style.height = `${bounds.height}px`;
+    trackScreenStagePointer(event, "resizing", (next) => {
+      const deltaX = next.clientX - event.clientX;
+      const deltaY = next.clientY - event.clientY;
+      const minWidth = stage.classList.contains("single") ? screenStageMinWidth : screenStageDoubleMinWidth;
+      const minHeight = screenStageMinHeight;
+      let left = bounds.left;
+      let top = bounds.top;
+      let width = bounds.width;
+      let height = bounds.height;
+      if (direction.includes("e")) {
+        width = Math.min(window.innerWidth - screenViewportMargin, Math.max(bounds.left + minWidth, bounds.right + deltaX)) - bounds.left;
+      }
+      if (direction.includes("s")) {
+        height = Math.min(window.innerHeight - screenViewportMargin, Math.max(bounds.top + minHeight, bounds.bottom + deltaY)) - bounds.top;
+      }
+      if (direction.includes("w")) {
+        left = Math.max(screenViewportMargin, Math.min(bounds.right - minWidth, bounds.left + deltaX));
+        width = bounds.right - left;
+      }
+      if (direction.includes("n")) {
+        top = Math.max(screenViewportMargin, Math.min(bounds.bottom - minHeight, bounds.top + deltaY));
+        height = bounds.bottom - top;
+      }
+      stage.style.left = `${left}px`;
+      stage.style.top = `${top}px`;
+      stage.style.width = `${width}px`;
+      stage.style.height = `${height}px`;
+    });
+  }
+
+  function trackScreenStagePointer(event: PointerEvent, activeClass: string, move: (next: PointerEvent) => void) {
+    const target = event.currentTarget as HTMLElement;
+    event.preventDefault();
+    target.setPointerCapture(event.pointerId);
+    screenStage?.classList.add(activeClass);
+    const handleMove = (next: PointerEvent) => {
+      if (next.pointerId === event.pointerId) move(next);
+    };
+    const stop = (next: PointerEvent) => {
+      if (next.pointerId !== event.pointerId) return;
+      screenStage?.classList.remove(activeClass);
+      target.removeEventListener("pointermove", handleMove);
+      target.removeEventListener("pointerup", stop);
+      target.removeEventListener("pointercancel", stop);
+      target.removeEventListener("lostpointercapture", stop);
+      if (next.type !== "lostpointercapture" && target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
+    };
+    target.addEventListener("pointermove", handleMove);
+    target.addEventListener("pointerup", stop);
+    target.addEventListener("pointercancel", stop);
+    target.addEventListener("lostpointercapture", stop);
+  }
+
+  function bindScreenStage(stage: HTMLElement) {
+    if (screenStage) screenStageObserver.unobserve(screenStage);
+    screenStage = stage;
+    screenStageObserver.observe(stage);
+    if (nativePopoverSupported) {
+      queueMicrotask(() => {
+        if (screenStage === stage && stage.isConnected && !nativePopoverOpen(stage)) stage.showPopover();
+      });
+    }
+  }
+
+  function clampScreenStage(stage: HTMLElement) {
+    if (!stage.style.left || props.screenFullscreen) return;
+    const left = Math.min(
+      Math.max(screenViewportMargin, window.innerWidth - stage.offsetWidth - screenViewportMargin),
+      Math.max(screenViewportMargin, Number.parseFloat(stage.style.left)),
+    );
+    const top = Math.min(
+      Math.max(screenViewportMargin, window.innerHeight - stage.offsetHeight - screenViewportMargin),
+      Math.max(screenViewportMargin, Number.parseFloat(stage.style.top)),
+    );
+    stage.style.left = `${left}px`;
+    stage.style.top = `${top}px`;
+  }
+
   onCleanup(() => {
     props.registerLeaveAction(undefined);
+    props.exitScreenFullscreen();
+    screenStageObserver.disconnect();
+    document.removeEventListener("beforetoggle", keepScreenStageOnTop, true);
     removeScreenListener();
     resetRemoteScreenVideo();
     void stopScreenShare(false);
@@ -427,6 +570,7 @@ export default function Room(props: RoomProps) {
   }
 
   async function leaveRoom() {
+    props.exitScreenFullscreen();
     await stopScreenShare(false);
     await props.runAction(Backend.LeaveRoom);
   }
@@ -467,51 +611,78 @@ export default function Room(props: RoomProps) {
           <Show when={localStream() || remoteSharers().length > 0}>
             <section
               class="screen-stage"
-              classList={{ single: Number(Boolean(localStream())) + Number(remoteSharers().length > 0) === 1 }}
+              classList={{
+                single: Number(Boolean(localStream())) + Number(remoteSharers().length > 0) === 1,
+                fullscreen: props.screenFullscreen,
+              }}
               aria-label="屏幕分享画面"
+              popover={nativePopoverSupported ? "manual" : undefined}
+              ref={bindScreenStage}
+              onPointerDown={startScreenStageDrag}
             >
+              <button
+                type="button"
+                class="screen-fullscreen-toggle"
+                aria-label={props.screenFullscreen ? "退出全屏" : "全屏显示"}
+                title={props.screenFullscreen ? "退出全屏" : "全屏显示"}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={props.toggleScreenFullscreen}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <Show
+                    when={props.screenFullscreen}
+                    fallback={<path d="M9 4H4v5M15 20h5v-5" />}
+                  >
+                    <path d="M4 9h5V4M20 15h-5v5" />
+                  </Show>
+                </svg>
+              </button>
               <Show when={localStream()}>{(stream) => (
-                <figure class="screen-preview local-screen">
-                  <figcaption><span>本机预览</span><b>正在分享</b></figcaption>
+                <figure class="screen-preview">
                   <video
                     muted
                     autoplay
                     playsinline
+                    aria-label="你分享的屏幕"
                     ref={(element) => { element.srcObject = stream(); }}
                   />
+                  <figcaption class="screen-sharer">你</figcaption>
                 </figure>
               )}</Show>
               <Show when={remoteSharers().length > 0}>
                 <figure class="screen-preview remote-screen">
-                  <figcaption>
-                    <span>远端画面</span>
-                    <Show
-                      when={remoteSharers().length > 1}
-                      fallback={<b>{remoteName(remoteSharers()[0])}</b>}
-                    >
-                      <select
-                        aria-label="选择远端屏幕"
-                        value={selectedSharer()}
-                        onChange={(event) => selectSharer(event.currentTarget.value)}
-                      >
-                        <For each={remoteSharers().map((peer) => peer.peerId)}>{(peerID) => {
-                          const peer = () => remoteSharers().find((candidate) => candidate.peerId === peerID)!;
-                          return <option value={peerID}>{remoteName(peer())}</option>;
-                        }}</For>
-                      </select>
-                    </Show>
-                  </figcaption>
                   <canvas
                     ref={(element) => { remoteCanvas = element; }}
                     classList={{ ready: remoteVideoReady() }}
                     role="img"
-                    aria-label="所选成员分享的屏幕"
+                    aria-label={`${selectedSharerName()}分享的屏幕`}
                   />
-                  <Show when={!remoteVideoReady()}>
-                    <div class="screen-waiting">等待关键帧…</div>
-                  </Show>
+                  <figcaption class="screen-sharer">
+                    <Show when={remoteSharers().length > 1} fallback={<span>{selectedSharerName()}</span>}>
+                      <select
+                        class="screen-sharer-select"
+                        aria-label="选择要观看的屏幕分享者"
+                        value={selectedSharer()}
+                        onPointerDown={(event) => event.stopPropagation()}
+                        onChange={(event) => selectSharer(event.currentTarget.value)}
+                      >
+                        <For each={remoteSharers().map((peer) => peer.peerId)}>{(peerID) => {
+                          const peer = () => remoteSharers().find((candidate) => candidate.peerId === peerID)!;
+                          return <option value={peerID}>{peer().nickname || peerID.slice(0, 14)}</option>;
+                        }}</For>
+                      </select>
+                    </Show>
+                  </figcaption>
                 </figure>
               </Show>
+              <For each={screenResizeDirections}>{(direction) => (
+                <span
+                  class="screen-resize-handle"
+                  data-direction={direction}
+                  aria-hidden="true"
+                  onPointerDown={(event) => startScreenStageResize(event, direction)}
+                />
+              )}</For>
             </section>
           </Show>
         </section>

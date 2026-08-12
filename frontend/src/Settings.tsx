@@ -192,7 +192,7 @@ export default function Settings(props: SettingsProps) {
             </label>
             <label class="setting-row audio-toggle">
               <span>
-                <strong>远端响度归一化</strong>
+                <strong>响度平衡</strong>
                 <small>自动平衡不同成员的播放响度。</small>
               </span>
               <input
@@ -227,6 +227,7 @@ export default function Settings(props: SettingsProps) {
               id="nickname"
               autocomplete="off"
               autocapitalize="off"
+              maxlength={32}
               spellcheck={false}
                 placeholder="未设置"
                 value={nickname()}
@@ -235,7 +236,7 @@ export default function Settings(props: SettingsProps) {
               onChange={() => void saveNickname()}
               onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}
             />
-            <small>最多 64 个字符，修改后自动保存并对其他成员可见。</small>
+            <small>修改后自动保存并对其他成员可见。</small>
           </div>
           </section>
           <section
@@ -245,10 +246,6 @@ export default function Settings(props: SettingsProps) {
           aria-labelledby="settings-tab-network"
           hidden={activeTab() !== "network"}
         >
-          <div class="diagnostic-section">
-            <div class="diagnostic-heading"><span>当前房间 PeerID</span></div>
-            <code class="diagnostic-value">{props.state.room?.peerId || "未加入房间"}</code>
-          </div>
           <div class="diagnostic-section">
             <div class="diagnostic-heading"><span>本机端点</span></div>
             <Show when={diagnostics().listenAddress} fallback={

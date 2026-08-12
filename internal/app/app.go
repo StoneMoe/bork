@@ -34,7 +34,6 @@ type App struct {
 	appContext  context.Context
 	startupDone chan struct{}
 
-	stateRevision        uint64
 	statePending         chan struct{}
 	stopStateNotifier    context.CancelFunc
 	stateNotifierStopped chan struct{}
@@ -122,7 +121,6 @@ func (a *App) startStateNotifier(parent context.Context) {
 	a.stateMu.Unlock()
 	go func() {
 		defer close(done)
-		var lastEmitted uint64
 		for {
 			select {
 			case <-ctx.Done():
@@ -147,21 +145,12 @@ func (a *App) startStateNotifier(parent context.Context) {
 					draining = false
 				}
 			}
-			a.stateMu.RLock()
-			revision := a.stateRevision
-			a.stateMu.RUnlock()
-			if revision != lastEmitted {
-				a.emit(ctx, stateChangedEvent, revision)
-				lastEmitted = revision
-			}
+			a.emit(ctx, stateChangedEvent)
 		}
 	}()
 }
 
 func (a *App) markStateChanged() {
-	a.stateMu.Lock()
-	a.stateRevision++
-	a.stateMu.Unlock()
 	select {
 	case a.statePending <- struct{}{}:
 	default:
@@ -391,67 +380,52 @@ func (a *App) activeClient() (*peer.Client, error) {
 }
 
 func (a *App) snapshot() AppSnapshot {
-	for {
-		a.stateMu.RLock()
-		revision := a.stateRevision
-		nickname := a.nickname
-		room := a.room
-		if room != nil && room.stopping {
-			room = nil
-		}
-		audioEngine := a.audioEngine
-		audioInitError := a.audioInitError
-		var diagnostics Diagnostics
-		if room == nil {
-			diagnostics = cloneDiagnostics(a.lastDiagnostics)
-		}
-		var lastError *AppError
-		if a.lastError != nil {
-			value := *a.lastError
-			lastError = &value
-		}
-		a.stateMu.RUnlock()
-
-		state := AppSnapshot{
-			Revision:    revision,
-			Nickname:    nickname,
-			Audio:       emptyAudioStatus(),
-			Diagnostics: diagnostics,
-			Error:       lastError,
-		}
-		if audioEngine != nil {
-			state.Audio = audioEngine.Status()
-		} else if audioInitError != "" {
-			state.Audio.Error = audioInitError
-		}
-		if room != nil {
-			peerSnapshot, networkSnapshot := room.client.StateSnapshot()
-			state.Room = &RoomState{
-				Name:          peerSnapshot.Name,
-				PeerID:        room.client.PeerID(),
-				Phase:         peerSnapshot.Phase,
-				ScreenSharing: peerSnapshot.ScreenSharing,
-				RemotePeers:   make([]RemotePeer, 0, len(peerSnapshot.RemotePeers)),
-				Transfers:     projectTransfers(peerSnapshot.Transfers, peerSnapshot.RemotePeers),
-			}
-			for _, remotePeer := range peerSnapshot.RemotePeers {
-				state.Room.RemotePeers = append(state.Room.RemotePeers, projectRemotePeer(remotePeer))
-			}
-			state.Diagnostics = projectDiagnostics(networkSnapshot, peerSnapshot.Connectivity)
-		}
-
-		a.stateMu.RLock()
-		stable := a.stateRevision == revision
-		if room == nil {
-			stable = stable && (a.room == nil || a.room.stopping)
-		} else {
-			stable = stable && a.room == room && !a.room.stopping
-		}
-		a.stateMu.RUnlock()
-		if stable {
-			return state
-		}
+	a.stateMu.RLock()
+	nickname := a.nickname
+	room := a.room
+	if room != nil && room.stopping {
+		room = nil
 	}
+	audioEngine := a.audioEngine
+	audioInitError := a.audioInitError
+	var diagnostics Diagnostics
+	if room == nil {
+		diagnostics = cloneDiagnostics(a.lastDiagnostics)
+	}
+	var lastError *AppError
+	if a.lastError != nil {
+		value := *a.lastError
+		lastError = &value
+	}
+	a.stateMu.RUnlock()
+
+	state := AppSnapshot{
+		Nickname:    nickname,
+		Audio:       emptyAudioStatus(),
+		Diagnostics: diagnostics,
+		Error:       lastError,
+	}
+	if audioEngine != nil {
+		state.Audio = audioEngine.Status()
+	} else if audioInitError != "" {
+		state.Audio.Error = audioInitError
+	}
+	if room != nil {
+		peerSnapshot, networkSnapshot := room.client.StateSnapshot()
+		state.Room = &RoomState{
+			Name:          peerSnapshot.Name,
+			PeerID:        room.client.PeerID(),
+			Phase:         peerSnapshot.Phase,
+			ScreenSharing: peerSnapshot.ScreenSharing,
+			RemotePeers:   make([]RemotePeer, 0, len(peerSnapshot.RemotePeers)),
+			Transfers:     projectTransfers(peerSnapshot.Transfers, peerSnapshot.RemotePeers),
+		}
+		for _, remotePeer := range peerSnapshot.RemotePeers {
+			state.Room.RemotePeers = append(state.Room.RemotePeers, projectRemotePeer(remotePeer))
+		}
+		state.Diagnostics = projectDiagnostics(networkSnapshot, peerSnapshot.Connectivity)
+	}
+	return state
 }
 
 func (a *App) recordError(err error) {
