@@ -177,7 +177,7 @@ func (a *App) publishRoomChange(change roomStateChange) {
 			room.cancel()
 		}
 		if audioEngine, err := a.readyAudioEngine(); err == nil {
-			audioEngine.StopWithPeerLeave()
+			audioEngine.Stop()
 		}
 		a.markStateChanged()
 		return
@@ -261,9 +261,6 @@ func (a *App) activateRoom(client *peer.Client) error {
 	select {
 	case <-client.Ready():
 		a.reconcileAudioLocked(room)
-		if audioEngine, err := a.readyAudioEngine(); err == nil {
-			audioEngine.PlayPeerChange(true)
-		}
 		return nil
 	case <-room.done:
 		return errors.New("room stopped during startup")

@@ -32,20 +32,18 @@ const (
 	notificationAttack       = SampleRate * 5 / 1000
 	notificationRelease      = SampleRate * 30 / 1000
 	notificationAmplitude    = 0.15
-	notificationDrain        = time.Duration(notificationSamples+2*FrameSamples) * time.Second / SampleRate
 )
 
 type engineRun struct {
 	cancel context.CancelFunc
 	port   media.AudioPort
 
-	device             *malgo.Device
-	workers            sync.WaitGroup
-	captureGeneration  atomic.Uint64
-	urgentNotification atomic.Uint32
-	peerNotification   atomic.Uint32
-	audioNotification  atomic.Uint32
-	active             atomic.Bool
+	device            *malgo.Device
+	workers           sync.WaitGroup
+	captureGeneration atomic.Uint64
+	peerNotification  atomic.Uint32
+	audioNotification atomic.Uint32
+	active            atomic.Bool
 
 	monitorDone chan struct{}
 }
@@ -290,27 +288,6 @@ func (e *Engine) PlayPeerChange(joined bool) {
 		e.run.peerNotification.Store(notification)
 	}
 	e.opMu.Unlock()
-}
-
-// StopWithPeerLeave lets the playback device consume the local leave tone
-// before room teardown stops its callback.
-func (e *Engine) StopWithPeerLeave() {
-	e.opMu.Lock()
-	run := e.run
-	queued := run != nil && run.active.Load() && !e.playbackMuted.Load()
-	if queued {
-		run.urgentNotification.Store(peerLeftNotification)
-	}
-	e.opMu.Unlock()
-	if queued {
-		time.Sleep(notificationDrain)
-	}
-	e.opMu.Lock()
-	e.stopRunLocked(run)
-	e.opMu.Unlock()
-	if run != nil {
-		<-run.monitorDone
-	}
 }
 
 func (e *Engine) SetCaptureGain(gain int) error {
@@ -712,28 +689,20 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 	discard := make([]float32, FrameSamples)
 	appliedPlaybackGain := playbackGainFactor(e.playbackGain.Load())
 	var notification notificationTone
-	mixFrame := func(destination []float32, consumeNotification bool) (bool, error) {
+	mixFrame := func(destination []float32) (bool, error) {
 		mixer.loudnessNormalization = e.remoteLoudnessNormalization.Load()
 		_, err := mixer.NextInto(destination)
 		e.setSpeakingPeerIDs(run, mixer.SpeakingPeerIDs())
-		if consumeNotification {
-			queued := run.urgentNotification.Swap(0)
+		if notification.remaining == 0 {
+			queued := run.audioNotification.Swap(0)
+			if queued == 0 {
+				queued = run.peerNotification.Swap(0)
+			}
 			if queued != 0 {
 				notification.start(queued)
-			} else if notification.remaining == 0 {
-				queued = run.audioNotification.Swap(0)
-				if queued == 0 {
-					queued = run.peerNotification.Swap(0)
-				}
-				if queued != 0 {
-					notification.start(queued)
-				}
 			}
 		}
-		localOnly := false
-		if consumeNotification {
-			localOnly = notification.mix(destination, e.playbackMuted.Load())
-		}
+		localOnly := notification.mix(destination, e.playbackMuted.Load())
 		targetGain := playbackGainFactor(e.playbackGain.Load())
 		appliedPlaybackGain = applyGainRamp(destination, appliedPlaybackGain, targetGain)
 		return localOnly, err
@@ -762,7 +731,7 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 			drainPlayback()
 			target := demand.Load()
 			for nextIndex < target {
-				_, err := mixFrame(discard, false)
+				_, err := mixFrame(discard)
 				if err != nil {
 					e.setRuntimeError(fmt.Errorf("decode Opus: %w", err))
 				}
@@ -773,7 +742,7 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 				if !ok {
 					break
 				}
-				localOnly, err := mixFrame(slot.Samples[:], true)
+				localOnly, err := mixFrame(slot.Samples[:])
 				slot.Index = nextIndex
 				slot.LocalOnly = localOnly
 				queue.CommitWrite()

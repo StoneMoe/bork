@@ -229,7 +229,7 @@ func (a *App) LeaveRoom() error {
 		room.cancel()
 	}
 	if audioEngine, err := a.readyAudioEngine(); err == nil {
-		audioEngine.StopWithPeerLeave()
+		audioEngine.Stop()
 	}
 	a.stateMu.Lock()
 	a.lastDiagnostics = emptyDiagnostics()
