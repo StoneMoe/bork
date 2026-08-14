@@ -9,6 +9,15 @@ const screenVideoCodecs = ["avc1.42E01F", "avc1.4D401F"] as const;
 const screenVideoFrameRate = 15;
 const screenVideoFrameDuration = Math.round(1_000_000 / screenVideoFrameRate);
 const maxScreenVideoChunkBytes = 256 * 1024;
+const screenVideoCanvasOptions: CanvasRenderingContext2DSettings = { alpha: false, colorSpace: "srgb" };
+// Screen frames pass through an 8-bit sRGB canvas before H.264 encoding, so
+// receivers must not reuse HDR color metadata from the captured surface.
+const screenVideoColorSpace = {
+  primaries: "bt709",
+  transfer: "bt709",
+  matrix: "bt709",
+  fullRange: false,
+} satisfies VideoColorSpaceInit;
 const screenViewportMargin = 8;
 const screenStageMinWidth = 220;
 const screenStageDoubleMinWidth = 360;
@@ -310,7 +319,7 @@ export default function Room(props: RoomProps) {
       if (run !== captureRun || displayStream !== stream) return;
       captureCanvas.width = dimensions.width;
       captureCanvas.height = dimensions.height;
-      if (!captureCanvas.getContext("2d", { alpha: false })) throw new Error("当前 WebView 无法创建屏幕视频画布");
+      if (!captureCanvas.getContext("2d", screenVideoCanvasOptions)) throw new Error("当前 WebView 无法创建屏幕视频画布");
       const encoder = new VideoEncoder({
         output: (chunk) => sendEncodedScreenVideoChunk(run, chunk),
         error: (cause) => failLocalScreenVideo(run, cause),
@@ -385,7 +394,7 @@ export default function Room(props: RoomProps) {
       captureTimestamp += screenVideoFrameDuration;
       const encoder = videoEncoder;
       if (encoder?.state === "configured" && encoder.encodeQueueSize === 0 && !screenChunkSending) {
-        const context = captureCanvas.getContext("2d", { alpha: false });
+        const context = captureCanvas.getContext("2d", screenVideoCanvasOptions);
         if (!context) throw new Error("屏幕视频画布不可用");
         context.drawImage(captureVideo, 0, 0, captureCanvas.width, captureCanvas.height);
         const keyFrame = forceKeyframe || timestamp-lastKeyframeTimestamp >= 2_000_000;
@@ -494,6 +503,7 @@ export default function Room(props: RoomProps) {
           codec: chunk.codec,
           codedWidth: chunk.width,
           codedHeight: chunk.height,
+          colorSpace: screenVideoColorSpace,
           optimizeForLatency: true,
         };
         const support = await VideoDecoder.isConfigSupported(config);
@@ -530,7 +540,7 @@ export default function Room(props: RoomProps) {
         throw new Error("远端屏幕视频帧尺寸无效");
       }
       const canvas = remoteCanvas;
-      const context = canvas?.getContext("2d", { alpha: false });
+      const context = canvas?.getContext("2d", screenVideoCanvasOptions);
       if (!canvas || !context) throw new Error("当前 WebView 无法渲染屏幕视频");
       if (canvas.width !== chunk.width || canvas.height !== chunk.height) {
         canvas.width = chunk.width;
