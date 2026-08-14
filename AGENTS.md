@@ -57,7 +57,7 @@ network:
 
 各平台配置路径：
 
-- Windows：`%AppData%\bork\config.yml`
+- Windows：`%LocalAppData%\bork\config.yml`
 - macOS：`~/Library/Application Support/bork/config.yml`
 - Linux：`${XDG_CONFIG_HOME:-~/.config}/bork/config.yml`
 

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -31,7 +32,13 @@ type NetworkConfig struct {
 }
 
 func LoadAppConfig() (AppConfig, error) {
-	base, err := os.UserConfigDir()
+	configDir := os.UserConfigDir
+	if runtime.GOOS == "windows" {
+		// The config and WebView profile are machine-local and should not roam
+		// between Windows devices.
+		configDir = os.UserCacheDir
+	}
+	base, err := configDir()
 	if err != nil {
 		return AppConfig{}, fmt.Errorf("locate user config directory: %w", err)
 	}
