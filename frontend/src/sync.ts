@@ -12,6 +12,8 @@ const emptyState = new app.AppSnapshot({
     captureMuted: false,
     playbackMuted: false,
     captureGain: 100,
+    captureLevel: 0,
+    captureClipped: false,
     playbackGain: 100,
     echoCancellation: true,
     noiseSuppression: true,

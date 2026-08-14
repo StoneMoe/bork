@@ -264,10 +264,6 @@ func contiguousStart(frames map[uint32]jitterFrame) (uint32, bool) {
 	return selected, found
 }
 
-func speakingFrame(pcm []float32) bool {
-	return pcmRMS(pcm) > speakingThreshold
-}
-
 func pcmRMS(pcm []float32) float64 {
 	var energy float64
 	for _, sample := range pcm {

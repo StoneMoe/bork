@@ -243,6 +243,10 @@ func (e *Engine) SetCaptureMuted(muted bool) {
 	if muted && e.state.Speaking {
 		e.state.Speaking = false
 	}
+	if muted {
+		e.state.CaptureLevel = 0
+		e.state.CaptureClipped = false
+	}
 	e.mu.Unlock()
 	e.queueAudioNotificationLocked(muted)
 	e.publish()
@@ -513,6 +517,39 @@ func applyGainRamp(samples []float32, from, to float32) float32 {
 	return to
 }
 
+func captureMeter(samples []float32) (float64, bool) {
+	var energy float64
+	clipped := false
+	for _, sample := range samples {
+		value := float64(sample)
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			continue
+		}
+		energy += value * value
+		clipped = clipped || math.Abs(value) >= captureClipThreshold
+	}
+	if len(samples) == 0 {
+		return 0, clipped
+	}
+	return min(1, math.Sqrt(energy/float64(len(samples)))), clipped
+}
+
+type captureMeterWindow struct {
+	squaredLevels float64
+	frames        int
+}
+
+func (w *captureMeterWindow) add(level float64) (float64, bool) {
+	w.squaredLevels += level * level
+	w.frames++
+	if w.frames < captureMeterFrames {
+		return 0, false
+	}
+	level = math.Sqrt(w.squaredLevels / float64(w.frames))
+	*w = captureMeterWindow{}
+	return level, true
+}
+
 func playbackGainFactor(percent int64) float32 {
 	// A squared curve adds perceptual range while keeping 100% at unity.
 	gain := float32(percent) / 100
@@ -583,6 +620,8 @@ func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrame
 	processedNoiseSuppression := e.noiseSuppression.Load()
 	var lastProcessedTimestamp uint32
 	var localSpeaking speakingHold
+	var clipHoldFrames int
+	var meterWindow captureMeterWindow
 	appliedCaptureGain := float32(e.captureGain.Load()) / 100
 	for {
 		select {
@@ -605,12 +644,15 @@ func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrame
 				}
 				if speakingGeneration != generation {
 					localSpeaking.reset()
+					clipHoldFrames = 0
+					meterWindow = captureMeterWindow{}
 					e.setLocalSpeaking(run, generation, false)
 					speakingGeneration = generation
 				}
 				echoCancellation := e.echoCancellation.Load()
 				noiseSuppression := e.noiseSuppression.Load()
 				captureMuted := frame.Muted
+				_, inputClipped := captureMeter(frame.Samples[:])
 				discontinuous := lastProcessedTimestamp != 0 && frame.Timestamp-lastProcessedTimestamp != FrameSamples
 				if processorGeneration != generation || discontinuous {
 					processor.ResetEchoCancellation()
@@ -634,7 +676,23 @@ func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrame
 				}
 				targetGain := float32(e.captureGain.Load()) / 100
 				appliedCaptureGain = applyGainRamp(frame.Samples[:], appliedCaptureGain, targetGain)
-				if run.active.Load() && !captureMuted && localSpeaking.update(speakingFrame(frame.Samples[:])) {
+				level, outputClipped := captureMeter(frame.Samples[:])
+				if captureMuted {
+					level = 0
+					clipHoldFrames = 0
+					meterWindow = captureMeterWindow{}
+					e.setCaptureMeter(run, generation, 0, false)
+				} else if inputClipped || outputClipped {
+					clipHoldFrames = captureClipHoldFrames
+				} else if clipHoldFrames > 0 {
+					clipHoldFrames--
+				}
+				if !captureMuted {
+					if windowLevel, ready := meterWindow.add(level); ready {
+						e.setCaptureMeter(run, generation, windowLevel, clipHoldFrames > 0)
+					}
+				}
+				if run.active.Load() && !captureMuted && localSpeaking.update(level > speakingThreshold) {
 					e.setLocalSpeaking(run, generation, localSpeaking.active())
 				}
 				payload, err := encoder.Encode(frame.Samples[:])
@@ -774,6 +832,8 @@ func (e *Engine) stopRunLocked(run *engineRun) {
 	run.active.Store(false)
 	e.state.Running = false
 	e.state.Speaking = false
+	e.state.CaptureLevel = 0
+	e.state.CaptureClipped = false
 	e.state.SpeakingPeerIDs = []string{}
 	e.mu.Unlock()
 	run.port.Reset()
@@ -832,6 +892,26 @@ func (e *Engine) setLocalSpeaking(run *engineRun, generation uint64, speaking bo
 		return
 	}
 	e.state.Speaking = speaking
+	e.mu.Unlock()
+	e.publish()
+}
+
+func (e *Engine) setCaptureMeter(run *engineRun, generation uint64, level float64, clipped bool) {
+	e.mu.Lock()
+	if !run.active.Load() || generation != run.captureGeneration.Load() {
+		e.mu.Unlock()
+		return
+	}
+	if e.captureMuted.Load() {
+		level = 0
+		clipped = false
+	}
+	if e.state.CaptureLevel == level && e.state.CaptureClipped == clipped {
+		e.mu.Unlock()
+		return
+	}
+	e.state.CaptureLevel = level
+	e.state.CaptureClipped = clipped
 	e.mu.Unlock()
 	e.publish()
 }

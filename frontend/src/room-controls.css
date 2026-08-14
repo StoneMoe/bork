@@ -255,9 +255,34 @@
 .audio-icon-button.muted { border-color: rgba(217, 135, 122, 0.34); color: #d99a91; }
 .audio-icon-button.muted:hover:not(:disabled),
 .audio-icon-button.muted:focus-visible { border-color: rgba(217, 135, 122, 0.52); color: #d99a91; }
+.audio-icon-button.clipped,
+.audio-icon-button.clipped:hover:not(:disabled),
+.audio-icon-button.clipped:focus-visible { border-color: var(--danger); color: var(--danger); }
 .audio-icon-button:disabled { cursor: wait; opacity: 0.45; }
 .audio-icon-button svg { width: 22px; height: 22px; overflow: visible; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
 .audio-icon-button .mute-slash { stroke-width: 2.2; }
+
+.capture-level-meter {
+  position: absolute;
+  right: 6px;
+  bottom: 3px;
+  left: 6px;
+  height: 2px;
+  overflow: hidden;
+  z-index: 2;
+  border-radius: 999px;
+  pointer-events: none;
+  background: rgba(255, 255, 255, 0.1);
+}
+.capture-level-meter > span {
+  display: block;
+  width: 100%;
+  height: 100%;
+  transform-origin: left;
+  background: #91a7e8;
+  transition: transform 70ms linear;
+}
+.capture-level-meter.clipped > span { background: var(--danger); }
 
 .gain-slider {
   position: absolute;
@@ -283,6 +308,7 @@
 .audio-control:hover .gain-slider,
 .audio-control:focus-within .gain-slider { visibility: visible; opacity: 1; pointer-events: auto; transform: translateY(0); }
 .gain-slider output { color: #aeb6ca; font: 10px/1 var(--font-mono); text-align: right; }
+.capture-clipping-label { grid-column: 1 / -1; min-height: 10px; color: var(--danger); font: 10px/1 var(--font-mono); text-align: right; }
 
 @keyframes attention-pulse {
   60% { box-shadow: 0 0 0 6px rgba(225, 184, 103, 0); }
@@ -313,6 +339,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .capture-level-meter > span { transition-duration: 0.01ms !important; }
   .transfer-progress progress::-webkit-progress-value { transition-duration: 0.01ms !important; }
   .transfer-progress progress::-moz-progress-bar { transition-duration: 0.01ms !important; }
 }

@@ -71,6 +71,8 @@ export function RoomControlRow(props: RoomControlRowProps) {
             label="麦克风"
             muted={props.state.audio.captureMuted}
             gain={props.state.audio.captureGain}
+            level={props.state.audio.captureLevel}
+            clipped={props.state.audio.captureClipped}
             disabled={props.busy || !props.ready || !props.state.audio.available}
             setMuted={(muted) => props.runAction(() => Backend.SetCaptureMuted(muted))}
             setGain={(gain) => props.runAction(() => Backend.SetCaptureGain(gain))}
@@ -586,6 +588,8 @@ interface AudioControlProps {
   label: string;
   muted: boolean;
   gain: number;
+  level?: number;
+  clipped?: boolean;
   disabled: boolean;
   setMuted: (muted: boolean) => void;
   setGain: (gain: number) => void | Promise<unknown>;
@@ -595,6 +599,10 @@ function AudioControl(props: AudioControlProps) {
   const [draftGain, setDraftGain] = createSignal(props.gain);
   let editingGain = false;
   const actionLabel = () => props.muted ? `取消${props.label}静音` : `将${props.label}静音`;
+  const levelPercent = () => {
+    const level = Math.max(0, Math.min(1, props.level ?? 0));
+    return level === 0 ? 0 : Math.max(0, (20 * Math.log10(level) + 60) / 60 * 100);
+  };
   createEffect(() => {
     const gain = props.gain;
     if (!editingGain) setDraftGain(gain);
@@ -613,18 +621,35 @@ function AudioControl(props: AudioControlProps) {
     <div class="audio-control">
       <button
         class="audio-icon-button"
-        classList={{ muted: props.muted }}
+        classList={{ muted: props.muted, clipped: Boolean(props.clipped) }}
         type="button"
         disabled={props.disabled}
         aria-label={actionLabel()}
         aria-pressed={props.muted}
-        title={actionLabel()}
+        title={props.clipped ? `麦克风输入削波 · ${actionLabel()}` : actionLabel()}
         onClick={() => props.setMuted(!props.muted)}
       >
         <Show when={props.kind === "capture"} fallback={<SpeakerIcon muted={props.muted} />}>
           <MicrophoneIcon muted={props.muted} />
         </Show>
       </button>
+      <Show when={props.kind === "capture"}>
+        <span
+          class="capture-level-meter"
+          classList={{ clipped: Boolean(props.clipped) }}
+          role="meter"
+          aria-label="麦克风输入电平"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow={Math.round(levelPercent())}
+          aria-valuetext={props.clipped ? "输入削波" : `${Math.round(levelPercent())}%`}
+        >
+          <span style={{ transform: `scaleX(${levelPercent() / 100})` }} />
+        </span>
+        <span class="visually-hidden" role="status" aria-live="polite">
+          {props.clipped ? "麦克风输入削波" : ""}
+        </span>
+      </Show>
       <div class="gain-slider">
         <input
           type="range"
@@ -639,6 +664,11 @@ function AudioControl(props: AudioControlProps) {
           onChange={() => void commitGain()}
         />
         <output>{draftGain()}%</output>
+        <Show when={props.kind === "capture"}>
+          <span class="capture-clipping-label" aria-hidden="true">
+            {props.clipped ? "削波" : ""}
+          </span>
+        </Show>
       </div>
     </div>
   );

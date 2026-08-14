@@ -12,6 +12,9 @@ const (
 
 	speakingThreshold     = 0.01
 	speakingReleaseFrames = 300 / FrameDuration
+	captureClipThreshold  = 0.999
+	captureClipHoldFrames = 1000 / FrameDuration
+	captureMeterFrames    = 50 / FrameDuration
 
 	defaultAudioGain = 100
 	minimumAudioGain = 0
@@ -38,6 +41,8 @@ type Status struct {
 	CaptureMuted                bool     `json:"captureMuted"`
 	PlaybackMuted               bool     `json:"playbackMuted"`
 	CaptureGain                 int      `json:"captureGain"`
+	CaptureLevel                float64  `json:"captureLevel"`
+	CaptureClipped              bool     `json:"captureClipped"`
 	PlaybackGain                int      `json:"playbackGain"`
 	EchoCancellation            bool     `json:"echoCancellation"`
 	NoiseSuppression            bool     `json:"noiseSuppression"`
