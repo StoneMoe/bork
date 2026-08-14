@@ -56,7 +56,7 @@ func loadAppConfigFile(path string) (AppConfig, error) {
 		Network: NetworkConfig{
 			UDPListen:   endpoint.DefaultOptions().ListenAddress,
 			STUNServers: []string{"stun.cloudflare.com:3478", "stun.miwifi.com:3478"},
-			TrackerURLs: []string{"https://tracker.zhuqiy.com/announce", "http://tracker.renfei.net:8080/announce"},
+			TrackerURLs: []string{"https://bork-pex.iii.moe/announce"},
 			PortMapping: true,
 		},
 	}

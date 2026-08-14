@@ -1,6 +1,7 @@
 package tracker
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log/slog"
@@ -77,7 +78,7 @@ func (g *Group) Snapshot() []ProviderStatus {
 			statuses = append(statuses, child.Snapshot()...)
 			continue
 		}
-		for _, configured := range g.providers {
+		for _, configured := range providersForCandidate(g.providers, candidate) {
 			statuses = append(statuses, ProviderStatus{
 				Provider: configured.display, Candidate: candidate.String(), PeerAddresses: []string{},
 			})
@@ -129,7 +130,8 @@ func (g *Group) runCandidates(ctx context.Context, candidates []AnnounceCandidat
 	results := make(chan error, len(candidates))
 	var workers sync.WaitGroup
 	for _, candidate := range candidates {
-		child, err := newAnnouncerFromProviders(g.providers, g.infoHash, g.identityKey, candidate, g.transport, g.logger)
+		providers := providersForCandidate(g.providers, candidate)
+		child, err := newAnnouncerFromProviders(providers, g.infoHash, g.identityKey, candidate, g.transport, g.logger)
 		if err != nil {
 			cancel()
 			workers.Wait()
@@ -205,7 +207,6 @@ func (g *Group) signalChange() {
 
 func normalizeAnnounceCandidates(candidates []AnnounceCandidate) []AnnounceCandidate {
 	normalized := make([]AnnounceCandidate, 0, min(len(candidates), MaxAnnounceCandidates))
-	seen := make(map[AnnounceCandidate]struct{}, MaxAnnounceCandidates)
 	var fallback AnnounceCandidate
 	for _, candidate := range candidates {
 		candidate, valid := normalizeAnnounceCandidate(candidate)
@@ -213,22 +214,32 @@ func normalizeAnnounceCandidates(candidates []AnnounceCandidate) []AnnounceCandi
 			continue
 		}
 		if !candidate.Address.IsValid() {
-			if fallback.Port == 0 {
-				fallback = candidate
-			}
+			fallback = cmp.Or(fallback, candidate)
 			continue
 		}
-		if _, exists := seen[candidate]; exists {
+		if slices.Contains(normalized, candidate) {
 			continue
 		}
-		seen[candidate] = struct{}{}
 		normalized = append(normalized, candidate)
 		if len(normalized) == MaxAnnounceCandidates {
 			break
 		}
 	}
-	if len(normalized) == 0 && fallback.Port != 0 {
-		normalized = append(normalized, fallback)
+	return withAnnounceFallback(normalized, fallback)
+}
+
+func withAnnounceFallback(candidates []AnnounceCandidate, fallback AnnounceCandidate) []AnnounceCandidate {
+	if len(candidates) == 0 && fallback.Port != 0 {
+		return append(candidates, fallback)
 	}
-	return normalized
+	return candidates
+}
+
+func providersForCandidate(providers []provider, candidate AnnounceCandidate) []provider {
+	if !candidate.Address.IsUnspecified() {
+		return providers
+	}
+	return slices.DeleteFunc(slices.Clone(providers), func(configured provider) bool {
+		return configured.scheme != "udp"
+	})
 }

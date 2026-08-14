@@ -50,8 +50,7 @@ network:
     - stun.cloudflare.com:3478
     - stun.miwifi.com:3478
   tracker_urls:
-    - https://tracker.zhuqiy.com/announce
-    - http://tracker.renfei.net:8080/announce
+    - https://bork-pex.iii.moe/announce
   port_mapping: true
 ```
 
@@ -64,7 +63,7 @@ network:
 - 空的 `stun_servers` 列表会禁用公共 STUN 服务。
 - 空的 `tracker_urls` 列表会禁用公共 Tracker 服务。
 - 将 `port_mapping` 设为 `false` 会禁用网关端口映射。
-- 默认 Tracker 中有一个使用未加密 HTTP。Tracker 可看到派生的 tracker hash、派生的 tracker peer ID、候选地址和源地址，但无法获取 `RoomSeed`、房间状态或媒体明文；tracker peer ID 会随每次入房使用的临时节点密钥变化。
+- 默认 Tracker 可看到派生的 tracker hash、派生的 tracker peer ID、候选地址和源地址，但无法获取 `RoomSeed`、房间状态或媒体明文；tracker peer ID 会随每次入房使用的临时节点密钥变化。
 
 ### 构建与验证
 

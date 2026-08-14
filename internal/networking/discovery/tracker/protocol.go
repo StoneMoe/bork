@@ -25,7 +25,7 @@ const (
 	announceResponseHead = 20
 	responseHeaderSize   = 8
 
-	maxAnnouncePeers       = 32
+	maxAnnouncePeers       = 50
 	maxTrackerResponseSize = 4096
 )
 
@@ -56,7 +56,14 @@ type announceRequest struct {
 type announceResponse struct {
 	interval        time.Duration
 	peers           []netip.AddrPort
+	peerNames       []httpPeer
 	externalAddress netip.Addr
+}
+
+type httpPeer struct {
+	address netip.Addr
+	name    string
+	port    uint16
 }
 
 func marshalConnectRequest(transaction uint32) []byte {
@@ -106,6 +113,9 @@ func parseAnnounceResponse(packet []byte, transaction uint32, ipv6 bool) (announ
 	response := announceResponse{
 		interval: time.Duration(binary.BigEndian.Uint32(packet[8:12])) * time.Second,
 	}
+	if response.interval <= 0 {
+		return announceResponse{}, errors.New("tracker announce interval must be positive")
+	}
 	seen := make(map[netip.AddrPort]struct{}, maxAnnouncePeers)
 	peers, err := appendCompactPeers(response.peers, seen, packet[announceResponseHead:], ipv6)
 	if err != nil {
@@ -133,17 +143,20 @@ func appendCompactPeers(peers []netip.AddrPort, seen map[netip.AddrPort]struct{}
 			address = netip.AddrFrom4([4]byte(compact[offset : offset+4]))
 		}
 		port := binary.BigEndian.Uint16(compact[offset+peerSize-2 : offset+peerSize])
-		peer := netip.AddrPortFrom(address, port)
-		if !usablePeer(peer) {
-			continue
-		}
-		if _, exists := seen[peer]; exists {
-			continue
-		}
-		seen[peer] = struct{}{}
-		peers = append(peers, peer)
+		peers = appendUniquePeer(peers, seen, netip.AddrPortFrom(address, port))
 	}
 	return peers, nil
+}
+
+func appendUniquePeer(peers []netip.AddrPort, seen map[netip.AddrPort]struct{}, peer netip.AddrPort) []netip.AddrPort {
+	if len(peers) >= maxAnnouncePeers || !usablePeer(peer) {
+		return peers
+	}
+	if _, exists := seen[peer]; exists {
+		return peers
+	}
+	seen[peer] = struct{}{}
+	return append(peers, peer)
 }
 
 func validateResponseHeader(packet []byte, expectedAction, transaction uint32) error {

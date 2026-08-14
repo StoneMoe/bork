@@ -1,0 +1,26 @@
+{
+  "name": "bork-pex",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-14",
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "bork-pex.iii.moe",
+      "custom_domain": true
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SWARMS",
+        "class_name": "Swarm"
+      }
+    ]
+  },
+  "exports": {
+    "Swarm": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -368,46 +369,83 @@ func portMappingInternalPort(snapshot endpoint.Snapshot) uint16 {
 
 func trackerAnnounceCandidates(snapshot endpoint.Snapshot) []tracker.AnnounceCandidate {
 	candidates := make([]tracker.AnnounceCandidate, 0, tracker.MaxAnnounceCandidates)
-	seenEndpoints := make(map[netip.AddrPort]struct{}, tracker.MaxAnnounceCandidates)
-	appendCandidate := func(candidate endpoint.Candidate) {
+	appendCandidate := func(candidate endpoint.Candidate) bool {
 		if len(candidates) == tracker.MaxAnnounceCandidates {
-			return
+			return false
 		}
-		address, err := netip.ParseAddrPort(candidate.Address)
-		if err != nil || !address.Addr().Unmap().Is4() || address.Port() == 0 {
-			return
+		address, valid := trackerCandidateAddress(snapshot, candidate)
+		if !valid {
+			return false
 		}
-		ip := address.Addr().Unmap()
-		if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || carrierGradeNATPrefix.Contains(ip) {
-			return
+		announceCandidate := tracker.AnnounceCandidate{Address: address.Addr(), Port: address.Port()}
+		if slices.Contains(candidates, announceCandidate) {
+			return false
 		}
-		if candidate.Type == endpoint.CandidatePortMapped && !hasSTUNAddress(snapshot, ip) {
-			return
+		// Keep only one IPv6 candidate so IPv4 trackers still get a slot.
+		if announceCandidate.Address.Is6() && slices.ContainsFunc(candidates, func(existing tracker.AnnounceCandidate) bool {
+			return existing.Address.Is6()
+		}) {
+			return false
 		}
-		endpointAddress := netip.AddrPortFrom(ip, address.Port())
-		if _, exists := seenEndpoints[endpointAddress]; exists {
-			return
-		}
-		seenEndpoints[endpointAddress] = struct{}{}
-		candidates = append(candidates, tracker.AnnounceCandidate{Address: ip, Port: address.Port()})
+		candidates = append(candidates, announceCandidate)
+		return true
 	}
 	for _, candidate := range snapshot.Candidates {
 		if candidate.Type == endpoint.CandidatePortMapped {
 			appendCandidate(candidate)
 		}
 	}
-	stunCandidates := make([]endpoint.Candidate, 0, len(snapshot.Candidates))
+	stunCandidates := sortedSTUNCandidates(snapshot)
+	appendIPv6 := func(source []endpoint.Candidate, candidateType endpoint.CandidateType) {
+		for _, candidate := range source {
+			if candidate.Type == candidateType && candidate.Family == "ipv6" && appendCandidate(candidate) {
+				return
+			}
+		}
+	}
+	appendIPv6(stunCandidates, endpoint.CandidateSTUN)
+	// STUN can miss IPv6 when its IPv4 probe wins, so fall back to a public NIC.
+	appendIPv6(snapshot.Candidates, endpoint.CandidateNIC)
+	for _, candidate := range stunCandidates {
+		appendCandidate(candidate)
+	}
+	appendTrackerSourceFallback(snapshot, &candidates)
+	return candidates
+}
+
+func appendTrackerSourceFallback(snapshot endpoint.Snapshot, candidates *[]tracker.AnnounceCandidate) {
+	hasIPv4 := slices.ContainsFunc(*candidates, func(candidate tracker.AnnounceCandidate) bool {
+		return candidate.Address.Is4()
+	})
+	if len(*candidates) >= tracker.MaxAnnounceCandidates || hasIPv4 {
+		return
+	}
+	listenAddress, err := netip.ParseAddrPort(snapshot.ListenAddress)
+	if err != nil || listenAddress.Port() == 0 {
+		return
+	}
+	fallback := tracker.AnnounceCandidate{Port: listenAddress.Port()}
+	if len(*candidates) != 0 {
+		// Keep this fallback on IPv4 UDP trackers; HTTP and IPv6 already have
+		// the explicit IPv6 candidate.
+		fallback.Address = netip.IPv4Unspecified()
+	}
+	*candidates = append(*candidates, fallback)
+}
+
+func sortedSTUNCandidates(snapshot endpoint.Snapshot) []endpoint.Candidate {
+	candidates := make([]endpoint.Candidate, 0, len(snapshot.Candidates))
 	for _, candidate := range snapshot.Candidates {
 		if candidate.Type == endpoint.CandidateSTUN {
-			stunCandidates = append(stunCandidates, candidate)
+			candidates = append(candidates, candidate)
 		}
 	}
 	rttByServer := make(map[string]int64, len(snapshot.STUN))
 	for _, result := range snapshot.STUN {
 		rttByServer[result.Server] = result.RTTMillis
 	}
-	sort.Slice(stunCandidates, func(i, j int) bool {
-		left, right := rttByServer[stunCandidates[i].Source], rttByServer[stunCandidates[j].Source]
+	sort.Slice(candidates, func(i, j int) bool {
+		left, right := rttByServer[candidates[i].Source], rttByServer[candidates[j].Source]
 		if left <= 0 {
 			left = 1<<63 - 1
 		}
@@ -417,17 +455,30 @@ func trackerAnnounceCandidates(snapshot endpoint.Snapshot) []tracker.AnnounceCan
 		if left != right {
 			return left < right
 		}
-		return stunCandidates[i].Address < stunCandidates[j].Address
+		return candidates[i].Address < candidates[j].Address
 	})
-	for _, candidate := range stunCandidates {
-		appendCandidate(candidate)
-	}
-	if len(candidates) == 0 {
-		if listenAddress, err := netip.ParseAddrPort(snapshot.ListenAddress); err == nil && listenAddress.Port() != 0 {
-			candidates = append(candidates, tracker.AnnounceCandidate{Port: listenAddress.Port()})
-		}
-	}
 	return candidates
+}
+
+func trackerCandidateAddress(snapshot endpoint.Snapshot, candidate endpoint.Candidate) (netip.AddrPort, bool) {
+	address, err := netip.ParseAddrPort(candidate.Address)
+	if err != nil || address.Port() == 0 {
+		return netip.AddrPort{}, false
+	}
+	ip := address.Addr().Unmap()
+	if !usablePublicTrackerAddress(ip) {
+		return netip.AddrPort{}, false
+	}
+	if candidate.Type == endpoint.CandidatePortMapped && !hasSTUNAddress(snapshot, ip) {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(ip, address.Port()), true
+}
+
+func usablePublicTrackerAddress(address netip.Addr) bool {
+	return address.IsGlobalUnicast() &&
+		!address.IsPrivate() &&
+		!carrierGradeNATPrefix.Contains(address)
 }
 
 func hasSTUNAddress(snapshot endpoint.Snapshot, address netip.Addr) bool {

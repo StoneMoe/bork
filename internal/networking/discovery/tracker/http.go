@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -39,6 +40,7 @@ var generatedHTTPQueryKeys = map[string]struct{}{
 	"uploaded":   {},
 	"downloaded": {},
 	"left":       {},
+	"key":        {},
 	"compact":    {},
 	"numwant":    {},
 	"event":      {},
@@ -60,47 +62,28 @@ func (a *Announcer) runHTTPTracker(ctx context.Context, configured provider, hin
 	started := false
 	announces := 0
 	announced := false
-	var active *trackerRegistration
-	defer func() {
-		if active != nil {
-			a.stopHTTPRegistration(configured, *active, timing)
-		}
-	}()
+	defer a.stopHTTPRegistration(configured, registration, timing)
 	for {
+		event := eventNone
 		if !started {
-			active = &registration
+			event = eventStarted
 		}
-		response, err := a.httpAnnounce(ctx, configured, registration, !started, timing)
+		response, err := a.httpAnnounce(ctx, configured, registration, event, timing)
 		if err != nil {
 			return announced, fmt.Errorf("announce to %s: %w", configured.display, err)
 		}
 		started = true
-		active = &registration
-		interval := effectiveAnnounceInterval(response.interval, timing, announces)
+		interval := effectiveAnnounceInterval(response.interval, announces)
 		announces++
 		a.recordSuccess(configured, candidate, response, interval)
 		announced = true
-		if err := publishAndWait(ctx, hints, response, interval, timing); err != nil {
+		if err := publishAndWait(ctx, hints, response, interval); err != nil {
 			return announced, err
 		}
 	}
 }
 
 func (a *Announcer) httpAnnounce(
-	ctx context.Context,
-	configured provider,
-	registration trackerRegistration,
-	started bool,
-	timing announcerTiming,
-) (announceResponse, error) {
-	event := eventNone
-	if started {
-		event = eventStarted
-	}
-	return a.httpAnnounceEvent(ctx, configured, registration, event, timing)
-}
-
-func (a *Announcer) httpAnnounceEvent(
 	ctx context.Context,
 	configured provider,
 	registration trackerRegistration,
@@ -122,6 +105,8 @@ func (a *Announcer) httpAnnounceEvent(
 	}
 	request.Header.Set("Accept", "text/plain, application/octet-stream")
 	request.Header.Set("Cache-Control", "no-cache")
+	// Cloudflare challenges Go's default User-Agent before an announce reaches the Worker.
+	request.Header.Set("User-Agent", "Bork")
 
 	response, err := a.httpClient.Do(request)
 	if err != nil {
@@ -159,7 +144,39 @@ func (a *Announcer) httpAnnounceEvent(
 	if ctx.Err() != nil {
 		return announceResponse{}, ctx.Err()
 	}
-	return parseHTTPAnnounceResponse(body)
+	parsed, err := parseHTTPAnnounceResponse(body)
+	if err != nil {
+		return announceResponse{}, err
+	}
+	parsed = a.resolveHTTPPeerNames(requestCtx, parsed)
+	if ctx.Err() != nil {
+		return announceResponse{}, ctx.Err()
+	}
+	// Keep any literal or compact peers already returned by the tracker. When
+	// the response only contains DNS names, a lookup timeout must be retried
+	// instead of turning into an empty result for the full announce interval.
+	if err := requestCtx.Err(); err != nil && len(parsed.peers) == 0 {
+		return announceResponse{}, fmt.Errorf("resolve HTTP tracker peers: %w", err)
+	}
+	return parsed, nil
+}
+
+func (a *Announcer) resolveHTTPPeerNames(ctx context.Context, response announceResponse) announceResponse {
+	seen := make(map[netip.AddrPort]struct{}, maxAnnouncePeers)
+	for _, peer := range response.peers {
+		seen[peer] = struct{}{}
+	}
+	for _, peer := range response.peerNames {
+		if len(response.peers) >= maxAnnouncePeers {
+			break
+		}
+		addresses, _ := a.lookupNetIP(ctx, "ip", peer.name)
+		for _, address := range addresses[:min(len(addresses), maxResolvedAddresses)] {
+			response.peers = appendUniquePeer(response.peers, seen, netip.AddrPortFrom(address.Unmap(), peer.port))
+		}
+	}
+	response.peerNames = nil
+	return response
 }
 
 func (a *Announcer) buildHTTPAnnounceURL(configured provider, registration trackerRegistration, event uint32) (string, error) {
@@ -179,6 +196,7 @@ func (a *Announcer) buildHTTPAnnounceURL(configured provider, registration track
 	query.Set("uploaded", "0")
 	query.Set("downloaded", "0")
 	query.Set("left", "0")
+	query.Set("key", strconv.FormatUint(uint64(registration.key), 10))
 	query.Set("compact", "1")
 	query.Set("numwant", strconv.Itoa(maxAnnouncePeers))
 	// Tracker frontends may cache time-sensitive GET responses despite request no-cache headers.
@@ -203,7 +221,7 @@ func (a *Announcer) stopHTTPRegistration(configured provider, registration track
 	timeout := min(timing.httpRequestTimeout, trackerStopTimeout)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	if _, err := a.httpAnnounceEvent(ctx, configured, registration, eventStopped, timing); err != nil {
+	if _, err := a.httpAnnounce(ctx, configured, registration, eventStopped, timing); err != nil {
 		a.logger.Debug("stop HTTP tracker registration", "provider", configured.display, "candidate", registration.candidate.String(), "error", err)
 	}
 }

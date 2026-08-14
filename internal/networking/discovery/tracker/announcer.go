@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +32,9 @@ const (
 	maximumConnectionLifetime = 60 * time.Second
 	trackerStopTimeout        = 3 * time.Second
 	maxTrackerErrorLength     = 512
+	initialAnnounceCount      = 3
+	initialAnnounceInterval   = 5 * time.Second
+	maximumAnnounceInterval   = 30 * time.Second
 )
 
 // Transport exchanges a BEP 15 request through the application's shared UDP
@@ -56,12 +60,6 @@ type announcerTiming struct {
 	httpRequestTimeout time.Duration
 	providerRetry      time.Duration
 	providerRetryMax   time.Duration
-	intervalMin        time.Duration
-	intervalMax        time.Duration
-	initialInterval    time.Duration
-	initialAnnounces   int
-	hintLifetimeMin    time.Duration
-	hintLifetimeMax    time.Duration
 }
 
 var defaultAnnouncerTiming = announcerTiming{
@@ -72,16 +70,11 @@ var defaultAnnouncerTiming = announcerTiming{
 	httpRequestTimeout: 20 * time.Second,
 	providerRetry:      5 * time.Second,
 	providerRetryMax:   5 * time.Minute,
-	intervalMin:        5 * time.Second,
-	intervalMax:        30 * time.Second,
-	initialInterval:    5 * time.Second,
-	initialAnnounces:   3,
-	hintLifetimeMin:    time.Minute,
-	hintLifetimeMax:    time.Hour,
 }
 
 // Announcer discovers peers from independently supervised UDP and HTTP(S)
-// trackers. Registration identities are derived per room, provider, and candidate.
+// trackers. Registration identities are shared by every address announced to
+// the same provider during a room session, as required for dual-stack announces.
 type Announcer struct {
 	providers   []provider
 	infoHash    [20]byte
@@ -128,14 +121,6 @@ type trackerRegistration struct {
 	candidate AnnounceCandidate
 	peerID    [20]byte
 	key       uint32
-}
-
-func newAnnouncer(providerURLs []string, infoHash [20]byte, identityKey [32]byte, candidate AnnounceCandidate, transport Transport, logger *slog.Logger) (*Announcer, error) {
-	providers, err := parseProviders(providerURLs)
-	if err != nil {
-		return nil, err
-	}
-	return newAnnouncerFromProviders(providers, infoHash, identityKey, candidate, transport, logger)
 }
 
 func ValidateProviderURL(raw string) error {
@@ -233,14 +218,19 @@ func normalizeAnnounceCandidate(candidate AnnounceCandidate) (AnnounceCandidate,
 		return candidate, true
 	}
 	candidate.Address = candidate.Address.Unmap()
-	if !candidate.Address.Is4() || !usableTrackerAddress(candidate.Address) || candidate.Address.IsPrivate() || candidate.Address.IsLoopback() || candidate.Address.IsLinkLocalUnicast() {
+	// An unspecified IPv4 address marks a UDP announce that should use the
+	// socket's observed IPv4 source address.
+	if candidate.Address.IsUnspecified() {
+		return candidate, candidate.Address.Is4()
+	}
+	if !usablePeer(netip.AddrPortFrom(candidate.Address, candidate.Port)) {
 		return AnnounceCandidate{}, false
 	}
 	return candidate, true
 }
 
 func (a *Announcer) registration(configured provider, candidate AnnounceCandidate) trackerRegistration {
-	info := "bork/tracker-registration/v1\x00" + configured.scope + "\x00" + candidate.String()
+	info := "bork/tracker-registration/v2\x00" + configured.scope
 	material, err := hkdf.Key(sha256.New, a.identityKey[:], a.infoHash[:], info, 24)
 	if err != nil {
 		panic("derive tracker registration: " + err.Error())
@@ -326,14 +316,23 @@ func (a *Announcer) runUDPProvider(ctx context.Context, configured provider, hin
 	}
 	announced := false
 	var failures []error
+	candidateAddress := a.candidate.Address
+	if candidateAddress.IsValid() {
+		// BEP 15 returns peers in the tracker's transport address family.
+		addresses = slices.DeleteFunc(addresses, func(address netip.AddrPort) bool {
+			return candidateAddress.Is4() != address.Addr().Unmap().Is4()
+		})
+	}
 	for _, address := range addresses {
-		var accepted bool
-		accepted, err = a.runTracker(ctx, configured, address, hints, timing)
+		accepted, err := a.runTracker(ctx, configured, address, hints, timing)
 		announced = announced || accepted
 		if ctx.Err() != nil {
 			return announced, ctx.Err()
 		}
 		failures = append(failures, fmt.Errorf("%s: %w", address, err))
+	}
+	if len(failures) == 0 {
+		return false, errors.New("UDP tracker has no address matching the announce candidate")
 	}
 	return announced, errors.Join(failures...)
 }
@@ -382,12 +381,11 @@ func (a *Announcer) runTracker(ctx context.Context, configured provider, address
 			return announced, fmt.Errorf("announce to %s: %w", configured.display, err)
 		}
 		started = true
-		active = &registration
-		interval := effectiveAnnounceInterval(response.interval, timing, announces)
+		interval := effectiveAnnounceInterval(response.interval, announces)
 		announces++
 		a.recordSuccess(configured, candidate, response, interval)
 		announced = true
-		if err := publishAndWait(ctx, hints, response, interval, timing); err != nil {
+		if err := publishAndWait(ctx, hints, response, interval); err != nil {
 			return announced, err
 		}
 	}
@@ -416,9 +414,9 @@ func (a *Announcer) stopUDPRegistration(
 	}
 }
 
-func publishAndWait(ctx context.Context, hints chan<- discovery.Hint, response announceResponse, interval time.Duration, timing announcerTiming) error {
-	lifetime := clampDuration(interval*2, timing.hintLifetimeMin, timing.hintLifetimeMax)
-	expiresAt := time.Now().Add(lifetime)
+func publishAndWait(ctx context.Context, hints chan<- discovery.Hint, response announceResponse, interval time.Duration) error {
+	// Keep the old hint alive while the next announce is in flight.
+	expiresAt := time.Now().Add(max(interval*2, time.Minute))
 	for _, peer := range response.peers {
 		select {
 		case hints <- discovery.Hint{Address: peer, Source: discovery.SourceTracker, ExpiresAt: expiresAt}:
@@ -435,12 +433,13 @@ func publishAndWait(ctx context.Context, hints chan<- discovery.Hint, response a
 	}
 }
 
-func effectiveAnnounceInterval(providerInterval time.Duration, timing announcerTiming, announces int) time.Duration {
-	interval := clampDuration(providerInterval, timing.intervalMin, timing.intervalMax)
-	if announces < timing.initialAnnounces && timing.initialInterval > 0 && timing.initialInterval < interval {
-		return timing.initialInterval
+// Refresh quickly even when a tracker asks clients to wait longer. Fast early
+// announces reduce the time needed for two peers entering a room to meet.
+func effectiveAnnounceInterval(providerInterval time.Duration, announces int) time.Duration {
+	if announces < initialAnnounceCount {
+		return initialAnnounceInterval
 	}
-	return interval
+	return min(max(providerInterval, initialAnnounceInterval), maximumAnnounceInterval)
 }
 
 func (a *Announcer) connect(ctx context.Context, address netip.AddrPort, timing announcerTiming) (uint64, error) {
@@ -748,24 +747,6 @@ func normalizeTiming(timing announcerTiming) announcerTiming {
 	if timing.providerRetryMax < timing.providerRetry {
 		timing.providerRetryMax = max(defaults.providerRetryMax, timing.providerRetry)
 	}
-	if timing.intervalMin <= 0 {
-		timing.intervalMin = defaults.intervalMin
-	}
-	if timing.intervalMax < timing.intervalMin {
-		timing.intervalMax = max(defaults.intervalMax, timing.intervalMin)
-	}
-	if timing.initialInterval <= 0 {
-		timing.initialInterval = defaults.initialInterval
-	}
-	if timing.initialAnnounces <= 0 {
-		timing.initialAnnounces = defaults.initialAnnounces
-	}
-	if timing.hintLifetimeMin <= 0 {
-		timing.hintLifetimeMin = defaults.hintLifetimeMin
-	}
-	if timing.hintLifetimeMax < timing.hintLifetimeMin {
-		timing.hintLifetimeMax = max(defaults.hintLifetimeMax, timing.hintLifetimeMin)
-	}
 	return timing
 }
 
@@ -786,10 +767,6 @@ func exponentialTimeout(base time.Duration, attempt int) time.Duration {
 		base *= 2
 	}
 	return base
-}
-
-func clampDuration(value, minimum, maximum time.Duration) time.Duration {
-	return min(max(value, minimum), maximum)
 }
 
 func usableTrackerAddress(address netip.Addr) bool {
