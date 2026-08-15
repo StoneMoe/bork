@@ -41,6 +41,7 @@ export default function Room(props: RoomProps) {
   const [localStream, setLocalStream] = createSignal<MediaStream>();
   const [selectedSharer, setSelectedSharer] = createSignal("");
   const [remoteVideoReady, setRemoteVideoReady] = createSignal(false);
+  const [remoteVideoRecovering, setRemoteVideoRecovering] = createSignal(false);
   const captureVideo = document.createElement("video");
   const captureCanvas = document.createElement("canvas");
   let displayStream: MediaStream | undefined;
@@ -548,6 +549,7 @@ export default function Room(props: RoomProps) {
       }
       context.drawImage(frame, 0, 0, chunk.width, chunk.height);
       setRemoteVideoReady(true);
+      setRemoteVideoRecovering(false);
     } catch (cause) {
       if (run === remoteVideoRun) {
         reportScreenError(cause);
@@ -559,6 +561,7 @@ export default function Room(props: RoomProps) {
   }
 
   function resetRemoteScreenVideo(clearIdentity = true) {
+    const preserveFrame = !clearIdentity && remoteVideoReady();
     ++remoteVideoRun;
     remoteDecoderSetup = undefined;
     const decoder = remoteDecoder;
@@ -574,9 +577,12 @@ export default function Room(props: RoomProps) {
     if (clearIdentity) remoteVideoIdentity = "";
     remoteNeedsKeyframe = true;
     remoteLastChunkID = 0;
-    setRemoteVideoReady(false);
-    const context = remoteCanvas?.getContext("2d");
-    if (context && remoteCanvas) context.clearRect(0, 0, remoteCanvas.width, remoteCanvas.height);
+    setRemoteVideoRecovering(preserveFrame);
+    if (!preserveFrame) {
+      setRemoteVideoReady(false);
+      const context = remoteCanvas?.getContext("2d");
+      if (context && remoteCanvas) context.clearRect(0, 0, remoteCanvas.width, remoteCanvas.height);
+    }
   }
 
   async function leaveRoom() {
@@ -667,6 +673,11 @@ export default function Room(props: RoomProps) {
                     role="img"
                     aria-label={`${selectedSharerName()}分享的屏幕`}
                   />
+                  <Show when={!remoteVideoReady() || remoteVideoRecovering()}>
+                    <p class="screen-video-status" role="status">
+                      {remoteVideoRecovering() ? "画面中断，正在恢复…" : "正在接收画面…"}
+                    </p>
+                  </Show>
                   <figcaption class="screen-sharer">
                     <Show when={remoteSharers().length > 1} fallback={<span>{selectedSharerName()}</span>}>
                       <select
