@@ -18,7 +18,6 @@ type Group struct {
 	providers   []provider
 	infoHash    [20]byte
 	identityKey [32]byte
-	transport   Transport
 	logger      *slog.Logger
 
 	mu         sync.RWMutex
@@ -30,20 +29,20 @@ type Group struct {
 	running    atomic.Bool
 }
 
-func New(providerURLs []string, infoHash [20]byte, identityKey [32]byte, transport Transport, logger *slog.Logger) (*Group, error) {
+func New(providerURLs []string, infoHash [20]byte, identityKey [32]byte, logger *slog.Logger) (*Group, error) {
 	providers, err := parseProviders(providerURLs)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateProviderConfig(providers, identityKey, transport); err != nil {
-		return nil, err
+	if len(providers) > 0 && identityKey == [32]byte{} {
+		return nil, errors.New("tracker identity key is required")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Group{
 		providers: providers, infoHash: infoHash, identityKey: identityKey,
-		transport: transport, logger: logger, children: make(map[AnnounceCandidate]*Announcer),
+		logger: logger, children: make(map[AnnounceCandidate]*Announcer),
 		updates: make(chan struct{}, 1), changes: make(chan struct{}, 1),
 	}, nil
 }
@@ -78,7 +77,7 @@ func (g *Group) Snapshot() []ProviderStatus {
 			statuses = append(statuses, child.Snapshot()...)
 			continue
 		}
-		for _, configured := range providersForCandidate(g.providers, candidate) {
+		for _, configured := range g.providers {
 			statuses = append(statuses, ProviderStatus{
 				Provider: configured.display, Candidate: candidate.String(), PeerAddresses: []string{},
 			})
@@ -130,8 +129,7 @@ func (g *Group) runCandidates(ctx context.Context, candidates []AnnounceCandidat
 	results := make(chan error, len(candidates))
 	var workers sync.WaitGroup
 	for _, candidate := range candidates {
-		providers := providersForCandidate(g.providers, candidate)
-		child, err := newAnnouncerFromProviders(providers, g.infoHash, g.identityKey, candidate, g.transport, g.logger)
+		child, err := newAnnouncerFromProviders(g.providers, g.infoHash, g.identityKey, candidate, g.logger)
 		if err != nil {
 			cancel()
 			workers.Wait()
@@ -233,13 +231,4 @@ func withAnnounceFallback(candidates []AnnounceCandidate, fallback AnnounceCandi
 		return append(candidates, fallback)
 	}
 	return candidates
-}
-
-func providersForCandidate(providers []provider, candidate AnnounceCandidate) []provider {
-	if !candidate.Address.IsUnspecified() {
-		return providers
-	}
-	return slices.DeleteFunc(slices.Clone(providers), func(configured provider) bool {
-		return configured.scheme != "udp"
-	})
 }

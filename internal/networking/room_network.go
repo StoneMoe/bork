@@ -95,7 +95,7 @@ func NewRoomNetwork(roomTag [16]byte, trackerHash [20]byte, trackerIdentity [32]
 	endpointUDP := endpoint.New(options.Endpoint, roomTag, logger)
 	network := newRoomNetwork(roomTag, endpointUDP, discovery.DefaultServices(), logger)
 	if len(options.TrackerURLs) > 0 {
-		network.tracker, network.initializationErr = tracker.New(options.TrackerURLs, trackerHash, trackerIdentity, endpointUDP, logger)
+		network.tracker, network.initializationErr = tracker.New(options.TrackerURLs, trackerHash, trackerIdentity, logger)
 	}
 	if options.EnablePortMapping {
 		network.portMapper = portmap.NewGateway(logger)
@@ -381,7 +381,8 @@ func trackerAnnounceCandidates(snapshot endpoint.Snapshot) []tracker.AnnounceCan
 		if slices.Contains(candidates, announceCandidate) {
 			return false
 		}
-		// Keep only one IPv6 candidate so IPv4 trackers still get a slot.
+		// One public IPv6 address is enough; keep the other bounded slots for
+		// IPv4 NAT mappings, which can differ between STUN servers.
 		if announceCandidate.Address.Is6() && slices.ContainsFunc(candidates, func(existing tracker.AnnounceCandidate) bool {
 			return existing.Address.Is6()
 		}) {
@@ -409,28 +410,15 @@ func trackerAnnounceCandidates(snapshot endpoint.Snapshot) []tracker.AnnounceCan
 	for _, candidate := range stunCandidates {
 		appendCandidate(candidate)
 	}
-	appendTrackerSourceFallback(snapshot, &candidates)
+	if len(candidates) == 0 {
+		// Without a public candidate, let the HTTP tracker use the request's
+		// observed source address with the room endpoint's listening port.
+		listenAddress, err := netip.ParseAddrPort(snapshot.ListenAddress)
+		if err == nil && listenAddress.Port() != 0 {
+			candidates = append(candidates, tracker.AnnounceCandidate{Port: listenAddress.Port()})
+		}
+	}
 	return candidates
-}
-
-func appendTrackerSourceFallback(snapshot endpoint.Snapshot, candidates *[]tracker.AnnounceCandidate) {
-	hasIPv4 := slices.ContainsFunc(*candidates, func(candidate tracker.AnnounceCandidate) bool {
-		return candidate.Address.Is4()
-	})
-	if len(*candidates) >= tracker.MaxAnnounceCandidates || hasIPv4 {
-		return
-	}
-	listenAddress, err := netip.ParseAddrPort(snapshot.ListenAddress)
-	if err != nil || listenAddress.Port() == 0 {
-		return
-	}
-	fallback := tracker.AnnounceCandidate{Port: listenAddress.Port()}
-	if len(*candidates) != 0 {
-		// Keep this fallback on IPv4 UDP trackers; HTTP and IPv6 already have
-		// the explicit IPv6 candidate.
-		fallback.Address = netip.IPv4Unspecified()
-	}
-	*candidates = append(*candidates, fallback)
 }
 
 func sortedSTUNCandidates(snapshot endpoint.Snapshot) []endpoint.Candidate {

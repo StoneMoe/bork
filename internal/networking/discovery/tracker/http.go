@@ -26,6 +26,14 @@ const (
 	maxHTTPResponseHeaders      = int64(64 << 10)
 )
 
+type announceEvent string
+
+const (
+	eventNone    announceEvent = ""
+	eventStarted announceEvent = "started"
+	eventStopped announceEvent = "stopped"
+)
+
 var trackerHTTPTransport = func() *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxResponseHeaderBytes = maxHTTPResponseHeaders
@@ -87,7 +95,7 @@ func (a *Announcer) httpAnnounce(
 	ctx context.Context,
 	configured provider,
 	registration trackerRegistration,
-	event uint32,
+	event announceEvent,
 	timing announcerTiming,
 ) (announceResponse, error) {
 	if err := ctx.Err(); err != nil {
@@ -179,7 +187,7 @@ func (a *Announcer) resolveHTTPPeerNames(ctx context.Context, response announceR
 	return response
 }
 
-func (a *Announcer) buildHTTPAnnounceURL(configured provider, registration trackerRegistration, event uint32) (string, error) {
+func (a *Announcer) buildHTTPAnnounceURL(configured provider, registration trackerRegistration, event announceEvent) (string, error) {
 	endpoint := configured.announceURL
 	query, err := url.ParseQuery(endpoint.RawQuery)
 	if err != nil {
@@ -201,13 +209,10 @@ func (a *Announcer) buildHTTPAnnounceURL(configured provider, registration track
 	query.Set("numwant", strconv.Itoa(maxAnnouncePeers))
 	// Tracker frontends may cache time-sensitive GET responses despite request no-cache headers.
 	query.Set("nonce", strconv.FormatInt(time.Now().UnixNano(), 36))
-	switch event {
-	case eventStarted:
-		query.Set("event", "started")
-	case eventStopped:
-		query.Set("event", "stopped")
-	default:
+	if event == eventNone {
 		query.Del("event")
+	} else {
+		query.Set("event", string(event))
 	}
 	endpoint.RawQuery = query.Encode()
 	encoded := endpoint.String()

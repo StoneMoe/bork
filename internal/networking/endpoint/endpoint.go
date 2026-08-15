@@ -2,7 +2,6 @@ package endpoint
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -27,8 +26,6 @@ const (
 	maxSTUNServerResults      = 8
 	maxSTUNAddresses          = 4
 	maxPendingSTUN            = maxSTUNServerResults * maxSTUNAddresses
-	maxPendingTracker         = 32
-	maxTrackerDatagram        = 2048
 	maxPeerDatagrams          = 256
 	maxAudioBatches           = 64
 	maxInteractiveBatches     = 32
@@ -86,12 +83,6 @@ type stunProbeResult struct {
 	err       error
 }
 
-type pendingTracker struct {
-	server         netip.AddrPort
-	expectedAction uint32
-	result         chan []byte
-}
-
 type Endpoint struct {
 	options Options
 	roomTag [16]byte
@@ -101,7 +92,6 @@ type Endpoint struct {
 	conn     *net.UDPConn
 	snapshot Snapshot
 	pending  map[stunTransaction]pendingSTUN
-	trackers map[uint32]pendingTracker
 	started  bool
 	closed   bool
 
@@ -128,7 +118,6 @@ func New(options Options, roomTag [16]byte, logger *slog.Logger) *Endpoint {
 		roomTag:            roomTag,
 		logger:             logger,
 		pending:            make(map[stunTransaction]pendingSTUN),
-		trackers:           make(map[uint32]pendingTracker),
 		snapshotChanges:    make(chan struct{}, 1),
 		controlPackets:     make(chan Datagram, maxPeerDatagrams),
 		reliablePackets:    make(chan Datagram, maxPeerDatagrams),
@@ -217,65 +206,6 @@ func (e *Endpoint) enqueuePeerDatagram(data []byte, destination netip.AddrPort, 
 		return nil
 	default:
 		return fmt.Errorf("UDP %s queue is full", lane)
-	}
-}
-
-// ExchangeTracker exchanges one BEP 15 request on the room's shared UDP
-// socket. Only the exact tracker source, transaction, and response action can
-// satisfy the exchange.
-func (e *Endpoint) ExchangeTracker(
-	ctx context.Context,
-	server netip.AddrPort,
-	request []byte,
-	expectedAction uint32,
-	transaction uint32,
-) ([]byte, error) {
-	if ctx == nil {
-		return nil, errors.New("tracker context is required")
-	}
-	if _, ok := ctx.Deadline(); !ok {
-		return nil, errors.New("tracker exchange requires a deadline")
-	}
-	server = netip.AddrPortFrom(server.Addr().Unmap(), server.Port())
-	if !server.IsValid() || server.Port() == 0 || server.Addr().IsUnspecified() || server.Addr().IsMulticast() {
-		return nil, errors.New("tracker server is invalid")
-	}
-	if len(request) < 16 || len(request) > maxTrackerDatagram {
-		return nil, fmt.Errorf("tracker request must contain 16 to %d bytes", maxTrackerDatagram)
-	}
-	if transaction == 0 || binary.BigEndian.Uint32(request[8:12]) != expectedAction || binary.BigEndian.Uint32(request[12:16]) != transaction {
-		return nil, errors.New("tracker request action or transaction is invalid")
-	}
-
-	response := make(chan []byte, 1)
-	e.mu.Lock()
-	if e.closed || e.conn == nil {
-		e.mu.Unlock()
-		return nil, errors.New("UDP endpoint is closed")
-	}
-	if len(e.trackers) >= maxPendingTracker {
-		e.mu.Unlock()
-		return nil, errors.New("too many pending tracker transactions")
-	}
-	if _, exists := e.trackers[transaction]; exists {
-		e.mu.Unlock()
-		return nil, errors.New("duplicate tracker transaction")
-	}
-	e.trackers[transaction] = pendingTracker{server: server, expectedAction: expectedAction, result: response}
-	e.mu.Unlock()
-	defer e.removePendingTracker(transaction)
-
-	if err := e.queueWrite(ctx, e.backgroundWrites, request, server); err != nil {
-		return nil, fmt.Errorf("send tracker request: %w", err)
-	}
-	select {
-	case received, open := <-response:
-		if !open {
-			return nil, errors.New("UDP endpoint closed during tracker exchange")
-		}
-		return received, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
 	}
 }
 
@@ -422,10 +352,6 @@ func (e *Endpoint) Run(ctx context.Context) error {
 		delete(e.pending, transaction)
 		close(pending.result)
 	}
-	for transaction, pending := range e.trackers {
-		delete(e.trackers, transaction)
-		close(pending.result)
-	}
 	e.mu.Unlock()
 	close(e.snapshotChanges)
 	close(e.controlPackets)
@@ -477,22 +403,6 @@ func (e *Endpoint) readLoop(conn *net.UDPConn) error {
 				case pending.result <- message:
 				default:
 				}
-				continue
-			}
-		}
-		if count >= 8 && count <= maxTrackerDatagram {
-			action := binary.BigEndian.Uint32(buffer[0:4])
-			transaction := binary.BigEndian.Uint32(buffer[4:8])
-			e.mu.Lock()
-			pending, exists := e.trackers[transaction]
-			if exists && pending.server == remote && (action == pending.expectedAction || action == 3) {
-				delete(e.trackers, transaction)
-			} else {
-				exists = false
-			}
-			e.mu.Unlock()
-			if exists {
-				pending.result <- append([]byte(nil), buffer[:count]...)
 				continue
 			}
 		}
@@ -997,12 +907,6 @@ func (e *Endpoint) addPending(transaction stunTransaction, pending pendingSTUN) 
 func (e *Endpoint) removePending(transaction stunTransaction) {
 	e.mu.Lock()
 	delete(e.pending, transaction)
-	e.mu.Unlock()
-}
-
-func (e *Endpoint) removePendingTracker(transaction uint32) {
-	e.mu.Lock()
-	delete(e.trackers, transaction)
 	e.mu.Unlock()
 }
 

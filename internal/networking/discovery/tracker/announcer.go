@@ -3,18 +3,15 @@ package tracker
 import (
 	"context"
 	"crypto/hkdf"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,69 +23,47 @@ import (
 )
 
 const (
-	maxProviderURLLength      = 2048
-	maxResolvedAddresses      = 8
-	maxResolvedAddressesByIP  = 4
-	maximumConnectionLifetime = 60 * time.Second
-	trackerStopTimeout        = 3 * time.Second
-	maxTrackerErrorLength     = 512
-	initialAnnounceCount      = 3
-	initialAnnounceInterval   = 5 * time.Second
-	maximumAnnounceInterval   = 30 * time.Second
+	maxProviderURLLength    = 2048
+	maxResolvedAddresses    = 8
+	trackerStopTimeout      = 3 * time.Second
+	maxTrackerErrorLength   = 512
+	initialAnnounceCount    = 3
+	initialAnnounceInterval = 5 * time.Second
+	maximumAnnounceInterval = 30 * time.Second
 )
-
-// Transport exchanges a BEP 15 request through the application's shared UDP
-// socket. expectedAction and transaction identify the response to accept.
-type Transport interface {
-	ExchangeTracker(ctx context.Context, server netip.AddrPort, request []byte, expectedAction, transaction uint32) ([]byte, error)
-}
 
 type provider struct {
 	display     string
 	scope       string
-	scheme      string
-	host        string
-	port        uint16
 	announceURL url.URL
 }
 
 type announcerTiming struct {
-	requestTimeout     time.Duration
-	requestAttempts    int
-	connectionLifetime time.Duration
-	resolveTimeout     time.Duration
 	httpRequestTimeout time.Duration
 	providerRetry      time.Duration
 	providerRetryMax   time.Duration
 }
 
 var defaultAnnouncerTiming = announcerTiming{
-	requestTimeout:     15 * time.Second,
-	requestAttempts:    4,
-	connectionLifetime: maximumConnectionLifetime,
-	resolveTimeout:     10 * time.Second,
 	httpRequestTimeout: 20 * time.Second,
 	providerRetry:      5 * time.Second,
 	providerRetryMax:   5 * time.Minute,
 }
 
-// Announcer discovers peers from independently supervised UDP and HTTP(S)
-// trackers. Registration identities are shared by every address announced to
-// the same provider during a room session, as required for dual-stack announces.
+// Announcer discovers peers from independently supervised HTTP(S) trackers.
+// Registration identities are shared by every address announced to the same
+// provider during a room session.
 type Announcer struct {
 	providers   []provider
 	infoHash    [20]byte
 	identityKey [32]byte
-	transport   Transport
 	httpClient  *http.Client
 	logger      *slog.Logger
 
 	lookupNetIP func(context.Context, string, string) ([]netip.Addr, error)
-	random      io.Reader
 	timing      announcerTiming
 	waitRetry   func(context.Context, time.Duration) bool
 
-	randomMu  sync.Mutex
 	candidate AnnounceCandidate
 	running   atomic.Bool
 	statusMu  sync.RWMutex
@@ -128,10 +103,7 @@ func ValidateProviderURL(raw string) error {
 	return err
 }
 
-func newAnnouncerFromProviders(providers []provider, infoHash [20]byte, identityKey [32]byte, candidate AnnounceCandidate, transport Transport, logger *slog.Logger) (*Announcer, error) {
-	if err := validateProviderConfig(providers, identityKey, transport); err != nil {
-		return nil, err
-	}
+func newAnnouncerFromProviders(providers []provider, infoHash [20]byte, identityKey [32]byte, candidate AnnounceCandidate, logger *slog.Logger) (*Announcer, error) {
 	if normalized, valid := normalizeAnnounceCandidate(candidate); valid {
 		candidate = normalized
 	} else if candidate != (AnnounceCandidate{}) {
@@ -145,13 +117,11 @@ func newAnnouncerFromProviders(providers []provider, infoHash [20]byte, identity
 		providers:   providers,
 		infoHash:    infoHash,
 		identityKey: identityKey,
-		transport:   transport,
 		httpClient:  newHTTPClient(),
 		logger:      logger,
 		lookupNetIP: func(ctx context.Context, network, host string) ([]netip.Addr, error) {
 			return net.DefaultResolver.LookupNetIP(ctx, network, host)
 		},
-		random:        rand.Reader,
 		timing:        defaultAnnouncerTiming,
 		waitRetry:     waitForProviderRetry,
 		candidate:     candidate,
@@ -170,18 +140,6 @@ func parseProviders(providerURLs []string) ([]provider, error) {
 		providers[index] = parsed
 	}
 	return providers, nil
-}
-
-func validateProviderConfig(providers []provider, identityKey [32]byte, transport Transport) error {
-	if len(providers) > 0 && identityKey == [32]byte{} {
-		return errors.New("tracker identity key is required")
-	}
-	for _, configured := range providers {
-		if configured.scheme == "udp" && transport == nil {
-			return errors.New("UDP tracker transport is required")
-		}
-	}
-	return nil
 }
 
 func (a *Announcer) Snapshot() []ProviderStatus {
@@ -218,11 +176,6 @@ func normalizeAnnounceCandidate(candidate AnnounceCandidate) (AnnounceCandidate,
 		return candidate, true
 	}
 	candidate.Address = candidate.Address.Unmap()
-	// An unspecified IPv4 address marks a UDP announce that should use the
-	// socket's observed IPv4 source address.
-	if candidate.Address.IsUnspecified() {
-		return candidate, candidate.Address.Is4()
-	}
 	if !usablePeer(netip.AddrPortFrom(candidate.Address, candidate.Port)) {
 		return AnnounceCandidate{}, false
 	}
@@ -282,13 +235,7 @@ func (a *Announcer) Run(ctx context.Context, hints chan<- discovery.Hint) error 
 func (a *Announcer) runProvider(ctx context.Context, configured provider, hints chan<- discovery.Hint, timing announcerTiming) {
 	retry := timing.providerRetry
 	for {
-		var announced bool
-		var err error
-		if configured.scheme == "udp" {
-			announced, err = a.runUDPProvider(ctx, configured, hints, timing)
-		} else {
-			announced, err = a.runHTTPTracker(ctx, configured, hints, timing)
-		}
+		announced, err := a.runHTTPTracker(ctx, configured, hints, timing)
 		if ctx.Err() != nil {
 			return
 		}
@@ -306,111 +253,6 @@ func (a *Announcer) runProvider(ctx context.Context, configured provider, hints 
 		} else {
 			retry *= 2
 		}
-	}
-}
-
-func (a *Announcer) runUDPProvider(ctx context.Context, configured provider, hints chan<- discovery.Hint, timing announcerTiming) (bool, error) {
-	addresses, err := a.resolveProvider(ctx, configured, timing.resolveTimeout)
-	if err != nil {
-		return false, fmt.Errorf("resolve UDP tracker: %w", err)
-	}
-	announced := false
-	var failures []error
-	candidateAddress := a.candidate.Address
-	if candidateAddress.IsValid() {
-		// BEP 15 returns peers in the tracker's transport address family.
-		addresses = slices.DeleteFunc(addresses, func(address netip.AddrPort) bool {
-			return candidateAddress.Is4() != address.Addr().Unmap().Is4()
-		})
-	}
-	for _, address := range addresses {
-		accepted, err := a.runTracker(ctx, configured, address, hints, timing)
-		announced = announced || accepted
-		if ctx.Err() != nil {
-			return announced, ctx.Err()
-		}
-		failures = append(failures, fmt.Errorf("%s: %w", address, err))
-	}
-	if len(failures) == 0 {
-		return false, errors.New("UDP tracker has no address matching the announce candidate")
-	}
-	return announced, errors.Join(failures...)
-}
-
-func (a *Announcer) runTracker(ctx context.Context, configured provider, address netip.AddrPort, hints chan<- discovery.Hint, timing announcerTiming) (bool, error) {
-	candidate := a.candidate
-	registration := a.registration(configured, candidate)
-	var connectionID uint64
-	var connectionExpires time.Time
-	started := false
-	announces := 0
-	announced := false
-	var active *trackerRegistration
-	defer func() {
-		if active != nil {
-			a.stopUDPRegistration(configured, address, connectionID, connectionExpires, *active, timing)
-		}
-	}()
-
-	for {
-		if ctx.Err() != nil {
-			return announced, ctx.Err()
-		}
-		if !time.Now().Before(connectionExpires) {
-			connected, err := a.connect(ctx, address, timing)
-			if err != nil {
-				return announced, fmt.Errorf("connect to %s: %w", configured.display, err)
-			}
-			connectionID = connected
-			connectionExpires = time.Now().Add(timing.connectionLifetime)
-		}
-
-		event := eventNone
-		if !started {
-			event = eventStarted
-			active = &registration
-		}
-		announceCtx, cancel := context.WithDeadline(ctx, connectionExpires)
-		response, err := a.announce(announceCtx, address, connectionID, event, registration, timing)
-		cancel()
-		if err != nil {
-			if ctx.Err() == nil && !time.Now().Before(connectionExpires) {
-				connectionExpires = time.Time{}
-				continue
-			}
-			return announced, fmt.Errorf("announce to %s: %w", configured.display, err)
-		}
-		started = true
-		interval := effectiveAnnounceInterval(response.interval, announces)
-		announces++
-		a.recordSuccess(configured, candidate, response, interval)
-		announced = true
-		if err := publishAndWait(ctx, hints, response, interval); err != nil {
-			return announced, err
-		}
-	}
-}
-
-func (a *Announcer) stopUDPRegistration(
-	configured provider,
-	address netip.AddrPort,
-	connectionID uint64,
-	connectionExpires time.Time,
-	registration trackerRegistration,
-	timing announcerTiming,
-) {
-	ctx, cancel := context.WithTimeout(context.Background(), trackerStopTimeout)
-	defer cancel()
-	if connectionID == 0 || !time.Now().Before(connectionExpires) {
-		connected, err := a.connect(ctx, address, timing)
-		if err != nil {
-			a.logger.Debug("connect to stop UDP tracker registration", "provider", configured.display, "candidate", registration.candidate.String(), "error", err)
-			return
-		}
-		connectionID = connected
-	}
-	if _, err := a.announce(ctx, address, connectionID, eventStopped, registration, timing); err != nil {
-		a.logger.Debug("stop UDP tracker registration", "provider", configured.display, "candidate", registration.candidate.String(), "error", err)
 	}
 }
 
@@ -442,171 +284,24 @@ func effectiveAnnounceInterval(providerInterval time.Duration, announces int) ti
 	return min(max(providerInterval, initialAnnounceInterval), maximumAnnounceInterval)
 }
 
-func (a *Announcer) connect(ctx context.Context, address netip.AddrPort, timing announcerTiming) (uint64, error) {
-	transaction, err := a.newTransaction()
-	if err != nil {
-		return 0, err
-	}
-	response, err := a.exchange(ctx, address, marshalConnectRequest(transaction), actionConnect, transaction, timing)
-	if err != nil {
-		return 0, err
-	}
-	return parseConnectResponse(response, transaction)
-}
-
-func (a *Announcer) announce(
-	ctx context.Context,
-	address netip.AddrPort,
-	connectionID uint64,
-	event uint32,
-	registration trackerRegistration,
-	timing announcerTiming,
-) (announceResponse, error) {
-	transaction, err := a.newTransaction()
-	if err != nil {
-		return announceResponse{}, err
-	}
-	request := marshalAnnounceRequest(announceRequest{
-		connectionID: connectionID,
-		transaction:  transaction,
-		infoHash:     a.infoHash,
-		peerID:       registration.peerID,
-		event:        event,
-		key:          registration.key,
-		numWant:      maxAnnouncePeers,
-		port:         registration.candidate.Port,
-		explicitIP:   registration.candidate.Address,
-	})
-	response, err := a.exchange(ctx, address, request, actionAnnounce, transaction, timing)
-	if err != nil {
-		return announceResponse{}, err
-	}
-	return parseAnnounceResponse(response, transaction, !address.Addr().Unmap().Is4())
-}
-
-func (a *Announcer) exchange(
-	ctx context.Context,
-	address netip.AddrPort,
-	request []byte,
-	action uint32,
-	transaction uint32,
-	timing announcerTiming,
-) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt < timing.requestAttempts; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		attemptCtx, cancel := context.WithTimeout(ctx, exponentialTimeout(timing.requestTimeout, attempt))
-		response, err := a.transport.ExchangeTracker(attemptCtx, address, request, action, transaction)
-		cancel()
-		if err == nil {
-			err = validateResponseHeader(response, action, transaction)
-			if err == nil {
-				return response, nil
-			}
-			var trackerErr *TrackerError
-			if errors.As(err, &trackerErr) {
-				return nil, err
-			}
-		}
-		lastErr = err
-	}
-	return nil, fmt.Errorf("tracker action %d exchange failed after %d attempts: %w", action, timing.requestAttempts, lastErr)
-}
-
-func (a *Announcer) resolveProvider(ctx context.Context, configured provider, timeout time.Duration) ([]netip.AddrPort, error) {
-	if literal, err := netip.ParseAddr(configured.host); err == nil {
-		literal = literal.Unmap()
-		if !usableTrackerAddress(literal) {
-			return nil, errors.New("tracker address is not usable")
-		}
-		return []netip.AddrPort{netip.AddrPortFrom(literal, configured.port)}, nil
-	}
-
-	resolveCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	addresses, err := a.lookupNetIP(resolveCtx, "ip", configured.host)
-	if err != nil {
-		return nil, err
-	}
-	resolved := make([]netip.AddrPort, 0, min(len(addresses), maxResolvedAddresses))
-	seen := make(map[netip.Addr]struct{}, maxResolvedAddresses)
-	ipv4Count, ipv6Count := 0, 0
-	for _, address := range addresses {
-		address = address.Unmap()
-		if !usableTrackerAddress(address) {
-			continue
-		}
-		if _, exists := seen[address]; exists {
-			continue
-		}
-		if address.Is4() {
-			if ipv4Count >= maxResolvedAddressesByIP {
-				continue
-			}
-			ipv4Count++
-		} else {
-			if ipv6Count >= maxResolvedAddressesByIP {
-				continue
-			}
-			ipv6Count++
-		}
-		seen[address] = struct{}{}
-		resolved = append(resolved, netip.AddrPortFrom(address, configured.port))
-		if len(resolved) == maxResolvedAddresses {
-			break
-		}
-	}
-	if len(resolved) == 0 {
-		return nil, errors.New("tracker hostname resolved to no usable addresses")
-	}
-	return resolved, nil
-}
-
-func (a *Announcer) newTransaction() (uint32, error) {
-	a.randomMu.Lock()
-	defer a.randomMu.Unlock()
-	transaction, err := readNonzeroUint32(a.random)
-	if err != nil {
-		return 0, fmt.Errorf("generate tracker transaction: %w", err)
-	}
-	return transaction, nil
-}
-
 func parseProvider(raw string) (provider, error) {
 	if raw == "" || raw != strings.TrimSpace(raw) || len(raw) > maxProviderURLLength {
 		return provider{}, errors.New("tracker URL is invalid")
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Opaque != "" || parsed.Host == "" {
-		return provider{}, errors.New("tracker URL must use udp://, http://, or https://")
+		return provider{}, errors.New("tracker URL must use http:// or https://")
 	}
-	if parsed.Scheme != "udp" && parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return provider{}, errors.New("tracker URL must use udp://, http://, or https://")
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return provider{}, errors.New("tracker URL must use http:// or https://")
 	}
 	if parsed.User != nil || parsed.Fragment != "" || strings.Contains(raw, "#") {
 		return provider{}, errors.New("tracker URL contains unsupported credentials or fragment")
 	}
-	host := parsed.Hostname()
-	if host == "" {
+	if parsed.Hostname() == "" {
 		return provider{}, errors.New("tracker URL requires a host")
 	}
 	portText := parsed.Port()
-	if parsed.Scheme == "udp" {
-		if parsed.RawQuery != "" {
-			return provider{}, errors.New("UDP tracker URL query is unsupported")
-		}
-		if portText == "" {
-			return provider{}, errors.New("UDP tracker URL requires a port")
-		}
-		port, err := strconv.ParseUint(portText, 10, 16)
-		if err != nil || port == 0 {
-			return provider{}, errors.New("UDP tracker URL port is invalid")
-		}
-		scopeURL := *parsed
-		return provider{display: raw, scope: scopeURL.String(), scheme: parsed.Scheme, host: host, port: uint16(port)}, nil
-	}
 	if portText != "" {
 		port, err := strconv.ParseUint(portText, 10, 16)
 		if err != nil || port == 0 {
@@ -623,20 +318,7 @@ func parseProvider(raw string) (provider, error) {
 	if query, err := url.ParseQuery(scopeURL.RawQuery); err == nil {
 		scopeURL.RawQuery = query.Encode()
 	}
-	return provider{display: displayURL.String(), scope: scopeURL.String(), scheme: parsed.Scheme, host: host, announceURL: *parsed}, nil
-}
-
-func readNonzeroUint32(source io.Reader) (uint32, error) {
-	var bytes [4]byte
-	for range 32 {
-		if _, err := io.ReadFull(source, bytes[:]); err != nil {
-			return 0, err
-		}
-		if value := binary.BigEndian.Uint32(bytes[:]); value != 0 {
-			return value, nil
-		}
-	}
-	return 0, errors.New("random source produced only zero values")
+	return provider{display: displayURL.String(), scope: scopeURL.String(), announceURL: *parsed}, nil
 }
 
 func (a *Announcer) recordSuccess(configured provider, candidate AnnounceCandidate, response announceResponse, interval time.Duration) {
@@ -722,22 +404,6 @@ func (a *Announcer) recordStatus(configured provider, status ProviderStatus) {
 
 func normalizeTiming(timing announcerTiming) announcerTiming {
 	defaults := defaultAnnouncerTiming
-	if timing.requestTimeout <= 0 {
-		timing.requestTimeout = defaults.requestTimeout
-	}
-	if timing.requestAttempts < 1 {
-		timing.requestAttempts = defaults.requestAttempts
-	} else if timing.requestAttempts > 8 {
-		timing.requestAttempts = 8
-	}
-	if timing.connectionLifetime <= 0 {
-		timing.connectionLifetime = defaults.connectionLifetime
-	} else if timing.connectionLifetime > maximumConnectionLifetime {
-		timing.connectionLifetime = maximumConnectionLifetime
-	}
-	if timing.resolveTimeout <= 0 {
-		timing.resolveTimeout = defaults.resolveTimeout
-	}
 	if timing.httpRequestTimeout <= 0 {
 		timing.httpRequestTimeout = defaults.httpRequestTimeout
 	}
@@ -757,18 +423,4 @@ func waitForProviderRetry(ctx context.Context, delay time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
-}
-
-func exponentialTimeout(base time.Duration, attempt int) time.Duration {
-	for range attempt {
-		if base > time.Duration(1<<63-1)/2 {
-			return time.Duration(1<<63 - 1)
-		}
-		base *= 2
-	}
-	return base
-}
-
-func usableTrackerAddress(address netip.Addr) bool {
-	return address.IsValid() && !address.IsUnspecified() && !address.IsMulticast()
 }

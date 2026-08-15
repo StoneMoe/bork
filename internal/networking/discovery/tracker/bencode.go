@@ -96,7 +96,7 @@ func parseHTTPAnnounceResponse(packet []byte) (announceResponse, error) {
 		return announceResponse{}, errors.New("HTTP tracker response has a malformed compact peer list")
 	}
 	if failureSet {
-		return announceResponse{}, &TrackerError{Message: string(failure)}
+		return announceResponse{}, errors.New("tracker returned an error: " + string(failure))
 	}
 	if !intervalSet || interval <= 0 || interval > math.MaxUint32 {
 		return announceResponse{}, errors.New("HTTP tracker interval is missing or invalid")

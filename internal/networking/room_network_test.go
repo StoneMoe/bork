@@ -43,33 +43,29 @@ func TestTrackerAnnounceCandidatesPrefersIPv6STUNAndKeepsIPv4(t *testing.T) {
 	}
 }
 
-func TestTrackerAnnounceCandidatesKeepsObservedFallbackWithPublicIPv6NIC(t *testing.T) {
-	snapshot := endpoint.Snapshot{
+func TestTrackerAnnounceCandidatesUsesObservedFallbackOnlyWithoutExplicitCandidate(t *testing.T) {
+	withPublicIPv6 := endpoint.Snapshot{
 		ListenAddress: "[::]:4000",
 		Candidates: []endpoint.Candidate{
 			{Type: endpoint.CandidateNIC, Address: "[fd00::1]:4000", Family: "ipv6"},
 			{Type: endpoint.CandidateNIC, Address: "[2001:4860:4860::8888]:4000", Family: "ipv6"},
 		},
 	}
-
-	candidates := trackerAnnounceCandidates(snapshot)
-	want := []tracker.AnnounceCandidate{
+	wantPublic := []tracker.AnnounceCandidate{
 		{Address: netip.MustParseAddr("2001:4860:4860::8888"), Port: 4000},
-		{Address: netip.IPv4Unspecified(), Port: 4000},
 	}
-	if !slices.Equal(candidates, want) {
-		t.Fatalf("candidates = %v, want IPv6 and observed-address fallback", candidates)
+	if candidates := trackerAnnounceCandidates(withPublicIPv6); !slices.Equal(candidates, wantPublic) {
+		t.Fatalf("candidates = %v, want only explicit public candidate %v", candidates, wantPublic)
 	}
 
-	group, err := tracker.New([]string{
-		"https://tracker.example/announce",
-		"udp://tracker.example:80/announce",
-	}, [20]byte{}, [32]byte{1}, &endpoint.Endpoint{}, nil)
-	if err != nil {
-		t.Fatal(err)
+	withoutPublicCandidate := endpoint.Snapshot{
+		ListenAddress: "[::]:4000",
+		Candidates: []endpoint.Candidate{
+			{Type: endpoint.CandidateNIC, Address: "[fd00::1]:4000", Family: "ipv6"},
+		},
 	}
-	group.UpdateCandidates(candidates)
-	if statuses := group.Snapshot(); len(statuses) != 3 || statuses[2].Candidate != "0.0.0.0:4000" {
-		t.Fatalf("provider candidates = %v, want fallback only on UDP", statuses)
+	wantFallback := []tracker.AnnounceCandidate{{Port: 4000}}
+	if candidates := trackerAnnounceCandidates(withoutPublicCandidate); !slices.Equal(candidates, wantFallback) {
+		t.Fatalf("candidates = %v, want observed-source fallback %v", candidates, wantFallback)
 	}
 }

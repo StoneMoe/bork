@@ -1,40 +1,15 @@
 package tracker
 
 import (
-	"encoding/binary"
 	"net/netip"
 	"net/url"
 	"strconv"
 	"testing"
 )
 
-func TestUDPIPv6AnnounceWireFormat(t *testing.T) {
-	request := marshalAnnounceRequest(announceRequest{
-		explicitIP: netip.MustParseAddr("2001:4860:4860::8888"),
-	})
-	if binary.BigEndian.Uint32(request[84:88]) != 0 {
-		t.Fatalf("IPv6 announce IP field = %x, want zero", request[84:88])
-	}
-
-	const transaction = uint32(0x12345678)
-	packet := make([]byte, announceResponseHead+18)
-	binary.BigEndian.PutUint32(packet[0:4], actionAnnounce)
-	binary.BigEndian.PutUint32(packet[4:8], transaction)
-	if _, err := parseAnnounceResponse(packet, transaction, true); err == nil {
-		t.Fatal("zero announce interval must be rejected")
-	}
-	binary.BigEndian.PutUint32(packet[8:12], 60)
-	address := netip.MustParseAddr("2606:4700:4700::1111").As16()
-	copy(packet[announceResponseHead:announceResponseHead+16], address[:])
-	binary.BigEndian.PutUint16(packet[announceResponseHead+16:], 6881)
-
-	response, err := parseAnnounceResponse(packet, transaction, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := netip.MustParseAddrPort("[2606:4700:4700::1111]:6881")
-	if len(response.peers) != 1 || response.peers[0] != want {
-		t.Fatalf("IPv6 peers = %v, want [%v]", response.peers, want)
+func TestValidateProviderURLRejectsUDP(t *testing.T) {
+	if err := ValidateProviderURL("udp://tracker.example:6969/announce"); err == nil {
+		t.Fatal("UDP tracker URL must be rejected")
 	}
 }
 
