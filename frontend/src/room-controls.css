@@ -308,7 +308,6 @@
 .audio-control:hover .gain-slider,
 .audio-control:focus-within .gain-slider { visibility: visible; opacity: 1; pointer-events: auto; transform: translateY(0); }
 .gain-slider output { color: #aeb6ca; font: 10px/1 var(--font-mono); text-align: right; }
-.capture-clipping-label { grid-column: 1 / -1; min-height: 10px; color: var(--danger); font: 10px/1 var(--font-mono); text-align: right; }
 
 @keyframes attention-pulse {
   60% { box-shadow: 0 0 0 6px rgba(225, 184, 103, 0); }

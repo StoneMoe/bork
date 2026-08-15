@@ -664,11 +664,6 @@ function AudioControl(props: AudioControlProps) {
           onChange={() => void commitGain()}
         />
         <output>{draftGain()}%</output>
-        <Show when={props.kind === "capture"}>
-          <span class="capture-clipping-label" aria-hidden="true">
-            {props.clipped ? "削波" : ""}
-          </span>
-        </Show>
       </div>
     </div>
   );
