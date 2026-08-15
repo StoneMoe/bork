@@ -222,7 +222,7 @@ export default function Settings(props: SettingsProps) {
           hidden={activeTab() !== "device"}
         >
           <div class="nickname-form">
-            <label for="nickname">房间昵称</label>
+            <label for="nickname">昵称</label>
             <input
               id="nickname"
               autocomplete="off"
