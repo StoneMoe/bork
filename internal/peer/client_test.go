@@ -2,11 +2,13 @@ package peer
 
 import (
 	"bytes"
+	"net/netip"
 	"testing"
 	"time"
 
 	"bork/internal/invite"
 	"bork/internal/networking"
+	"bork/internal/networking/discovery"
 )
 
 func TestNewClientUsesEphemeralRoomIdentity(t *testing.T) {
@@ -60,5 +62,44 @@ func TestExpireRemotePeersDropsStaleSessionRecord(t *testing.T) {
 	peer := client.remotePeers["pending"]
 	if peer == nil || peer.activeSession != nil || peer.pendingSession != freshPending {
 		t.Fatal("fresh pending session was not preserved")
+	}
+}
+
+func TestHistoricalRemoteHintRefreshesExpiry(t *testing.T) {
+	now := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	address := netip.MustParseAddrPort("203.0.113.10:4000")
+	path := Path{address: address}
+	client := &Client{}
+	client.rememberAuthenticatedPath(path, now)
+	first := client.discoveredAddresses[address]
+	if first.source != discovery.SourceHistoricalRemote || first.expiresAt != now.Add(knownPeerTTL) {
+		t.Fatalf("historical remote hint = %+v", first)
+	}
+
+	renewedAt := now.Add(knownPeerTTL / 2)
+	client.rememberAuthenticatedPath(path, renewedAt)
+	if client.expireDiscoveryHints(first.expiresAt) {
+		t.Fatal("renewed historical remote hint expired at its old deadline")
+	}
+	renewed := client.discoveredAddresses[address]
+	if renewed.expiresAt != renewedAt.Add(knownPeerTTL) {
+		t.Fatalf("renewed expiry = %v", renewed.expiresAt)
+	}
+	if !client.expireDiscoveryHints(renewed.expiresAt) {
+		t.Fatal("historical remote hint did not expire")
+	}
+}
+
+func TestHistoricalRemoteHintKeepsRoomLifetimeSource(t *testing.T) {
+	now := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	address := netip.MustParseAddrPort("192.0.2.10:4000")
+	path := Path{address: address}
+	client := &Client{discoveredAddresses: map[netip.AddrPort]discoveredAddress{
+		address: {source: discovery.SourceMDNS},
+	}}
+	client.rememberAuthenticatedPath(path, now)
+	remembered := client.discoveredAddresses[address]
+	if remembered.source != discovery.SourceMDNS || !remembered.expiresAt.IsZero() {
+		t.Fatalf("room-lifetime source was replaced: %+v", remembered)
 	}
 }

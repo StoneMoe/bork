@@ -400,7 +400,7 @@ function CandidateRow(props: { candidate: Candidate }) {
 }
 
 function discoveryHintSourceLabel(source: string): string {
-  return ({ authenticated: "已认证", local: "本机", mdns: "mDNS", tracker: "Tracker", topology: "拓扑" } as Record<string, string>)[source] || "发现";
+  return ({ "historical-remote": "历史远端", local: "本机", mdns: "mDNS", tracker: "Tracker", topology: "拓扑" } as Record<string, string>)[source] || "发现";
 }
 
 function formatDiscoveryHintExpiry(value: string | undefined, now: number): string {

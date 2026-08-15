@@ -57,7 +57,7 @@ func (c *Client) addDiscoveryHintAt(hint discovery.Hint, now time.Time) {
 func (c *Client) rememberDiscoveryHint(hint discovery.Hint, now time.Time) (netip.AddrPort, bool, bool) {
 	address, valid := normalizeDiscoveryAddress(hint.Address)
 	if !valid || !validDiscoverySource(hint.Source) || discoveryExpired(hint.ExpiresAt, now) ||
-		((hint.Source == discovery.SourceTracker || hint.Source == discovery.SourceTopology) && hint.ExpiresAt.IsZero()) || c.isSelfAddress(address) {
+		((hint.Source == discovery.SourceTracker || hint.Source == discovery.SourceTopology || hint.Source == discovery.SourceHistoricalRemote) && hint.ExpiresAt.IsZero()) || c.isSelfAddress(address) {
 		return netip.AddrPort{}, false, false
 	}
 	if c.discoveredAddresses == nil {
@@ -68,8 +68,9 @@ func (c *Client) rememberDiscoveryHint(hint discovery.Hint, now time.Time) (neti
 	} else if exists {
 		previous := remembered
 		remembered.lastSeen = now
-		// Never downgrade an authenticated or room-lifetime record to an expiring hint.
-		if hint.Source == discovery.SourceAuthenticated || (remembered.source != discovery.SourceAuthenticated && (!remembered.expiresAt.IsZero() || hint.ExpiresAt.IsZero())) {
+		// Room-lifetime local discovery outranks expiring sources. Historical
+		// remote addresses in turn outrank unverified tracker and topology hints.
+		if hint.ExpiresAt.IsZero() || (!remembered.expiresAt.IsZero() && (hint.Source == discovery.SourceHistoricalRemote || remembered.source != discovery.SourceHistoricalRemote)) {
 			remembered.source = hint.Source
 			remembered.expiresAt = hint.ExpiresAt
 		}
@@ -106,7 +107,7 @@ func normalizeDiscoveryAddress(address netip.AddrPort) (netip.AddrPort, bool) {
 
 func validDiscoverySource(source discovery.Source) bool {
 	switch source {
-	case discovery.SourceLocal, discovery.SourceMDNS, discovery.SourceTracker, discovery.SourceTopology, discovery.SourceAuthenticated:
+	case discovery.SourceLocal, discovery.SourceMDNS, discovery.SourceTracker, discovery.SourceTopology, discovery.SourceHistoricalRemote:
 		return true
 	default:
 		return false
@@ -155,7 +156,7 @@ func (c *Client) discoveryEvictionCandidate(now time.Time, incoming discovery.So
 	maximumRank := 1
 	if incoming == discovery.SourceLocal || incoming == discovery.SourceMDNS {
 		maximumRank = 2
-	} else if incoming == discovery.SourceAuthenticated {
+	} else if incoming == discovery.SourceHistoricalRemote {
 		maximumRank = 5
 	}
 	for address, remembered := range c.discoveredAddresses {
@@ -166,11 +167,11 @@ func (c *Client) discoveryEvictionCandidate(now time.Time, incoming discovery.So
 			rank = 0
 		case !active && (remembered.source == discovery.SourceTracker || remembered.source == discovery.SourceTopology):
 			rank = 1
-		case !active && remembered.source != discovery.SourceAuthenticated:
+		case !active && remembered.source != discovery.SourceHistoricalRemote:
 			rank = 2
 		case !active:
 			rank = 3
-		case remembered.source != discovery.SourceAuthenticated:
+		case remembered.source != discovery.SourceHistoricalRemote:
 			rank = 4
 		}
 		if rank > maximumRank {
@@ -198,7 +199,9 @@ func (c *Client) expireDiscoveryHints(now time.Time) bool {
 
 func (c *Client) rememberAuthenticatedPath(path Path, now time.Time) {
 	if path.IsDirect() {
-		_, _, _ = c.rememberDiscoveryHint(discovery.Hint{Address: path.Address(), Source: discovery.SourceAuthenticated}, now)
+		_, _, _ = c.rememberDiscoveryHint(discovery.Hint{
+			Address: path.Address(), Source: discovery.SourceHistoricalRemote, ExpiresAt: now.Add(knownPeerTTL),
+		}, now)
 	}
 }
 

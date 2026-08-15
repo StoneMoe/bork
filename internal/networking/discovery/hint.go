@@ -11,11 +11,11 @@ import (
 type Source string
 
 const (
-	SourceLocal         Source = "local"
-	SourceMDNS          Source = "mdns"
-	SourceTracker       Source = "tracker"
-	SourceTopology      Source = "topology"
-	SourceAuthenticated Source = "authenticated"
+	SourceLocal            Source = "local"
+	SourceMDNS             Source = "mdns"
+	SourceTracker          Source = "tracker"
+	SourceTopology         Source = "topology"
+	SourceHistoricalRemote Source = "historical-remote"
 )
 
 type Hint struct {
