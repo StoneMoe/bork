@@ -10,10 +10,9 @@ import (
 const maxAnnouncePeers = 50
 
 type announceResponse struct {
-	interval        time.Duration
-	peers           []netip.AddrPort
-	peerNames       []httpPeer
-	externalAddress netip.Addr
+	interval  time.Duration
+	peers     []netip.AddrPort
+	peerNames []httpPeer
 }
 
 type httpPeer struct {

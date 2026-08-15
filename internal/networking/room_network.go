@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/netip"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -145,28 +144,12 @@ func (n *RoomNetwork) Run(parent context.Context) error {
 	var portMapCancel context.CancelFunc
 	portMapperFinished := false
 	var currentMapping *portmap.Mapping
-	var mappingExpiryTimer *time.Timer
-	var mappingExpiry <-chan time.Time
-	stopMappingExpiry := func() {
-		mappingExpiry = nil
-	}
-	resetMappingExpiry := func(expiresAt time.Time) {
-		delay := time.Until(expiresAt)
-		if mappingExpiryTimer == nil {
-			mappingExpiryTimer = time.NewTimer(delay)
-		} else {
-			mappingExpiryTimer.Reset(delay)
-		}
-		mappingExpiry = mappingExpiryTimer.C
-	}
 	applyMapping := func(mapping *portmap.Mapping, mappingError string) {
 		if mapping == nil {
 			currentMapping = nil
-			stopMappingExpiry()
 		} else {
 			copy := *mapping
 			currentMapping = &copy
-			resetMappingExpiry(copy.ExpiresAt)
 		}
 		projectedEndpoint := withPortMapping(n.endpoint.Snapshot(), currentMapping)
 		n.updateSnapshot(func(snapshot *RoomSnapshot) {
@@ -178,7 +161,6 @@ func (n *RoomNetwork) Run(parent context.Context) error {
 		}
 	}
 	finish := func(runErr error) error {
-		stopMappingExpiry()
 		if portMapCancel != nil && !portMapperFinished {
 			portMapCancel()
 			cleanupDeadline := time.After(5 * time.Second)
@@ -306,23 +288,7 @@ func (n *RoomNetwork) Run(parent context.Context) error {
 			}
 			n.updateSnapshot(func(snapshot *RoomSnapshot) { snapshot.Tracker = n.tracker.Snapshot() })
 		case state := <-portMapStates:
-			if state.Mapping != nil && !time.Now().Before(state.Mapping.ExpiresAt) {
-				if state.Error == "" {
-					state.Error = "port mapping expired"
-				}
-				state.Mapping = nil
-			}
 			applyMapping(state.Mapping, state.Error)
-		case <-mappingExpiry:
-			mappingExpiry = nil
-			if currentMapping == nil {
-				continue
-			}
-			if time.Now().Before(currentMapping.ExpiresAt) {
-				resetMappingExpiry(currentMapping.ExpiresAt)
-				continue
-			}
-			applyMapping(nil, "port mapping expired")
 		case err := <-portMapResult:
 			portMapperFinished = true
 			portMapResult = nil
@@ -373,7 +339,7 @@ func trackerAnnounceCandidates(snapshot endpoint.Snapshot) []tracker.AnnounceCan
 		if len(candidates) == tracker.MaxAnnounceCandidates {
 			return false
 		}
-		address, valid := trackerCandidateAddress(snapshot, candidate)
+		address, valid := trackerCandidateAddress(candidate)
 		if !valid {
 			return false
 		}
@@ -391,28 +357,32 @@ func trackerAnnounceCandidates(snapshot endpoint.Snapshot) []tracker.AnnounceCan
 		candidates = append(candidates, announceCandidate)
 		return true
 	}
-	for _, candidate := range snapshot.Candidates {
-		if candidate.Type == endpoint.CandidatePortMapped {
-			appendCandidate(candidate)
+	appendCandidates := func(candidateType endpoint.CandidateType) {
+		for _, candidate := range snapshot.Candidates {
+			if candidate.Type == candidateType {
+				appendCandidate(candidate)
+			}
 		}
 	}
-	stunCandidates := sortedSTUNCandidates(snapshot)
-	appendIPv6 := func(source []endpoint.Candidate, candidateType endpoint.CandidateType) {
-		for _, candidate := range source {
+	appendCandidates(endpoint.CandidatePortMapped)
+	appendIPv6 := func(candidateType endpoint.CandidateType) {
+		for _, candidate := range snapshot.Candidates {
 			if candidate.Type == candidateType && candidate.Family == "ipv6" && appendCandidate(candidate) {
 				return
 			}
 		}
 	}
-	appendIPv6(stunCandidates, endpoint.CandidateSTUN)
-	// STUN can miss IPv6 when its IPv4 probe wins, so fall back to a public NIC.
-	appendIPv6(snapshot.Candidates, endpoint.CandidateNIC)
-	for _, candidate := range stunCandidates {
-		appendCandidate(candidate)
-	}
+	appendIPv6(endpoint.CandidateSTUN)
+	// If STUN found no IPv6 mapping, fall back to a public NIC address.
+	appendIPv6(endpoint.CandidateNIC)
+	// Endpoint keeps STUN candidates in stable server/family order. Reuse that
+	// order so changing probe RTT does not restart tracker registrations.
+	appendCandidates(endpoint.CandidateSTUN)
+	// Public NICs fill only the slots left after port mapping and STUN.
+	appendCandidates(endpoint.CandidateNIC)
 	if len(candidates) == 0 {
-		// Without a public candidate, let the HTTP tracker use the request's
-		// observed source address with the room endpoint's listening port.
+		// Without a public candidate, let the HTTP tracker use the request source
+		// address with the room endpoint's listening port.
 		listenAddress, err := netip.ParseAddrPort(snapshot.ListenAddress)
 		if err == nil && listenAddress.Port() != 0 {
 			candidates = append(candidates, tracker.AnnounceCandidate{Port: listenAddress.Port()})
@@ -421,43 +391,13 @@ func trackerAnnounceCandidates(snapshot endpoint.Snapshot) []tracker.AnnounceCan
 	return candidates
 }
 
-func sortedSTUNCandidates(snapshot endpoint.Snapshot) []endpoint.Candidate {
-	candidates := make([]endpoint.Candidate, 0, len(snapshot.Candidates))
-	for _, candidate := range snapshot.Candidates {
-		if candidate.Type == endpoint.CandidateSTUN {
-			candidates = append(candidates, candidate)
-		}
-	}
-	rttByServer := make(map[string]int64, len(snapshot.STUN))
-	for _, result := range snapshot.STUN {
-		rttByServer[result.Server] = result.RTTMillis
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		left, right := rttByServer[candidates[i].Source], rttByServer[candidates[j].Source]
-		if left <= 0 {
-			left = 1<<63 - 1
-		}
-		if right <= 0 {
-			right = 1<<63 - 1
-		}
-		if left != right {
-			return left < right
-		}
-		return candidates[i].Address < candidates[j].Address
-	})
-	return candidates
-}
-
-func trackerCandidateAddress(snapshot endpoint.Snapshot, candidate endpoint.Candidate) (netip.AddrPort, bool) {
+func trackerCandidateAddress(candidate endpoint.Candidate) (netip.AddrPort, bool) {
 	address, err := netip.ParseAddrPort(candidate.Address)
 	if err != nil || address.Port() == 0 {
 		return netip.AddrPort{}, false
 	}
 	ip := address.Addr().Unmap()
 	if !usablePublicTrackerAddress(ip) {
-		return netip.AddrPort{}, false
-	}
-	if candidate.Type == endpoint.CandidatePortMapped && !hasSTUNAddress(snapshot, ip) {
 		return netip.AddrPort{}, false
 	}
 	return netip.AddrPortFrom(ip, address.Port()), true
@@ -469,31 +409,14 @@ func usablePublicTrackerAddress(address netip.Addr) bool {
 		!carrierGradeNATPrefix.Contains(address)
 }
 
-func hasSTUNAddress(snapshot endpoint.Snapshot, address netip.Addr) bool {
-	for _, candidate := range snapshot.Candidates {
-		if candidate.Type != endpoint.CandidateSTUN {
-			continue
-		}
-		stunAddress, err := netip.ParseAddrPort(candidate.Address)
-		if err == nil && stunAddress.Addr().Unmap() == address {
-			return true
-		}
-	}
-	return false
-}
-
 func withPortMapping(snapshot endpoint.Snapshot, mapping *portmap.Mapping) endpoint.Snapshot {
 	if mapping == nil || !mapping.ExternalAddress.IsValid() || mapping.ExternalAddress.Port() == 0 {
 		return snapshot
 	}
-	family := "ipv6"
-	if mapping.ExternalAddress.Addr().Unmap().Is4() {
-		family = "ipv4"
-	}
 	snapshot.Candidates = append(snapshot.Candidates[:len(snapshot.Candidates):len(snapshot.Candidates)], endpoint.Candidate{
 		Type:    endpoint.CandidatePortMapped,
 		Address: mapping.ExternalAddress.String(),
-		Family:  family,
+		Family:  "ipv4",
 		Source:  mapping.Provider,
 	})
 	return snapshot

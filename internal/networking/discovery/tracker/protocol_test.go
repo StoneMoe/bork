@@ -28,7 +28,7 @@ func TestTrackerRegistrationIdentityIsSharedAcrossAddresses(t *testing.T) {
 	if ipv4.peerID != ipv6.peerID || ipv4.key != ipv6.key {
 		t.Fatal("dual-stack registrations must share peer ID and key")
 	}
-	request, err := announcer.buildHTTPAnnounceURL(configured, ipv4, eventNone)
+	request, err := announcer.buildHTTPAnnounceURL(configured, ipv4, "")
 	if err != nil {
 		t.Fatal(err)
 	}

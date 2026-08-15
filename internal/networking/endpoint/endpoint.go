@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"slices"
 	"sort"
 	"sync"
 	"syscall"
@@ -24,8 +23,7 @@ const (
 	maxRealtimeBatchBytes     = MaxRealtimeBatchDatagrams * protocol.MaxDatagramSize
 	udpReceiveBufferSize      = 64 * 1024
 	maxSTUNServerResults      = 8
-	maxSTUNAddresses          = 4
-	maxPendingSTUN            = maxSTUNServerResults * maxSTUNAddresses
+	maxPendingSTUN            = maxSTUNServerResults * 2
 	maxPeerDatagrams          = 256
 	maxAudioBatches           = 64
 	maxInteractiveBatches     = 32
@@ -82,6 +80,8 @@ type stunProbeResult struct {
 	rttMillis int64
 	err       error
 }
+
+type stunProbeFunc func(context.Context, netip.AddrPort) stunProbeResult
 
 type Endpoint struct {
 	options Options
@@ -714,100 +714,119 @@ func (e *Endpoint) refreshSTUN(ctx context.Context) {
 	if len(servers) > maxSTUNServerResults {
 		servers = servers[:maxSTUNServerResults]
 	}
-	results := make(chan STUNResult, len(servers))
-	for _, server := range servers {
-		go func() { results <- e.querySTUN(ctx, server) }()
-	}
-
-	stunResults := make([]STUNResult, 0, len(servers))
-	for range servers {
-		result := <-results
-		stunResults = append(stunResults, result)
+	stunResults := e.querySTUNServers(ctx, servers)
+	for _, result := range stunResults {
 		if result.Error != "" {
-			e.logger.Debug("STUN probe failed", "server", result.Server, "error", result.Error)
+			e.logger.Debug("STUN probe failed", "server", result.Server, "family", result.Family, "error", result.Error)
 		} else {
 			e.logger.Info("STUN mapping discovered",
 				"server", result.Server,
+				"family", result.Family,
 				"mapped", result.MappedAddress,
 				"rtt_ms", result.RTTMillis,
 			)
 		}
 	}
-	sort.Slice(stunResults, func(i, j int) bool { return stunResults[i].Server < stunResults[j].Server })
 	e.updateSnapshot(func(snapshot *Snapshot) {
-		nics := snapshot.Candidates[:0]
-		for _, candidate := range snapshot.Candidates {
-			if candidate.Type == CandidateNIC {
-				nics = append(nics, candidate)
-			}
-		}
-		snapshot.Candidates = nics
-		seen := make(map[string]struct{})
-		for _, result := range stunResults {
-			if result.MappedAddress == "" {
-				continue
-			}
-			if _, exists := seen[result.MappedAddress]; exists {
-				continue
-			}
-			seen[result.MappedAddress] = struct{}{}
-			address, err := netip.ParseAddrPort(result.MappedAddress)
-			if err != nil {
-				continue
-			}
-			snapshot.Candidates = append(snapshot.Candidates, Candidate{
-				Type:    CandidateSTUN,
-				Address: result.MappedAddress,
-				Family:  addressFamily(address.Addr()),
-				Source:  result.Server,
-			})
-		}
+		snapshot.Candidates = mergeSTUNCandidates(snapshot.Candidates, stunResults)
 		snapshot.STUN = stunResults
 	})
 }
 
-func (e *Endpoint) querySTUN(ctx context.Context, server string) STUNResult {
-	result := STUNResult{Server: server}
+func (e *Endpoint) querySTUNServers(ctx context.Context, servers []string) []STUNResult {
+	batches := make(chan []STUNResult, len(servers))
+	for _, server := range servers {
+		go func() { batches <- e.querySTUN(ctx, server) }()
+	}
+	results := make([]STUNResult, 0, len(servers)*2)
+	for range servers {
+		results = append(results, (<-batches)...)
+	}
+	sortSTUNResults(results)
+	return results
+}
+
+func (e *Endpoint) querySTUN(ctx context.Context, server string) []STUNResult {
 	queryCtx, cancel := context.WithTimeout(ctx, e.options.STUNTimeout)
 	defer cancel()
 	serverAddresses, err := resolveSTUNServer(queryCtx, server)
 	if err != nil {
-		result.Error = err.Error()
-		return result
+		return []STUNResult{{Server: server, Error: err.Error()}}
 	}
-	e.mu.RLock()
-	running := e.conn != nil
-	e.mu.RUnlock()
-	if !running {
-		result.Error = "UDP endpoint is not running"
-		return result
-	}
-	probes := make(chan stunProbeResult, len(serverAddresses))
-	for _, serverAddress := range serverAddresses {
-		go func() { probes <- e.probeSTUN(queryCtx, serverAddress) }()
-	}
-	var lastErr error
-	for range serverAddresses {
-		select {
-		case probe := <-probes:
-			if probe.err == nil {
-				cancel()
-				result.MappedAddress = probe.mapped.String()
-				result.RTTMillis = probe.rttMillis
-				return result
+	return collectSTUNFamilies(queryCtx, server, serverAddresses, e.probeSTUN)
+}
+
+func collectSTUNFamilies(ctx context.Context, server string, addresses []netip.AddrPort, probe stunProbeFunc) []STUNResult {
+	completed := make(chan STUNResult, len(addresses))
+	for _, address := range addresses {
+		go func() {
+			family := "ipv6"
+			if address.Addr().Is4() {
+				family = "ipv4"
 			}
-			lastErr = probe.err
-		case <-queryCtx.Done():
-			if ctx.Err() != nil {
-				result.Error = ctx.Err().Error()
+			result := STUNResult{Server: server, Family: family}
+			received := probe(ctx, address)
+			if received.err != nil {
+				result.Error = received.err.Error()
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					result.Error = "STUN request timed out"
+				}
 			} else {
-				result.Error = "STUN request timed out"
+				result.MappedAddress = received.mapped.String()
+				result.RTTMillis = received.rttMillis
 			}
-			return result
+			completed <- result
+		}()
+	}
+	results := make([]STUNResult, 0, len(addresses))
+	for range addresses {
+		results = append(results, <-completed)
+	}
+	sortSTUNResults(results)
+	return results
+}
+
+func sortSTUNResults(results []STUNResult) {
+	sort.Slice(results, func(i, j int) bool {
+		left, right := results[i], results[j]
+		if left.Server != right.Server {
+			return left.Server < right.Server
+		}
+		return left.Family < right.Family
+	})
+}
+
+func mergeSTUNCandidates(existing []Candidate, results []STUNResult) []Candidate {
+	candidates := existing[:0]
+	for _, candidate := range existing {
+		if candidate.Type == CandidateNIC {
+			candidates = append(candidates, candidate)
 		}
 	}
-	result.Error = lastErr.Error()
-	return result
+	seen := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		candidate, valid := stunCandidate(result)
+		if !valid {
+			continue
+		}
+		if _, duplicate := seen[candidate.Address]; duplicate {
+			continue
+		}
+		seen[candidate.Address] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
+func stunCandidate(result STUNResult) (Candidate, bool) {
+	address, err := netip.ParseAddrPort(result.MappedAddress)
+	if err != nil {
+		return Candidate{}, false
+	}
+	return Candidate{
+		Type: CandidateSTUN, Address: result.MappedAddress,
+		Family: addressFamily(address.Addr()), Source: result.Server,
+	}, true
 }
 
 func (e *Endpoint) probeSTUN(ctx context.Context, server netip.AddrPort) stunProbeResult {
@@ -852,35 +871,22 @@ func resolveSTUNServer(ctx context.Context, server string) ([]netip.AddrPort, er
 	if err != nil {
 		return nil, fmt.Errorf("resolve STUN port %q: %w", port, err)
 	}
-	unique := make([]netip.Addr, 0, len(addresses))
-	seen := make(map[netip.Addr]struct{})
+	// One address per family keeps each server bounded while allowing both IP stacks.
+	var ipv4, ipv6 netip.Addr
 	for _, address := range addresses {
 		address = address.Unmap()
-		if !address.IsValid() || (!address.Is4() && !address.Is6()) {
-			continue
-		}
-		if _, exists := seen[address]; !exists {
-			seen[address] = struct{}{}
-			unique = append(unique, address)
+		if address.Is4() && !ipv4.IsValid() {
+			ipv4 = address
+		} else if address.Is6() && !ipv6.IsValid() {
+			ipv6 = address
 		}
 	}
-	resolved := make([]netip.AddrPort, 0, min(len(unique), maxSTUNAddresses))
-	for _, wantIPv4 := range []bool{true, false} {
-		for _, address := range unique {
-			if address.Is4() == wantIPv4 {
-				resolved = append(resolved, netip.AddrPortFrom(address, uint16(parsedPort)))
-				break
-			}
-		}
+	resolved := make([]netip.AddrPort, 0, 2)
+	if ipv4.IsValid() {
+		resolved = append(resolved, netip.AddrPortFrom(ipv4, uint16(parsedPort)))
 	}
-	for _, address := range unique {
-		if len(resolved) >= maxSTUNAddresses {
-			break
-		}
-		candidate := netip.AddrPortFrom(address, uint16(parsedPort))
-		if !slices.Contains(resolved, candidate) {
-			resolved = append(resolved, candidate)
-		}
+	if ipv6.IsValid() {
+		resolved = append(resolved, netip.AddrPortFrom(ipv6, uint16(parsedPort)))
 	}
 	if len(resolved) > 0 {
 		return resolved, nil

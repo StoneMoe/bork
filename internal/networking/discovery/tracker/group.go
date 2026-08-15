@@ -1,10 +1,10 @@
 package tracker
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -42,19 +42,18 @@ func New(providerURLs []string, infoHash [20]byte, identityKey [32]byte, logger 
 	}
 	return &Group{
 		providers: providers, infoHash: infoHash, identityKey: identityKey,
-		logger: logger, children: make(map[AnnounceCandidate]*Announcer),
-		updates: make(chan struct{}, 1), changes: make(chan struct{}, 1),
+		logger: logger, updates: make(chan struct{}, 1), changes: make(chan struct{}, 1),
 	}, nil
 }
 
 func (g *Group) UpdateCandidates(candidates []AnnounceCandidate) {
-	normalized := normalizeAnnounceCandidates(candidates)
+	candidates = slices.Clone(candidates)
 	g.mu.Lock()
-	if slices.Equal(g.candidates, normalized) {
+	if slices.Equal(g.candidates, candidates) {
 		g.mu.Unlock()
 		return
 	}
-	g.candidates = normalized
+	g.candidates = candidates
 	g.revision++
 	g.mu.Unlock()
 	select {
@@ -66,10 +65,7 @@ func (g *Group) UpdateCandidates(candidates []AnnounceCandidate) {
 func (g *Group) Snapshot() []ProviderStatus {
 	g.mu.RLock()
 	candidates := append([]AnnounceCandidate{}, g.candidates...)
-	children := make(map[AnnounceCandidate]*Announcer, len(g.children))
-	for candidate, child := range g.children {
-		children[candidate] = child
-	}
+	children := maps.Clone(g.children)
 	g.mu.RUnlock()
 	statuses := make([]ProviderStatus, 0, len(candidates)*len(g.providers))
 	for _, candidate := range candidates {
@@ -129,12 +125,7 @@ func (g *Group) runCandidates(ctx context.Context, candidates []AnnounceCandidat
 	results := make(chan error, len(candidates))
 	var workers sync.WaitGroup
 	for _, candidate := range candidates {
-		child, err := newAnnouncerFromProviders(g.providers, g.infoHash, g.identityKey, candidate, g.logger)
-		if err != nil {
-			cancel()
-			workers.Wait()
-			return false, err
-		}
+		child := newAnnouncerFromProviders(g.providers, g.infoHash, g.identityKey, candidate, g.logger)
 		children[candidate] = child
 		workers.Add(2)
 		go func() {
@@ -188,9 +179,6 @@ func (g *Group) currentRevision() uint64 {
 
 func (g *Group) setChildren(children map[AnnounceCandidate]*Announcer) {
 	g.mu.Lock()
-	if children == nil {
-		children = make(map[AnnounceCandidate]*Announcer)
-	}
 	g.children = children
 	g.mu.Unlock()
 	g.signalChange()
@@ -201,34 +189,4 @@ func (g *Group) signalChange() {
 	case g.changes <- struct{}{}:
 	default:
 	}
-}
-
-func normalizeAnnounceCandidates(candidates []AnnounceCandidate) []AnnounceCandidate {
-	normalized := make([]AnnounceCandidate, 0, min(len(candidates), MaxAnnounceCandidates))
-	var fallback AnnounceCandidate
-	for _, candidate := range candidates {
-		candidate, valid := normalizeAnnounceCandidate(candidate)
-		if !valid {
-			continue
-		}
-		if !candidate.Address.IsValid() {
-			fallback = cmp.Or(fallback, candidate)
-			continue
-		}
-		if slices.Contains(normalized, candidate) {
-			continue
-		}
-		normalized = append(normalized, candidate)
-		if len(normalized) == MaxAnnounceCandidates {
-			break
-		}
-	}
-	return withAnnounceFallback(normalized, fallback)
-}
-
-func withAnnounceFallback(candidates []AnnounceCandidate, fallback AnnounceCandidate) []AnnounceCandidate {
-	if len(candidates) == 0 && fallback.Port != 0 {
-		return append(candidates, fallback)
-	}
-	return candidates
 }

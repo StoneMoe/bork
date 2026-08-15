@@ -25,6 +25,9 @@ import (
 const (
 	maxProviderURLLength    = 2048
 	maxResolvedAddresses    = 8
+	httpRequestTimeout      = 20 * time.Second
+	providerRetryInitial    = 5 * time.Second
+	providerRetryMaximum    = 5 * time.Minute
 	trackerStopTimeout      = 3 * time.Second
 	maxTrackerErrorLength   = 512
 	initialAnnounceCount    = 3
@@ -38,18 +41,6 @@ type provider struct {
 	announceURL url.URL
 }
 
-type announcerTiming struct {
-	httpRequestTimeout time.Duration
-	providerRetry      time.Duration
-	providerRetryMax   time.Duration
-}
-
-var defaultAnnouncerTiming = announcerTiming{
-	httpRequestTimeout: 20 * time.Second,
-	providerRetry:      5 * time.Second,
-	providerRetryMax:   5 * time.Minute,
-}
-
 // Announcer discovers peers from independently supervised HTTP(S) trackers.
 // Registration identities are shared by every address announced to the same
 // provider during a room session.
@@ -61,8 +52,6 @@ type Announcer struct {
 	logger      *slog.Logger
 
 	lookupNetIP func(context.Context, string, string) ([]netip.Addr, error)
-	timing      announcerTiming
-	waitRetry   func(context.Context, time.Duration) bool
 
 	candidate AnnounceCandidate
 	running   atomic.Bool
@@ -73,13 +62,11 @@ type Announcer struct {
 }
 
 type ProviderStatus struct {
-	Provider        string   `json:"provider"`
-	Candidate       string   `json:"candidate"`
-	ObservedAddress string   `json:"observedAddress,omitempty"`
-	NextAnnounce    string   `json:"nextAnnounce,omitempty"`
-	PeerCount       int      `json:"peerCount"`
-	PeerAddresses   []string `json:"peerAddresses"`
-	Error           string   `json:"error,omitempty"`
+	Provider      string   `json:"provider"`
+	Candidate     string   `json:"candidate"`
+	NextAnnounce  string   `json:"nextAnnounce,omitempty"`
+	PeerAddresses []string `json:"peerAddresses"`
+	Error         string   `json:"error,omitempty"`
 }
 
 func (s ProviderStatus) Clone() ProviderStatus {
@@ -103,13 +90,7 @@ func ValidateProviderURL(raw string) error {
 	return err
 }
 
-func newAnnouncerFromProviders(providers []provider, infoHash [20]byte, identityKey [32]byte, candidate AnnounceCandidate, logger *slog.Logger) (*Announcer, error) {
-	if normalized, valid := normalizeAnnounceCandidate(candidate); valid {
-		candidate = normalized
-	} else if candidate != (AnnounceCandidate{}) {
-		return nil, errors.New("tracker announce candidate is invalid")
-	}
-
+func newAnnouncerFromProviders(providers []provider, infoHash [20]byte, identityKey [32]byte, candidate AnnounceCandidate, logger *slog.Logger) *Announcer {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -122,12 +103,10 @@ func newAnnouncerFromProviders(providers []provider, infoHash [20]byte, identity
 		lookupNetIP: func(ctx context.Context, network, host string) ([]netip.Addr, error) {
 			return net.DefaultResolver.LookupNetIP(ctx, network, host)
 		},
-		timing:        defaultAnnouncerTiming,
-		waitRetry:     waitForProviderRetry,
 		candidate:     candidate,
 		statuses:      make(map[string]ProviderStatus, len(providers)),
 		statusChanges: make(chan struct{}, 1),
-	}, nil
+	}
 }
 
 func parseProviders(providerURLs []string) ([]provider, error) {
@@ -167,21 +146,6 @@ func (candidate AnnounceCandidate) String() string {
 	return netip.AddrPortFrom(netip.IPv4Unspecified(), candidate.Port).String()
 }
 
-func normalizeAnnounceCandidate(candidate AnnounceCandidate) (AnnounceCandidate, bool) {
-	if candidate.Port == 0 {
-		return AnnounceCandidate{}, false
-	}
-	if !candidate.Address.IsValid() {
-		candidate.Address = netip.Addr{}
-		return candidate, true
-	}
-	candidate.Address = candidate.Address.Unmap()
-	if !usablePeer(netip.AddrPortFrom(candidate.Address, candidate.Port)) {
-		return AnnounceCandidate{}, false
-	}
-	return candidate, true
-}
-
 func (a *Announcer) registration(configured provider, candidate AnnounceCandidate) trackerRegistration {
 	info := "bork/tracker-registration/v2\x00" + configured.scope
 	material, err := hkdf.Key(sha256.New, a.identityKey[:], a.infoHash[:], info, 24)
@@ -217,14 +181,13 @@ func (a *Announcer) Run(ctx context.Context, hints chan<- discovery.Hint) error 
 		return errors.New("tracker announce candidate is required")
 	}
 
-	timing := normalizeTiming(a.timing)
 	var workers sync.WaitGroup
 	workers.Add(len(a.providers))
 	for _, configured := range a.providers {
 		configured := configured
 		go func() {
 			defer workers.Done()
-			a.runProvider(ctx, configured, hints, timing)
+			a.runProvider(ctx, configured, hints)
 		}()
 	}
 	<-ctx.Done()
@@ -232,27 +195,25 @@ func (a *Announcer) Run(ctx context.Context, hints chan<- discovery.Hint) error 
 	return nil
 }
 
-func (a *Announcer) runProvider(ctx context.Context, configured provider, hints chan<- discovery.Hint, timing announcerTiming) {
-	retry := timing.providerRetry
+func (a *Announcer) runProvider(ctx context.Context, configured provider, hints chan<- discovery.Hint) {
+	retry := providerRetryInitial
 	for {
-		announced, err := a.runHTTPTracker(ctx, configured, hints, timing)
+		announced, err := a.runHTTPTracker(ctx, configured, hints)
 		if ctx.Err() != nil {
 			return
 		}
 		if announced {
-			retry = timing.providerRetry
+			retry = providerRetryInitial
 		}
 		a.logger.Warn("tracker provider unavailable", "provider", configured.display, "error", err)
-		a.recordFailure(configured, a.candidate, err, time.Now().Add(retry))
+		a.recordFailure(configured, err, time.Now().Add(retry))
 
-		if !a.waitRetry(ctx, retry) {
+		select {
+		case <-time.After(retry):
+		case <-ctx.Done():
 			return
 		}
-		if retry >= timing.providerRetryMax/2 {
-			retry = timing.providerRetryMax
-		} else {
-			retry *= 2
-		}
+		retry = min(retry*2, providerRetryMaximum)
 	}
 }
 
@@ -321,55 +282,24 @@ func parseProvider(raw string) (provider, error) {
 	return provider{display: displayURL.String(), scope: scopeURL.String(), announceURL: *parsed}, nil
 }
 
-func (a *Announcer) recordSuccess(configured provider, candidate AnnounceCandidate, response announceResponse, interval time.Duration) {
+func (a *Announcer) recordSuccess(configured provider, response announceResponse, interval time.Duration) {
 	now := time.Now().UTC()
-	observed := observedRegistrationAddress(response, candidate)
 	addresses := make([]string, len(response.peers))
 	for index, peer := range response.peers {
 		addresses[index] = peer.String()
 	}
 	a.recordStatus(configured, ProviderStatus{
-		Provider: configured.display, Candidate: candidate.String(),
-		NextAnnounce: now.Add(interval).Format(time.RFC3339), PeerCount: len(response.peers), PeerAddresses: addresses, ObservedAddress: observed,
+		NextAnnounce: now.Add(interval).Format(time.RFC3339), PeerAddresses: addresses,
 	})
 }
 
-func observedRegistrationAddress(response announceResponse, candidate AnnounceCandidate) string {
-	if response.externalAddress.IsValid() && candidate.Port != 0 {
-		return netip.AddrPortFrom(response.externalAddress.Unmap(), candidate.Port).String()
-	}
-	if candidate.Address.IsValid() {
-		expected := netip.AddrPortFrom(candidate.Address.Unmap(), candidate.Port)
-		for _, peer := range response.peers {
-			if peer == expected {
-				return peer.String()
-			}
-		}
-	}
-	var matched netip.AddrPort
-	for _, peer := range response.peers {
-		if peer.Port() != candidate.Port {
-			continue
-		}
-		if matched.IsValid() && matched != peer {
-			return ""
-		}
-		matched = peer
-	}
-	if matched.IsValid() {
-		return matched.String()
-	}
-	return ""
-}
-
-func (a *Announcer) recordFailure(configured provider, candidate AnnounceCandidate, err error, retryAt time.Time) {
+func (a *Announcer) recordFailure(configured provider, err error, retryAt time.Time) {
 	message := "tracker provider stopped unexpectedly"
 	if err != nil {
 		message = err.Error()
 	}
 	message = boundedTrackerText(message, maxTrackerErrorLength)
 	a.recordStatus(configured, ProviderStatus{
-		Provider: configured.display, Candidate: candidate.String(),
 		NextAnnounce: retryAt.UTC().Format(time.RFC3339), PeerAddresses: []string{}, Error: message,
 	})
 }
@@ -399,28 +329,5 @@ func (a *Announcer) recordStatus(configured provider, status ProviderStatus) {
 	select {
 	case a.statusChanges <- struct{}{}:
 	default:
-	}
-}
-
-func normalizeTiming(timing announcerTiming) announcerTiming {
-	defaults := defaultAnnouncerTiming
-	if timing.httpRequestTimeout <= 0 {
-		timing.httpRequestTimeout = defaults.httpRequestTimeout
-	}
-	if timing.providerRetry <= 0 {
-		timing.providerRetry = defaults.providerRetry
-	}
-	if timing.providerRetryMax < timing.providerRetry {
-		timing.providerRetryMax = max(defaults.providerRetryMax, timing.providerRetry)
-	}
-	return timing
-}
-
-func waitForProviderRetry(ctx context.Context, delay time.Duration) bool {
-	select {
-	case <-time.After(delay):
-		return true
-	case <-ctx.Done():
-		return false
 	}
 }

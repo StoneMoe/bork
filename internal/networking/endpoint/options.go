@@ -17,6 +17,7 @@ type Options struct {
 
 type STUNResult struct {
 	Server        string `json:"server"`
+	Family        string `json:"family,omitempty"`
 	MappedAddress string `json:"mappedAddress,omitempty"`
 	RTTMillis     int64  `json:"rttMillis,omitempty"`
 	Error         string `json:"error,omitempty"`

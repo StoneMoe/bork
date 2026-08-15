@@ -17,27 +17,14 @@ import (
 )
 
 const (
-	maxHTTPRequestURLLength     = 4096
-	maxConfiguredQueryKeys      = 32
-	maxConfiguredQueryValues    = 64
-	maxConfiguredQueryKeySize   = 128
-	maxConfiguredQueryValueSize = 1024
-	maxHTTPRedirects            = 3
-	maxHTTPResponseHeaders      = int64(64 << 10)
-)
-
-type announceEvent string
-
-const (
-	eventNone    announceEvent = ""
-	eventStarted announceEvent = "started"
-	eventStopped announceEvent = "stopped"
+	maxHTTPRequestURLLength = 4096
+	maxHTTPRedirects        = 3
+	maxHTTPResponseHeaders  = int64(64 << 10)
 )
 
 var trackerHTTPTransport = func() *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxResponseHeaderBytes = maxHTTPResponseHeaders
-	transport.ResponseHeaderTimeout = defaultAnnouncerTiming.httpRequestTimeout
 	return transport
 }()
 
@@ -59,34 +46,29 @@ var generatedHTTPQueryKeys = map[string]struct{}{
 func newHTTPClient() *http.Client {
 	return &http.Client{
 		Transport:     trackerHTTPTransport,
-		Timeout:       defaultAnnouncerTiming.httpRequestTimeout,
 		CheckRedirect: trackerRedirectPolicy,
 	}
 }
 
-func (a *Announcer) runHTTPTracker(ctx context.Context, configured provider, hints chan<- discovery.Hint, timing announcerTiming) (bool, error) {
+func (a *Announcer) runHTTPTracker(ctx context.Context, configured provider, hints chan<- discovery.Hint) (bool, error) {
 	candidate := a.candidate
 	registration := a.registration(configured, candidate)
-	started := false
 	announces := 0
-	announced := false
-	defer a.stopHTTPRegistration(configured, registration, timing)
+	defer a.stopHTTPRegistration(configured, registration)
 	for {
-		event := eventNone
-		if !started {
-			event = eventStarted
+		event := ""
+		if announces == 0 {
+			event = "started"
 		}
-		response, err := a.httpAnnounce(ctx, configured, registration, event, timing)
+		response, err := a.httpAnnounce(ctx, configured, registration, event)
 		if err != nil {
-			return announced, fmt.Errorf("announce to %s: %w", configured.display, err)
+			return announces > 0, fmt.Errorf("announce to %s: %w", configured.display, err)
 		}
-		started = true
 		interval := effectiveAnnounceInterval(response.interval, announces)
 		announces++
-		a.recordSuccess(configured, candidate, response, interval)
-		announced = true
+		a.recordSuccess(configured, response, interval)
 		if err := publishAndWait(ctx, hints, response, interval); err != nil {
-			return announced, err
+			return true, err
 		}
 	}
 }
@@ -95,8 +77,7 @@ func (a *Announcer) httpAnnounce(
 	ctx context.Context,
 	configured provider,
 	registration trackerRegistration,
-	event announceEvent,
-	timing announcerTiming,
+	event string,
 ) (announceResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return announceResponse{}, err
@@ -105,7 +86,7 @@ func (a *Announcer) httpAnnounce(
 	if err != nil {
 		return announceResponse{}, err
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, timing.httpRequestTimeout)
+	requestCtx, cancel := context.WithTimeout(ctx, httpRequestTimeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, requestURL, nil)
 	if err != nil {
@@ -187,7 +168,7 @@ func (a *Announcer) resolveHTTPPeerNames(ctx context.Context, response announceR
 	return response
 }
 
-func (a *Announcer) buildHTTPAnnounceURL(configured provider, registration trackerRegistration, event announceEvent) (string, error) {
+func (a *Announcer) buildHTTPAnnounceURL(configured provider, registration trackerRegistration, event string) (string, error) {
 	endpoint := configured.announceURL
 	query, err := url.ParseQuery(endpoint.RawQuery)
 	if err != nil {
@@ -209,10 +190,10 @@ func (a *Announcer) buildHTTPAnnounceURL(configured provider, registration track
 	query.Set("numwant", strconv.Itoa(maxAnnouncePeers))
 	// Tracker frontends may cache time-sensitive GET responses despite request no-cache headers.
 	query.Set("nonce", strconv.FormatInt(time.Now().UnixNano(), 36))
-	if event == eventNone {
+	if event == "" {
 		query.Del("event")
 	} else {
-		query.Set("event", string(event))
+		query.Set("event", event)
 	}
 	endpoint.RawQuery = query.Encode()
 	encoded := endpoint.String()
@@ -222,42 +203,22 @@ func (a *Announcer) buildHTTPAnnounceURL(configured provider, registration track
 	return encoded, nil
 }
 
-func (a *Announcer) stopHTTPRegistration(configured provider, registration trackerRegistration, timing announcerTiming) {
-	timeout := min(timing.httpRequestTimeout, trackerStopTimeout)
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func (a *Announcer) stopHTTPRegistration(configured provider, registration trackerRegistration) {
+	ctx, cancel := context.WithTimeout(context.Background(), trackerStopTimeout)
 	defer cancel()
-	if _, err := a.httpAnnounce(ctx, configured, registration, eventStopped, timing); err != nil {
+	if _, err := a.httpAnnounce(ctx, configured, registration, "stopped"); err != nil {
 		a.logger.Debug("stop HTTP tracker registration", "provider", configured.display, "candidate", registration.candidate.String(), "error", err)
 	}
 }
 
 func validateHTTPProviderQuery(rawQuery string) error {
-	if rawQuery == "" {
-		return nil
-	}
 	query, err := url.ParseQuery(rawQuery)
 	if err != nil {
 		return errors.New("HTTP tracker URL query is invalid")
 	}
-	if len(query) > maxConfiguredQueryKeys {
-		return errors.New("HTTP tracker URL query has too many keys")
-	}
-	values := 0
-	for key, entries := range query {
-		if key == "" || len(key) > maxConfiguredQueryKeySize {
-			return errors.New("HTTP tracker URL query key is invalid")
-		}
+	for key := range query {
 		if _, generated := generatedHTTPQueryKeys[key]; generated {
 			return fmt.Errorf("HTTP tracker URL query duplicates protocol key %q", key)
-		}
-		values += len(entries)
-		if values > maxConfiguredQueryValues {
-			return errors.New("HTTP tracker URL query has too many values")
-		}
-		for _, entry := range entries {
-			if len(entry) > maxConfiguredQueryValueSize {
-				return errors.New("HTTP tracker URL query value is too long")
-			}
 		}
 	}
 	return nil

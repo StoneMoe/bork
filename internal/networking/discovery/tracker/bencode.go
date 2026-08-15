@@ -42,7 +42,6 @@ func parseHTTPAnnounceResponse(packet []byte) (announceResponse, error) {
 	var compact4, compact6 []byte
 	var listedPeers []netip.AddrPort
 	var listedPeerNames []httpPeer
-	var externalIP []byte
 	var failure []byte
 	var failureSet bool
 	var previousKey []byte
@@ -67,8 +66,6 @@ func parseHTTPAnnounceResponse(packet []byte) (announceResponse, error) {
 		previousKey = key
 
 		switch string(key) {
-		case "external ip":
-			externalIP, err = decoder.parseString(1)
 		case "failure reason":
 			failure, err = decoder.parseString(1)
 			if err == nil && len(failure) > maxFailureReasonLength {
@@ -106,9 +103,6 @@ func parseHTTPAnnounceResponse(packet []byte) (announceResponse, error) {
 		interval:  time.Duration(interval) * time.Second,
 		peers:     listedPeers,
 		peerNames: listedPeerNames,
-	}
-	if len(externalIP) > 0 {
-		response.externalAddress = parseTrackerExternalIP(externalIP)
 	}
 	return parseHTTPCompactPeers(response, compact4, compact6)
 }
@@ -252,21 +246,6 @@ func (d *bencodeDecoder) endCollection(name string) (bool, error) {
 	}
 	d.pos++
 	return true, nil
-}
-
-func parseTrackerExternalIP(encoded []byte) netip.Addr {
-	switch len(encoded) {
-	case 4:
-		return netip.AddrFrom4([4]byte(encoded))
-	case 16:
-		return netip.AddrFrom16([16]byte(encoded)).Unmap()
-	default:
-		address, err := netip.ParseAddr(string(encoded))
-		if err == nil {
-			return address.Unmap()
-		}
-		return netip.Addr{}
-	}
 }
 
 func parseHTTPCompactPeers(response announceResponse, compact4, compact6 []byte) (announceResponse, error) {

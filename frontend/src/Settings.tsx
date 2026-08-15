@@ -287,7 +287,7 @@ export default function Settings(props: SettingsProps) {
               <ol class="stun-list">
                 <For each={stun()}>{(result) => (
                   <li classList={{ failed: !result.mappedAddress }} title={result.error || ""}>
-                    <span>{result.server}</span>
+                    <span>{result.server}{result.family && ` · ${result.family === "ipv6" ? "IPv6" : "IPv4"}`}</span>
                     <b>{result.mappedAddress ? `${result.rttMillis || 1} ms` : "失败"}</b>
                   </li>
                 )}</For>
@@ -335,7 +335,6 @@ export default function Settings(props: SettingsProps) {
                           }}
                         >
                           <span><small>请求地址</small><code>{tracker().candidate || "等待候选地址"}</code></span>
-                          <span><small>Tracker 观察地址</small><b>{tracker().error ? "失败" : tracker().observedAddress || "未返回"}</b></span>
                           <span class="tracker-next"><small>下次公告</small><b>{tracker().nextAnnounce ? formatRelativeTime(tracker().nextAnnounce!, now()) : "等待"}</b></span>
                           <div id={tooltipID()} class="tracker-peer-popover" role="tooltip">
                             <strong>{tracker().error ? "Tracker 错误" : "本次返回的地址"}</strong>
