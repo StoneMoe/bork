@@ -3,6 +3,7 @@ package invite
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -21,7 +22,7 @@ const (
 	MaxEncodedSize   = 512
 	prefix           = "bork://join/"
 	payloadFixedSize = 1 + RoomSeedSize
-	checksumSize     = 4
+	checksumSize     = 2
 	hkdfSalt         = "bork/invite/hkdf-sha256/v1"
 )
 
@@ -64,12 +65,11 @@ func Parse(encoded string) (Invite, error) {
 	if len(payload) < payloadFixedSize+checksumSize {
 		return Invite{}, errors.New("invite payload is truncated")
 	}
+	content := payload[:len(payload)-checksumSize]
 	if payload[0] != Version {
 		return Invite{}, fmt.Errorf("unsupported invite version %d", payload[0])
 	}
-	content := payload[:len(payload)-checksumSize]
-	wantChecksum := sha256.Sum256(content)
-	if string(payload[len(payload)-checksumSize:]) != string(wantChecksum[:checksumSize]) {
+	if binary.BigEndian.Uint16(payload[len(payload)-checksumSize:]) != inviteCRC16(content) {
 		return Invite{}, errors.New("invite checksum is invalid")
 	}
 	rawDisplayName := string(content[payloadFixedSize:])
@@ -90,9 +90,27 @@ func (i Invite) Encode() string {
 	payload[0] = Version
 	copy(payload[1:1+RoomSeedSize], i.roomSeed[:])
 	copy(payload[payloadFixedSize:], i.DisplayName)
-	checksum := sha256.Sum256(payload[:len(payload)-checksumSize])
-	copy(payload[len(payload)-checksumSize:], checksum[:checksumSize])
+	binary.BigEndian.PutUint16(
+		payload[len(payload)-checksumSize:],
+		inviteCRC16(payload[:len(payload)-checksumSize]),
+	)
 	return prefix + encodeBase58(payload)
+}
+
+// inviteCRC16 implements CRC-16/CCITT-FALSE for accidental input errors.
+func inviteCRC16(content []byte) uint16 {
+	crc := uint16(0xffff)
+	for _, value := range content {
+		crc ^= uint16(value) << 8
+		for range 8 {
+			if crc&0x8000 != 0 {
+				crc = crc<<1 ^ 0x1021
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
 }
 
 // TrackerHash returns the non-enumerable swarm identifier used for tracker discovery.
