@@ -3,7 +3,7 @@ import * as Backend from "@wailsjs/go/app/App";
 import { EventsOn } from "@wailsjs/runtime/runtime";
 import { RoomControlRow, RoomMemberList } from "./RoomControls";
 import { nativePopoverOpen, nativePopoverSupported } from "./popover";
-import type { ActionProps, AppState, FriendlyStatus } from "./types";
+import type { ActionProps, AppState, FriendlyStatus, PushToTalkPreference } from "./types";
 
 const screenVideoCodecs = ["avc1.42E01F", "avc1.4D401F"] as const;
 const screenVideoFrameRate = 15;
@@ -29,6 +29,8 @@ type ScreenResizeDirection = typeof screenResizeDirections[number];
 interface RoomProps extends ActionProps {
   state: AppState;
   friendly: FriendlyStatus;
+  pushToTalk: PushToTalkPreference;
+  configurePushToTalk: (enabled: boolean, code: string) => Promise<boolean>;
   screenFullscreen: boolean;
   reportError: (message: string) => void;
   registerLeaveAction: (action: (() => Promise<void>) | undefined) => void;
@@ -620,6 +622,8 @@ export default function Room(props: RoomProps) {
               busy={props.busy}
               ready={props.ready}
               runAction={props.runAction}
+              pushToTalk={props.pushToTalk}
+              configurePushToTalk={props.configurePushToTalk}
               focusFallback={focusRoomFallback}
               toggleScreenShare={() => localStream() || props.state.room?.screenSharing ? void stopScreenShare(true) : void startScreenShare()}
             />

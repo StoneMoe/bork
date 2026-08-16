@@ -1,7 +1,7 @@
 import { For, Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import * as Backend from "@wailsjs/go/app/App";
 import { closePopoversEvent, nativePopoverOpen, nativePopoverSupported } from "./popover";
-import type { ActionProps, AppState, FileTransfer, RemotePeer } from "./types";
+import type { ActionProps, AppState, FileTransfer, PushToTalkPreference, RemotePeer } from "./types";
 
 const memberInfoPopoverID = "member-info-popover";
 const fileSharePopoverID = "file-share-popover";
@@ -9,6 +9,8 @@ const fileSharePopoverID = "file-share-popover";
 interface RoomControlRowProps extends ActionProps {
   state: AppState;
   remotePeers: RemotePeer[];
+  pushToTalk: PushToTalkPreference;
+  configurePushToTalk: (enabled: boolean, code: string) => Promise<boolean>;
   screenSharing: boolean;
   captureBusy: boolean;
   remoteSharerCount: number;
@@ -73,8 +75,12 @@ export function RoomControlRow(props: RoomControlRowProps) {
             gain={props.state.audio.captureGain}
             level={props.state.audio.captureLevel}
             clipped={props.state.audio.captureClipped}
+            pushToTalk={props.pushToTalk.enabled}
             disabled={props.busy || !props.ready || !props.state.audio.available}
-            setMuted={(muted) => props.runAction(() => Backend.SetCaptureMuted(muted))}
+            setMuted={(muted) => {
+              if (props.pushToTalk.enabled) void props.configurePushToTalk(false, props.pushToTalk.code);
+              else void props.runAction(() => Backend.SetCaptureMuted(muted));
+            }}
             setGain={(gain) => props.runAction(() => Backend.SetCaptureGain(gain))}
           />
           <AudioControl
@@ -590,6 +596,7 @@ interface AudioControlProps {
   gain: number;
   level?: number;
   clipped?: boolean;
+  pushToTalk?: boolean;
   disabled: boolean;
   setMuted: (muted: boolean) => void;
   setGain: (gain: number) => void | Promise<unknown>;
@@ -598,7 +605,10 @@ interface AudioControlProps {
 function AudioControl(props: AudioControlProps) {
   const [draftGain, setDraftGain] = createSignal(props.gain);
   let editingGain = false;
-  const actionLabel = () => props.muted ? `取消${props.label}静音` : `将${props.label}静音`;
+  const actionLabel = () => {
+    if (props.pushToTalk) return `${props.muted ? "按住设定按键" : "正在按键"}说话；点击切换到开放麦克风`;
+    return props.muted ? `取消${props.label}静音` : `将${props.label}静音`;
+  };
   const levelPercent = () => {
     const level = Math.max(0, Math.min(1, props.level ?? 0));
     return level === 0 ? 0 : Math.max(0, (20 * Math.log10(level) + 60) / 60 * 100);
@@ -625,12 +635,15 @@ function AudioControl(props: AudioControlProps) {
         type="button"
         disabled={props.disabled}
         aria-label={actionLabel()}
-        aria-pressed={props.muted}
+        aria-pressed={props.pushToTalk ? undefined : props.muted}
         title={props.clipped ? `麦克风输入削波 · ${actionLabel()}` : actionLabel()}
         onClick={() => props.setMuted(!props.muted)}
       >
         <Show when={props.kind === "capture"} fallback={<SpeakerIcon muted={props.muted} />}>
           <MicrophoneIcon muted={props.muted} />
+        </Show>
+        <Show when={props.pushToTalk}>
+          <span class="audio-shortcut" aria-hidden="true">PTT</span>
         </Show>
       </button>
       <Show when={props.kind === "capture"}>

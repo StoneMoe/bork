@@ -261,6 +261,15 @@
 .audio-icon-button:disabled { cursor: wait; opacity: 0.45; }
 .audio-icon-button svg { width: 22px; height: 22px; overflow: visible; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
 .audio-icon-button .mute-slash { stroke-width: 2.2; }
+.audio-shortcut {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  border-radius: 4px;
+  padding: 2px 3px;
+  background: #171b25;
+  font: 700 7px/1 var(--font-mono);
+}
 
 .capture-level-meter {
   position: absolute;

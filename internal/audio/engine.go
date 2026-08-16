@@ -220,6 +220,16 @@ func (e *Engine) SetDevices(captureID, playbackID string) error {
 }
 
 func (e *Engine) SetCaptureMuted(muted bool) {
+	e.setCaptureMuted(muted, true)
+}
+
+// SetCaptureMutedQuietly changes the capture gate without playing the normal
+// mute tone. Push-to-talk uses it for every press and release.
+func (e *Engine) SetCaptureMutedQuietly(muted bool) {
+	e.setCaptureMuted(muted, false)
+}
+
+func (e *Engine) setCaptureMuted(muted, notify bool) {
 	e.opMu.Lock()
 	e.mu.RLock()
 	unchanged := e.state.CaptureMuted == muted
@@ -248,7 +258,9 @@ func (e *Engine) SetCaptureMuted(muted bool) {
 		e.state.CaptureClipped = false
 	}
 	e.mu.Unlock()
-	e.queueAudioNotificationLocked(muted)
+	if notify {
+		e.queueAudioNotificationLocked(muted)
+	}
 	e.publish()
 	e.opMu.Unlock()
 }

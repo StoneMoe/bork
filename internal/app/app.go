@@ -10,6 +10,7 @@ import (
 
 	"bork/internal/audio"
 	"bork/internal/config"
+	"bork/internal/globalkey"
 	"bork/internal/media"
 	"bork/internal/networking/discovery/tracker"
 	"bork/internal/networking/endpoint"
@@ -49,6 +50,9 @@ type App struct {
 	lastError           *AppError
 	nextErrorID         uint64
 	nextScreenCaptureID uint32
+	pushToTalk          *globalkey.Listener
+	pushToTalkEnabled   bool
+	pushToTalkKey       string
 	shuttingDown        bool
 }
 
@@ -81,6 +85,8 @@ func NewApp(cfg config.AppConfig, logger *slog.Logger) *App {
 		startupDone:     make(chan struct{}),
 		statePending:    make(chan struct{}, 1),
 		lastDiagnostics: emptyDiagnostics(),
+		pushToTalk:      globalkey.New(),
+		pushToTalkKey:   globalkey.DefaultCode,
 	}
 }
 
@@ -98,6 +104,7 @@ func (a *App) startup(ctx context.Context) {
 	}
 	a.startAudioWatcher(ctx)
 	a.commandMu.Unlock()
+	go a.watchPushToTalk(ctx)
 
 	a.markStateChanged()
 	close(a.startupDone)
@@ -172,6 +179,7 @@ func (a *App) publishRoomChange(change roomStateChange) {
 		if change.err != nil {
 			a.recordError(change.err)
 		}
+		a.stopPushToTalkLocked()
 		room := a.detachActiveRoom()
 		if room != nil {
 			room.cancel()
@@ -367,6 +375,68 @@ func (a *App) playPeerChangeLocked(room *roomSession) {
 	}
 }
 
+func (a *App) watchPushToTalk(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.pushToTalk.Changes():
+			a.applyPushToTalk(a.pushToTalk.Pressed())
+		case event := <-a.pushToTalk.Errors():
+			a.handlePushToTalkError(event)
+		}
+	}
+}
+
+func (a *App) handlePushToTalkError(event globalkey.ListenerError) {
+	a.commandMu.Lock()
+	defer a.commandMu.Unlock()
+	if !a.pushToTalkEnabled || a.shuttingDown || !a.pushToTalk.IsCurrent(event) {
+		return
+	}
+	a.stateMu.RLock()
+	room := a.room
+	a.stateMu.RUnlock()
+	if room == nil || room.stopping {
+		return
+	}
+	muted := true
+	_ = a.setMutedLocked(&muted, nil, false)
+	a.recordError(event)
+	a.markStateChanged()
+}
+
+func (a *App) applyPushToTalk(pressed bool) {
+	a.commandMu.Lock()
+	defer a.commandMu.Unlock()
+	if a.shuttingDown || !a.pushToTalkEnabled {
+		return
+	}
+	a.stateMu.RLock()
+	room := a.room
+	a.stateMu.RUnlock()
+	if room == nil || room.stopping {
+		return
+	}
+	muted := !pressed
+	if err := a.setMutedLocked(&muted, nil, false); err != nil {
+		a.recordError(err)
+		a.markStateChanged()
+	}
+}
+
+func (a *App) stopPushToTalkLocked() {
+	if !a.pushToTalkEnabled {
+		return
+	}
+	// Close the audio gate before waiting for an operating-system listener to
+	// finish, so leaving a room is fail closed even if a key is held.
+	if audioEngine, err := a.readyAudioEngine(); err == nil {
+		audioEngine.SetCaptureMutedQuietly(true)
+	}
+	a.pushToTalk.Stop()
+}
+
 func (a *App) activeClient() (*peer.Client, error) {
 	a.stateMu.RLock()
 	defer a.stateMu.RUnlock()
@@ -475,6 +545,7 @@ func (a *App) shutdown(context.Context) {
 	}
 	a.stateMu.Unlock()
 	a.stopStateNotifications()
+	a.stopPushToTalkLocked()
 	if room != nil {
 		room.cancel()
 	}

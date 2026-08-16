@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"bork/internal/audio"
+	"bork/internal/globalkey"
 	"bork/internal/invite"
 	"bork/internal/peer"
 
@@ -198,6 +199,9 @@ func (a *App) createRoom(roomInvite invite.Invite) error {
 	captureMuted := false
 	playbackMuted := false
 	if audioEngine != nil {
+		if a.pushToTalkEnabled {
+			audioEngine.SetCaptureMutedQuietly(true)
+		}
 		status := audioEngine.Status()
 		captureMuted = status.CaptureMuted
 		playbackMuted = status.PlaybackMuted
@@ -209,6 +213,11 @@ func (a *App) createRoom(roomInvite invite.Invite) error {
 		return err
 	}
 	a.clearError()
+	if a.pushToTalkEnabled {
+		if err := a.pushToTalk.Start(a.pushToTalkKey); err != nil {
+			a.recordError(err)
+		}
+	}
 	a.markStateChanged()
 	return nil
 }
@@ -221,6 +230,7 @@ func (a *App) LeaveRoom() error {
 		return errors.New("application is shutting down")
 	}
 	room := a.detachActiveRoom()
+	a.stopPushToTalkLocked()
 	if room != nil {
 		if room.screenCaptureID != 0 {
 			_ = room.client.StopScreenShare()
@@ -335,12 +345,23 @@ func (a *App) setMuted(captureMuted, playbackMuted *bool) error {
 	if a.isShuttingDown() {
 		return errors.New("application is shutting down")
 	}
+	if captureMuted != nil && !*captureMuted && a.pushToTalkEnabled {
+		return errors.New("disable push-to-talk before unmuting the microphone")
+	}
+	return a.setMutedLocked(captureMuted, playbackMuted, true)
+}
+
+func (a *App) setMutedLocked(captureMuted, playbackMuted *bool, notify bool) error {
 	audioEngine, err := a.readyAudioEngine()
 	if err != nil {
 		return err
 	}
 	if captureMuted != nil {
-		audioEngine.SetCaptureMuted(*captureMuted)
+		if notify {
+			audioEngine.SetCaptureMuted(*captureMuted)
+		} else {
+			audioEngine.SetCaptureMutedQuietly(*captureMuted)
+		}
 	}
 	if playbackMuted != nil {
 		audioEngine.SetPlaybackMuted(*playbackMuted)
@@ -350,13 +371,85 @@ func (a *App) setMuted(captureMuted, playbackMuted *bool) error {
 	nickname := a.nickname
 	room := a.room
 	a.stateMu.RUnlock()
+	a.markStateChanged()
 	if room != nil && !room.stopping {
 		if err := room.client.SetLocalMemberState(nickname, status.CaptureMuted, status.PlaybackMuted); err != nil {
 			return err
 		}
 	}
-	a.markStateChanged()
 	return nil
+}
+
+// ConfigurePushToTalk stores the frontend preference. The operating-system
+// listener is started only while a room is active.
+func (a *App) ConfigurePushToTalk(enabled bool, code string) error {
+	a.waitForStartup()
+	if !globalkey.ValidCode(code) {
+		return errors.New("push-to-talk key is unsupported")
+	}
+	a.commandMu.Lock()
+	defer a.commandMu.Unlock()
+	if a.isShuttingDown() {
+		return errors.New("application is shutting down")
+	}
+	audioEngine, audioErr := a.readyAudioEngine()
+	if audioErr != nil {
+		if enabled {
+			return audioErr
+		}
+		a.pushToTalk.Stop()
+		a.pushToTalkEnabled = false
+		a.pushToTalkKey = code
+		return nil
+	}
+	return a.configurePushToTalkLocked(audioEngine, enabled, code)
+}
+
+func (a *App) configurePushToTalkLocked(audioEngine *audio.Engine, enabled bool, code string) error {
+	a.stateMu.RLock()
+	room := a.room
+	a.stateMu.RUnlock()
+	activeRoom := room != nil && !room.stopping
+	previousMuted := audioEngine.Status().CaptureMuted
+	muted := previousMuted
+	if enabled {
+		muted = true
+	} else if a.pushToTalkEnabled {
+		muted = false
+	}
+	if err := a.setPushToTalkListenerLocked(audioEngine, enabled, activeRoom, code, previousMuted); err != nil {
+		return err
+	}
+	a.pushToTalkEnabled = enabled
+	a.pushToTalkKey = code
+	if err := a.setMutedLocked(&muted, nil, false); err != nil {
+		a.recordError(err)
+	}
+	return nil
+}
+
+func (a *App) setPushToTalkListenerLocked(audioEngine *audio.Engine, enabled, activeRoom bool, code string, previousMuted bool) error {
+	if !enabled || !activeRoom {
+		a.pushToTalk.Stop()
+		return nil
+	}
+	// Mute before replacing the listener. This also covers a held old key
+	// while the platform waits for its old callback source to stop.
+	audioEngine.SetCaptureMutedQuietly(true)
+	if err := a.pushToTalk.Start(code); err != nil {
+		a.restoreMutedAfterPushToTalkFailure(previousMuted)
+		return err
+	}
+	return nil
+}
+
+func (a *App) restoreMutedAfterPushToTalkFailure(previousMuted bool) {
+	// A failed first enable restores the manual mute state. A failed rebind
+	// keeps an existing PTT setup closed until its key is pressed again.
+	muted := previousMuted || a.pushToTalkEnabled
+	if err := a.setMutedLocked(&muted, nil, false); err != nil {
+		a.recordError(err)
+	}
 }
 
 func (a *App) SetCaptureGain(gain int) error {

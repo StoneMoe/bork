@@ -12,6 +12,11 @@ export interface ActionProps {
   runAction: (action: () => Promise<void>) => Promise<boolean>;
 }
 
+export interface PushToTalkPreference {
+  enabled: boolean;
+  code: string;
+}
+
 export interface FriendlyStatus {
   title?: string;
   detail?: string;

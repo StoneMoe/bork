@@ -1,10 +1,12 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import * as Backend from "@wailsjs/go/app/App";
-import type { ActionProps, AppState, Candidate, TrackerStatus } from "./types";
+import type { ActionProps, AppState, Candidate, PushToTalkPreference, TrackerStatus } from "./types";
 
 interface SettingsProps extends ActionProps {
   state: AppState;
   close: () => void;
+  pushToTalk: PushToTalkPreference;
+  configurePushToTalk: (enabled: boolean, code: string) => Promise<boolean>;
 }
 
 const settingsTabs = [
@@ -14,6 +16,24 @@ const settingsTabs = [
 ] as const;
 
 type SettingsTab = typeof settingsTabs[number]["id"];
+
+const pushToTalkKeyLabels: Record<string, string> = {
+  Backquote: "`", Minus: "-", Equal: "=", BracketLeft: "[", BracketRight: "]", Backslash: "\\", IntlBackslash: "\\",
+  Semicolon: ";", Quote: "'", Comma: ",", Period: ".", Slash: "/", Space: "空格",
+  Enter: "Enter", Tab: "Tab", Backspace: "Backspace", Delete: "Delete", Insert: "Insert",
+  Home: "Home", End: "End", PageUp: "Page Up", PageDown: "Page Down",
+  ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→",
+  NumpadDivide: "Num /", NumpadMultiply: "Num *", NumpadSubtract: "Num -", NumpadAdd: "Num +",
+  NumpadEnter: "Num Enter", NumpadDecimal: "Num .",
+};
+
+function formatPushToTalkKey(code: string) {
+  if (pushToTalkKeyLabels[code]) return pushToTalkKeyLabels[code];
+  if (code.startsWith("Key") && code.length === 4) return code.slice(3);
+  if (code.startsWith("Digit") && code.length === 6) return code.slice(5);
+  if (code.startsWith("Numpad")) return `Num ${code.slice(6)}`;
+  return code;
+}
 
 export default function Settings(props: SettingsProps) {
   const [activeTab, setActiveTab] = createSignal<SettingsTab>("device");
@@ -43,6 +63,7 @@ export default function Settings(props: SettingsProps) {
   const diagnosticErrors = () => [diagnostics().networkError, diagnostics().discoveryError, diagnostics().portMappingError]
     .filter((message): message is string => Boolean(message));
   const [nickname, setNickname] = createSignal(props.state.nickname);
+  const [capturingPushToTalkKey, setCapturingPushToTalkKey] = createSignal(false);
   const [now, setNow] = createSignal(Date.now());
   const [dismissedTrackerTooltip, setDismissedTrackerTooltip] = createSignal("");
   const clock = window.setInterval(() => setNow(Date.now()), 1000);
@@ -65,6 +86,20 @@ export default function Settings(props: SettingsProps) {
     const tab = settingsTabs[next].id;
     setActiveTab(tab);
     queueMicrotask(() => tabButtons[tab]?.focus({ preventScroll: true }));
+  }
+
+  function capturePushToTalkKey(event: KeyboardEvent) {
+    if (!capturingPushToTalkKey()) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.code === "Escape") {
+      setCapturingPushToTalkKey(false);
+      return;
+    }
+    if (event.repeat || event.code === "Unidentified"
+      || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    setCapturingPushToTalkKey(false);
+    void props.configurePushToTalk(props.pushToTalk.enabled, event.code);
   }
 
   function handleSettingsKeyDown(event: KeyboardEvent) {
@@ -158,6 +193,45 @@ export default function Settings(props: SettingsProps) {
             </select>
           </label>
           <div class="audio-toggles">
+            <label class="setting-row audio-toggle">
+              <span>
+                <strong>按键说话</strong>
+                <small>按住设定按键时发送麦克风声音。</small>
+              </span>
+              <input
+                type="checkbox"
+                checked={props.pushToTalk.enabled}
+                disabled={props.busy || !props.ready}
+                onChange={async (event) => {
+                  const input = event.currentTarget;
+                  const checked = input.checked;
+                  if (!await props.configurePushToTalk(checked, props.pushToTalk.code)) input.checked = !checked;
+                }}
+              />
+            </label>
+            <div class="setting-row audio-toggle">
+              <span>
+                <strong>首选说话按键</strong>
+                <small>请设定一个非修饰键；系统可能要求确认，全局监听仅在房间内注册。</small>
+              </span>
+              <button
+                class="push-to-talk-key-button"
+                type="button"
+                disabled={props.busy || !props.ready}
+                aria-label={capturingPushToTalkKey() ? "请按一个按键，按 Escape 取消" : `说话按键 ${formatPushToTalkKey(props.pushToTalk.code)}，点击更改`}
+                title={capturingPushToTalkKey() ? "按 Escape 取消" : "更改说话按键"}
+                onClick={() => setCapturingPushToTalkKey(true)}
+                onKeyDown={capturePushToTalkKey}
+                onBlur={() => setCapturingPushToTalkKey(false)}
+              >
+                <Show when={!capturingPushToTalkKey()} fallback={<span>请按键…</span>}>
+                  <kbd>{formatPushToTalkKey(props.pushToTalk.code)}</kbd>
+                </Show>
+              </button>
+              <span class="visually-hidden" role="status" aria-live="polite">
+                {capturingPushToTalkKey() ? "请按一个非修饰键，按 Escape 取消" : ""}
+              </span>
+            </div>
             <label class="setting-row audio-toggle">
               <span>
                 <strong>回声消除</strong>

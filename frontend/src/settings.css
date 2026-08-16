@@ -114,6 +114,22 @@
 .audio-toggle strong { color: #d8dbe4; font-size: 12px; font-weight: 600; }
 .audio-toggle + .audio-toggle { border-top: 1px solid rgba(255, 255, 255, 0.055); }
 
+.push-to-talk-key-button {
+  min-width: 74px;
+  height: 30px;
+  border: 1px solid rgba(145, 167, 232, 0.25);
+  border-radius: 6px;
+  padding: 0 9px;
+  color: #bbc6e3;
+  cursor: pointer;
+  background: rgba(145, 167, 232, 0.06);
+  font: 600 10px/1 var(--font-ui);
+}
+.push-to-talk-key-button:hover:not(:disabled),
+.push-to-talk-key-button:focus-visible { border-color: rgba(145, 167, 232, 0.52); color: #e2e7f4; }
+.push-to-talk-key-button:disabled { cursor: default; opacity: 0.5; }
+.push-to-talk-key-button kbd { font: 700 11px/1 var(--font-mono); }
+
 .setting-row {
   min-height: 50px;
   display: flex;

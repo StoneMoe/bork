@@ -16,13 +16,16 @@ import { closePopoversEvent, nativePopoverOpen, nativePopoverSupported } from ".
 import { parseRoomHistory, roomHistoryStorageKey, withRecentRoom } from "./room-history";
 import { createRemoteState } from "./sync";
 import type { RoomHistoryEntry } from "./room-history";
-import type { ActionProps, AppState, FriendlyStatus } from "./types";
+import type { ActionProps, AppState, FriendlyStatus, PushToTalkPreference } from "./types";
 
 const maxInviteLength = 512;
 const nicknameStorageKey = "bork.nickname";
 const echoCancellationDisabledStorageKey = "bork.audio.echoCancellation.disabled";
 const noiseSuppressionDisabledStorageKey = "bork.audio.noiseSuppression.disabled";
 const remoteLoudnessNormalizationDisabledStorageKey = "bork.audio.remoteLoudnessNormalization.disabled";
+const pushToTalkEnabledStorageKey = "bork.audio.pushToTalk.enabled";
+const pushToTalkKeyStorageKey = "bork.audio.pushToTalk.key";
+const defaultPushToTalkKey = "Backquote";
 function hasNativeWindowBridge() {
   const host = window as typeof window & {
     chrome?: { webview?: { postMessage?: unknown } };
@@ -64,6 +67,8 @@ export default function App() {
   const [inviteCopied, setInviteCopied] = createSignal(false);
   const [nicknameStorageReady, setNicknameStorageReady] = createSignal(false);
   const [audioPreferencesStorageReady, setAudioPreferencesStorageReady] = createSignal(false);
+  const [pushToTalk, setPushToTalk] = createSignal(readPushToTalkPreference());
+  const [pushToTalkStorageReady, setPushToTalkStorageReady] = createSignal(false);
   const customWindowControls = hasNativeWindowBridge();
   const [windowMaximised, setWindowMaximised] = createSignal(false);
   const [screenFullscreen, setScreenFullscreen] = createSignal(false);
@@ -72,6 +77,7 @@ export default function App() {
   let leaveRoomAction: (() => Promise<void>) | undefined;
   let nicknameRestoreStarted = false;
   let audioPreferencesRestoreStarted = false;
+  let pushToTalkRestoreStarted = false;
   let copyTimer: number | undefined;
   let windowStateGeneration = 0;
   let screenFullscreenOwned = false;
@@ -80,6 +86,7 @@ export default function App() {
   const remote = createRemoteState(setError);
   const state = remote.state;
   const operational = remote.ready;
+  const ready = createMemo(() => operational() && pushToTalkStorageReady());
   const inRoom = createMemo(() => Boolean(state().room));
   const friendly = createMemo(() => humanStatus(state()));
   let previousRoomState = inRoom();
@@ -184,6 +191,20 @@ export default function App() {
     } catch { /* storage unavailable */ }
   });
   createEffect(() => {
+    if (!operational() || !nicknameStorageReady() || busy() || pushToTalkRestoreStarted) return;
+    pushToTalkRestoreStarted = true;
+    const preference = pushToTalk();
+    void runAction(() => Backend.ConfigurePushToTalk(preference.enabled, preference.code)).then((restored) => {
+      if (!restored) {
+        // A temporary backend failure must not discard the user's chosen key.
+        const disabled = { enabled: false, code: preference.code };
+        setPushToTalk(disabled);
+        writePushToTalkPreference(disabled);
+      }
+      setPushToTalkStorageReady(true);
+    });
+  });
+  createEffect(() => {
     if (!operational() || !nicknameStorageReady() || busy() || audioPreferencesRestoreStarted) return;
     audioPreferencesRestoreStarted = true;
     let echoCancellation = true;
@@ -224,6 +245,14 @@ export default function App() {
       else localStorage.setItem(remoteLoudnessNormalizationDisabledStorageKey, "1");
     } catch { /* storage unavailable */ }
   });
+
+  async function configurePushToTalk(enabled: boolean, code: string) {
+    const next = { enabled, code };
+    if (!await runAction(() => Backend.ConfigurePushToTalk(enabled, code))) return false;
+    setPushToTalk(next);
+    writePushToTalkPreference(next);
+    return true;
+  }
 
   async function runAction(action: () => Promise<void>) {
     if (!operational() || busy()) return false;
@@ -291,7 +320,7 @@ export default function App() {
             <button
               class="topbar-icon-button back-button"
               type="button"
-              disabled={busy() || !operational()}
+              disabled={busy() || !ready()}
               aria-label="离开房间"
               title="离开房间"
               onClick={() => void leaveRoomAction?.()}
@@ -307,7 +336,7 @@ export default function App() {
                 class="topbar-icon-button copy-invite-button"
                 classList={{ copied: inviteCopied() }}
                 type="button"
-                disabled={busy() || !operational()}
+                disabled={busy() || !ready()}
                 aria-label={inviteCopied() ? "邀请已复制" : "复制房间邀请"}
                 title={inviteCopied() ? "邀请已复制" : "复制房间邀请"}
                 onClick={() => void copyInvite()}
@@ -318,7 +347,7 @@ export default function App() {
           </div>
         </div>
         <div class="topbar-actions">
-          <button ref={settingsButton} class="topbar-icon-button settings-button" type="button" disabled={!operational()} aria-label="打开设置" title="设置" onClick={openSettings}>
+          <button ref={settingsButton} class="topbar-icon-button settings-button" type="button" disabled={!ready()} aria-label="打开设置" title="设置" onClick={openSettings}>
             <SettingsIcon />
           </button>
           <Show when={customWindowControls}>
@@ -346,7 +375,7 @@ export default function App() {
           fallback={
             <Lobby
               busy={busy()}
-              ready={operational()}
+              ready={ready()}
               history={roomHistory()}
               runAction={runAction}
               removeHistory={(invite) => updateRoomHistory(roomHistory().filter((entry) => entry.invite !== invite))}
@@ -358,8 +387,10 @@ export default function App() {
             friendly={friendly()}
             screenFullscreen={screenFullscreen()}
             busy={busy()}
-            ready={operational()}
+            ready={ready()}
             runAction={runAction}
+            pushToTalk={pushToTalk()}
+            configurePushToTalk={configurePushToTalk}
             reportError={setError}
             registerLeaveAction={(action) => { leaveRoomAction = action; }}
             toggleScreenFullscreen={toggleScreenFullscreen}
@@ -372,9 +403,11 @@ export default function App() {
         <Settings
           state={state()}
           busy={busy()}
-          ready={operational()}
+          ready={ready()}
           close={closeSettings}
           runAction={runAction}
+          pushToTalk={pushToTalk()}
+          configurePushToTalk={configurePushToTalk}
         />
       </Show>
 
@@ -590,6 +623,25 @@ function ChevronIcon() {
 
 function HistoryIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3L4.5 9M4.5 4.5V9H9M12 8v4.5l3 1.8" /></svg>;
+}
+
+function readPushToTalkPreference(): PushToTalkPreference {
+  try {
+    return {
+      enabled: localStorage.getItem(pushToTalkEnabledStorageKey) === "1",
+      code: localStorage.getItem(pushToTalkKeyStorageKey) || defaultPushToTalkKey,
+    };
+  } catch {
+    return { enabled: false, code: defaultPushToTalkKey };
+  }
+}
+
+function writePushToTalkPreference(preference: PushToTalkPreference) {
+  try {
+    if (preference.enabled) localStorage.setItem(pushToTalkEnabledStorageKey, "1");
+    else localStorage.removeItem(pushToTalkEnabledStorageKey);
+    localStorage.setItem(pushToTalkKeyStorageKey, preference.code);
+  } catch { /* storage unavailable */ }
 }
 
 function readRoomHistory() {
