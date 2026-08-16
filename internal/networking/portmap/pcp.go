@@ -127,7 +127,7 @@ func (p *PCP) Run(ctx context.Context, internalPort uint16, states chan<- State)
 		if attempted {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), timing.cleanupTimeout)
 			if err := deletePCPMapping(cleanupCtx, client, nonce, internalPort); err != nil {
-				p.logger.Debug("PCP cleanup failed", "error", boundedError(err))
+				p.logger.Warn("PCP mapping cleanup was not confirmed", "error", boundedError(err))
 			}
 			cancel()
 		}
@@ -432,7 +432,7 @@ func deletePCPMapping(ctx context.Context, client *pcpGatewayClient, nonce [12]b
 		return err
 	}
 	if response.lifetime != 0 {
-		return errors.New("PCP gateway did not confirm mapping deletion")
+		return fmt.Errorf("PCP gateway deferred mapping deletion for %d seconds", response.lifetime)
 	}
 	return nil
 }
