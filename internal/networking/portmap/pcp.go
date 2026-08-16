@@ -25,6 +25,7 @@ const (
 	pcpGatewayPort     = 5351
 	pcpReadPoll        = 100 * time.Millisecond
 	pcpRequestAttempts = 3
+	pcpIPv6Anycast     = "2001:1::1"
 )
 
 var errPCPEpochReset = errors.New("PCP gateway epoch moved backwards")
@@ -77,12 +78,16 @@ type pcpGatewayClient struct {
 var _ Mapper = (*PCP)(nil)
 
 func NewPCP(logger *slog.Logger) *PCP {
+	return newPCP(logger, discoverPCPGateway)
+}
+
+func newPCP(logger *slog.Logger, discover pcpDiscoverFunc) *PCP {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &PCP{
 		logger:      logger,
-		discover:    discoverPCPGateway,
+		discover:    discover,
 		gatewayPort: pcpGatewayPort,
 		random:      rand.Reader,
 		now:         time.Now,
@@ -240,37 +245,85 @@ func (p *PCP) Run(ctx context.Context, internalPort uint16, states chan<- State)
 }
 
 func discoverPCPGateway(ctx context.Context) (pcpRoute, error) {
-	if err := ctx.Err(); err != nil {
-		return pcpRoute{}, err
-	}
 	route, err := discoverDefaultRoute(ctx)
 	if err != nil {
 		return pcpRoute{}, err
 	}
-	if err := ctx.Err(); err != nil {
-		return pcpRoute{}, err
-	}
-	local, ok := netip.AddrFromSlice(route.local)
-	if !ok {
-		return pcpRoute{}, errors.New("PCP local address is invalid")
-	}
-	gateway, err := validNATPMPGateway(route.gateway)
+	return pcpRouteFromDefault(route, false)
+}
+
+func discoverIPv6PCPGateway(ctx context.Context) (pcpRoute, error) {
+	route, err := discoverDefaultIPv6Route(ctx)
 	if err != nil {
 		return pcpRoute{}, err
 	}
-	local = local.Unmap()
-	if !local.Is4() || !local.IsGlobalUnicast() || local.IsLoopback() || local.IsLinkLocalUnicast() {
-		return pcpRoute{}, errors.New("PCP local address is not usable IPv4")
+	return pcpRouteFromDefault(route, true)
+}
+
+func discoverIPv6PCPAnycast(_ context.Context) (pcpRoute, error) {
+	return pcpRoute{gateway: netip.MustParseAddr(pcpIPv6Anycast)}, nil
+}
+
+func pcpRouteFromDefault(route defaultRoute, ipv6 bool) (pcpRoute, error) {
+	local, ok := netip.AddrFromSlice(route.local)
+	if !ok || !usablePCPLocalAddress(local.Unmap(), ipv6) {
+		return pcpRoute{}, errors.New("PCP local address is not usable")
+	}
+	gateway, ok := netip.AddrFromSlice(route.gateway)
+	if !ok || !usablePCPGatewayAddress(gateway.Unmap(), ipv6) {
+		return pcpRoute{}, errors.New("PCP gateway address is not usable")
+	}
+	local, gateway = local.Unmap(), gateway.Unmap()
+	if gateway.IsLinkLocalUnicast() {
+		if route.zone == "" {
+			return pcpRoute{}, errors.New("PCP link-local gateway has no interface zone")
+		}
+		gateway = gateway.WithZone(route.zone)
 	}
 	return pcpRoute{gateway: gateway, local: local}, nil
 }
 
+func usablePCPLocalAddress(address netip.Addr, ipv6 bool) bool {
+	return address.IsValid() &&
+		address.Is6() == ipv6 &&
+		address.IsGlobalUnicast() &&
+		(!ipv6 || !address.IsPrivate())
+}
+
+func usablePCPGatewayAddress(address netip.Addr, ipv6 bool) bool {
+	if !address.IsValid() || address.Is6() != ipv6 {
+		return false
+	}
+	return address.IsGlobalUnicast() || (ipv6 && address.IsLinkLocalUnicast())
+}
+
 func newPCPGatewayClient(route pcpRoute, port uint16) (*pcpGatewayClient, error) {
-	conn, err := net.DialUDP("udp4", net.UDPAddrFromAddrPort(netip.AddrPortFrom(route.local, 0)), net.UDPAddrFromAddrPort(netip.AddrPortFrom(route.gateway, port)))
+	network, local, gateway := pcpDialAddresses(route, port)
+	conn, err := net.DialUDP(network, local, gateway)
 	if err != nil {
 		return nil, err
 	}
+	actualLocal := conn.LocalAddr().(*net.UDPAddr).AddrPort().Addr().Unmap()
+	if !usablePCPLocalAddress(actualLocal, route.gateway.Is6()) {
+		_ = conn.Close()
+		return nil, errors.New("PCP socket selected an unusable local address")
+	}
 	return &pcpGatewayClient{conn: conn}, nil
+}
+
+// A nil local address lets the OS select the source for the RFC 7723 anycast
+// fallback; the PCP header then uses conn.LocalAddr().
+func pcpDialAddresses(route pcpRoute, port uint16) (string, *net.UDPAddr, *net.UDPAddr) {
+	network := "udp4"
+	if route.gateway.Is6() {
+		network = "udp6"
+	}
+	gateway := net.UDPAddrFromAddrPort(netip.AddrPortFrom(route.gateway, port))
+	if !route.local.IsValid() {
+		return network, nil, gateway
+	}
+	local := net.UDPAddrFromAddrPort(netip.AddrPortFrom(route.local, 0))
+	return network, local, gateway
 }
 
 func (c *pcpGatewayClient) Close() error { return c.conn.Close() }
@@ -330,10 +383,7 @@ func (c *pcpGatewayClient) exchange(ctx context.Context, request []byte, match f
 }
 
 func requestPCPMapping(ctx context.Context, client *pcpGatewayClient, localAddress netip.Addr, nonce [12]byte, internalPort, externalPort uint16, externalAddress netip.Addr, lifetime uint32) (pcpMapResponse, error) {
-	request, err := buildPCPMapRequest(localAddress, nonce, internalPort, externalPort, externalAddress, lifetime)
-	if err != nil {
-		return pcpMapResponse{}, err
-	}
+	request := buildPCPMapRequest(localAddress, nonce, internalPort, externalPort, externalAddress, lifetime)
 	message, err := client.exchange(ctx, request, func(message []byte) bool {
 		if natPMPUnsupportedVersion(message) {
 			return true
@@ -401,22 +451,19 @@ func pcpRetryDelay(retry time.Duration, state State, owned *pcpOwnedMapping, now
 	return delay
 }
 
-func buildPCPMapRequest(localAddress netip.Addr, nonce [12]byte, internalPort, externalPort uint16, externalAddress netip.Addr, lifetime uint32) ([]byte, error) {
-	clientAddress, err := pcpAddress(localAddress)
-	if err != nil {
-		return nil, fmt.Errorf("PCP client address: %w", err)
-	}
-	suggestedAddress := [16]byte{}
+func buildPCPMapRequest(localAddress netip.Addr, nonce [12]byte, internalPort, externalPort uint16, externalAddress netip.Addr, lifetime uint32) []byte {
+	clientAddress := localAddress.Unmap().As16()
+	var suggestedAddress [16]byte
 	if lifetime != 0 {
-		suggestedAddress, err = pcpAddress(netip.IPv4Unspecified())
-		if err != nil {
-			return nil, err
+		// Each mapper requests an external address in its socket family. A
+		// cross-family NAT64 or NAT46 mapping needs a separate MAP lifecycle.
+		suggested := netip.IPv4Unspecified()
+		if localAddress.Is6() {
+			suggested = netip.IPv6Unspecified()
 		}
-	}
-	if externalAddress.IsValid() {
-		suggestedAddress, err = pcpAddress(externalAddress)
-		if err != nil {
-			return nil, fmt.Errorf("PCP suggested address: %w", err)
+		suggestedAddress = suggested.As16()
+		if externalAddress.IsValid() {
+			suggestedAddress = externalAddress.Unmap().As16()
 		}
 	}
 	request := make([]byte, pcpMapMessageSize)
@@ -429,7 +476,7 @@ func buildPCPMapRequest(localAddress netip.Addr, nonce [12]byte, internalPort, e
 	binary.BigEndian.PutUint16(request[40:42], internalPort)
 	binary.BigEndian.PutUint16(request[42:44], externalPort)
 	copy(request[44:60], suggestedAddress[:])
-	return request, nil
+	return request
 }
 
 func parsePCPMapResponse(message []byte, nonce [12]byte, internalPort uint16) (pcpMapResponse, error) {
@@ -465,7 +512,7 @@ func parsePCPMapResponse(message []byte, nonce [12]byte, internalPort uint16) (p
 	}
 	externalPort := binary.BigEndian.Uint16(message[42:44])
 	externalAddress := netip.AddrFrom16([16]byte(message[44:60])).Unmap()
-	if externalPort == 0 || !publiclyRoutableIPv4(externalAddress) {
+	if externalPort == 0 || !usablePCPExternalAddress(externalAddress) {
 		return pcpMapResponse{}, errors.New("PCP gateway returned an unusable external address")
 	}
 	response.externalAddress = netip.AddrPortFrom(externalAddress, externalPort)
@@ -494,12 +541,11 @@ func validatePCPOptions(options []byte) error {
 	return nil
 }
 
-func pcpAddress(address netip.Addr) ([16]byte, error) {
-	address = address.Unmap()
-	if !address.IsValid() || !address.Is4() {
-		return [16]byte{}, errors.New("PCP currently requires IPv4")
+func usablePCPExternalAddress(address netip.Addr) bool {
+	if address.Is4() {
+		return publiclyRoutableIPv4(address)
 	}
-	return address.As16(), nil
+	return address.Is6() && address.IsGlobalUnicast() && !address.IsPrivate()
 }
 
 func pcpResultText(code byte) string {

@@ -1,13 +1,134 @@
 package networking
 
 import (
+	"context"
+	"errors"
 	"net/netip"
 	"slices"
 	"testing"
+	"time"
 
 	"bork/internal/networking/discovery/tracker"
 	"bork/internal/networking/endpoint"
+	"bork/internal/networking/portmap"
 )
+
+type lifecyclePortMapper struct {
+	mapping portmap.Mapping
+	fail    <-chan error
+}
+
+func (m *lifecyclePortMapper) Run(ctx context.Context, _ uint16, states chan<- portmap.State) error {
+	states <- portmap.State{Mapping: &m.mapping}
+	select {
+	case err := <-m.fail:
+		return err
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+func receivePortMappingTestValue[T any](t *testing.T, values <-chan T) T {
+	t.Helper()
+	select {
+	case value := <-values:
+		return value
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for port mapping lifecycle")
+		var zero T
+		return zero
+	}
+}
+
+func requirePortMappingLane(t *testing.T, lane portMappingLane, wantAddress, wantError string) {
+	t.Helper()
+	address := ""
+	if lane.mapping != nil {
+		address = lane.mapping.ExternalAddress.String()
+	}
+	if address != wantAddress || lane.err != wantError {
+		t.Fatalf("port mapping lane = {%q, %q}, want {%q, %q}", address, lane.err, wantAddress, wantError)
+	}
+}
+
+func TestPortMappingLanesKeepFamiliesIndependent(t *testing.T) {
+	failIPv4 := make(chan error, 1)
+	ipv4 := &lifecyclePortMapper{mapping: portmap.Mapping{ExternalAddress: netip.MustParseAddrPort("198.51.100.10:5000")}, fail: failIPv4}
+	ipv6 := &lifecyclePortMapper{mapping: portmap.Mapping{ExternalAddress: netip.MustParseAddrPort("[2001:db8::10]:6000")}}
+	mappings := newPortMappingLanes(ipv4, ipv6)
+
+	mappings.startAvailable(t.Context(), endpoint.Snapshot{
+		ListenAddress: "[::]:4000",
+		Candidates: []endpoint.Candidate{
+			{Type: endpoint.CandidateNIC, Address: "192.0.2.10:4000", Family: "ipv4"},
+			{Type: endpoint.CandidateNIC, Address: "[2001:db8::10]:4000", Family: "ipv6"},
+		},
+	})
+	for range 2 {
+		if err := mappings.apply(receivePortMappingTestValue(t, mappings.events)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requirePortMappingLane(t, mappings.lanes[0], "198.51.100.10:5000", "")
+	requirePortMappingLane(t, mappings.lanes[1], "[2001:db8::10]:6000", "")
+
+	failure := errors.New("fake IPv4 failure")
+	failIPv4 <- failure
+	if err := mappings.apply(receivePortMappingTestValue(t, mappings.events)); !errors.Is(err, failure) {
+		t.Fatalf("port mapping event error = %v, want %v", err, failure)
+	}
+	requirePortMappingLane(t, mappings.lanes[0], "", failure.Error())
+	requirePortMappingLane(t, mappings.lanes[1], "[2001:db8::10]:6000", "")
+	if got := mappings.errorText(); got != "ipv4: "+failure.Error() {
+		t.Fatalf("port mapping error = %q, want independent IPv4 error", got)
+	}
+
+	if err := mappings.stop(); err != nil {
+		t.Fatal(err)
+	}
+	requirePortMappingLane(t, mappings.lanes[0], "", failure.Error())
+	requirePortMappingLane(t, mappings.lanes[1], "", "")
+}
+
+func TestWithPortMappingsProjectsBothFamilies(t *testing.T) {
+	snapshot := endpoint.Snapshot{Candidates: []endpoint.Candidate{{
+		Type: endpoint.CandidateNIC, Address: "192.0.2.10:4000", Family: "ipv4",
+	}}}
+	ipv4 := &portmap.Mapping{
+		ExternalAddress: netip.MustParseAddrPort("198.51.100.10:5000"),
+		Provider:        "pcp-v4",
+	}
+	ipv6 := &portmap.Mapping{
+		ExternalAddress: netip.MustParseAddrPort("[2001:db8::10]:6000"),
+		Provider:        "pcp-v6",
+	}
+
+	projected := withPortMappings(snapshot, ipv4, ipv6)
+	want := []endpoint.Candidate{
+		{Type: endpoint.CandidateNIC, Address: "192.0.2.10:4000", Family: "ipv4"},
+		{Type: endpoint.CandidatePortMapped, Address: "198.51.100.10:5000", Family: "ipv4", Source: "pcp-v4"},
+		{Type: endpoint.CandidatePortMapped, Address: "[2001:db8::10]:6000", Family: "ipv6", Source: "pcp-v6"},
+	}
+	if !slices.Equal(projected.Candidates, want) {
+		t.Fatalf("candidates = %v, want both port-mapping families %v", projected.Candidates, want)
+	}
+}
+
+func TestPortMappingInternalPortAllowsIPv6OnlyEndpoint(t *testing.T) {
+	snapshot := endpoint.Snapshot{
+		ListenAddress: "[::]:4000",
+		Candidates: []endpoint.Candidate{{
+			Type: endpoint.CandidateNIC, Address: "[2001:db8::10]:4000", Family: "ipv6",
+		}},
+	}
+
+	if port := portMappingInternalPort(snapshot, "ipv4"); port != 0 {
+		t.Fatalf("IPv4 port = %d, want unavailable", port)
+	}
+	if port := portMappingInternalPort(snapshot, "ipv6"); port != 4000 {
+		t.Fatalf("IPv6 port = %d, want 4000", port)
+	}
+}
 
 func TestTrackerAnnounceCandidatesUsesStableSTUNOrder(t *testing.T) {
 	snapshot := endpoint.Snapshot{

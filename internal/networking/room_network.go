@@ -21,6 +21,7 @@ const (
 	defaultDiscoveryRetryInitial = 250 * time.Millisecond
 	defaultDiscoveryRetryMax     = 30 * time.Second
 	maxDiscoveryErrorLength      = 1024
+	portMappingCleanupTimeout    = 5 * time.Second
 )
 
 var carrierGradeNATPrefix = netip.MustParsePrefix("100.64.0.0/10")
@@ -74,6 +75,7 @@ type RoomNetwork struct {
 	discoveryMax      time.Duration
 	tracker           roomTracker
 	portMapper        portmap.Mapper
+	ipv6PortMapper    portmap.Mapper
 	initializationErr error
 
 	mu           sync.RWMutex
@@ -87,6 +89,125 @@ type discoveryEvent struct {
 	err     error
 }
 
+type portMappingEvent struct {
+	lane  int
+	state *portmap.State
+	err   error
+}
+
+type portMappingLane struct {
+	family  string
+	mapper  portmap.Mapper
+	cancel  context.CancelFunc
+	started bool
+	mapping *portmap.Mapping
+	err     string
+}
+
+type portMappingLanes struct {
+	lanes  [2]portMappingLane
+	events chan portMappingEvent
+}
+
+func newPortMappingLanes(ipv4, ipv6 portmap.Mapper) *portMappingLanes {
+	return &portMappingLanes{
+		lanes: [2]portMappingLane{
+			{family: "ipv4", mapper: ipv4},
+			{family: "ipv6", mapper: ipv6},
+		},
+		events: make(chan portMappingEvent, 8),
+	}
+}
+
+func (m *portMappingLanes) startAvailable(ctx context.Context, snapshot endpoint.Snapshot) {
+	for index := range m.lanes {
+		lane := &m.lanes[index]
+		internalPort := portMappingInternalPort(snapshot, lane.family)
+		if lane.mapper == nil || lane.started || internalPort == 0 {
+			continue
+		}
+		mapperCtx, cancel := context.WithCancel(ctx)
+		lane.cancel = cancel
+		lane.started = true
+		go runPortMappingLane(mapperCtx, index, lane.mapper, internalPort, m.events)
+	}
+}
+
+func runPortMappingLane(ctx context.Context, lane int, mapper portmap.Mapper, internalPort uint16, events chan<- portMappingEvent) {
+	states := make(chan portmap.State, 4)
+	result := make(chan error, 1)
+	go func() { result <- mapper.Run(ctx, internalPort, states) }()
+	for {
+		select {
+		case state := <-states:
+			events <- portMappingEvent{lane: lane, state: &state}
+		case err := <-result:
+			events <- portMappingEvent{lane: lane, err: err}
+			return
+		}
+	}
+}
+
+func (m *portMappingLanes) apply(event portMappingEvent) error {
+	lane := &m.lanes[event.lane]
+	if event.state != nil {
+		lane.err = event.state.Error
+		lane.mapping = event.state.Mapping
+		return nil
+	}
+	lane.cancel = nil
+	lane.mapping = nil
+	if event.err == nil {
+		event.err = errors.New("port mapper stopped unexpectedly")
+	}
+	lane.err = event.err.Error()
+	return event.err
+}
+
+func (m *portMappingLanes) project(snapshot endpoint.Snapshot) endpoint.Snapshot {
+	return withPortMappings(snapshot, m.lanes[0].mapping, m.lanes[1].mapping)
+}
+
+func (m *portMappingLanes) errorText() string {
+	errors := make([]string, 0, len(m.lanes))
+	for _, lane := range m.lanes {
+		if lane.err != "" {
+			errors = append(errors, lane.family+": "+lane.err)
+		}
+	}
+	return strings.Join(errors, "; ")
+}
+
+func (m *portMappingLanes) stop() error {
+	pending := 0
+	for index := range m.lanes {
+		lane := &m.lanes[index]
+		if lane.cancel != nil {
+			lane.cancel()
+			lane.mapping = nil
+			pending++
+		}
+	}
+	if pending == 0 {
+		return nil
+	}
+	timer := time.NewTimer(portMappingCleanupTimeout)
+	defer timer.Stop()
+	for pending > 0 {
+		select {
+		case event := <-m.events:
+			if event.state != nil {
+				continue
+			}
+			m.lanes[event.lane].cancel = nil
+			pending--
+		case <-timer.C:
+			return errors.New("timed out cleaning up port mappings")
+		}
+	}
+	return nil
+}
+
 func NewRoomNetwork(roomTag [16]byte, trackerHash [20]byte, trackerIdentity [32]byte, options Options, logger *slog.Logger) *RoomNetwork {
 	if logger == nil {
 		logger = slog.Default()
@@ -98,6 +219,7 @@ func NewRoomNetwork(roomTag [16]byte, trackerHash [20]byte, trackerIdentity [32]
 	}
 	if options.EnablePortMapping {
 		network.portMapper = portmap.NewGateway(logger)
+		network.ipv6PortMapper = portmap.NewIPv6PCP(logger)
 	}
 	return network
 }
@@ -139,47 +261,25 @@ func (n *RoomNetwork) Run(parent context.Context) error {
 		trackerChanges = n.tracker.StatusChanges()
 		n.updateSnapshot(func(snapshot *RoomSnapshot) { snapshot.Tracker = n.tracker.Snapshot() })
 	}
-	var portMapResult chan error
-	var portMapStates <-chan portmap.State
-	var portMapCancel context.CancelFunc
-	portMapperFinished := false
-	var currentMapping *portmap.Mapping
-	applyMapping := func(mapping *portmap.Mapping, mappingError string) {
-		if mapping == nil {
-			currentMapping = nil
-		} else {
-			copy := *mapping
-			currentMapping = &copy
-		}
-		projectedEndpoint := withPortMapping(n.endpoint.Snapshot(), currentMapping)
+	portMappings := newPortMappingLanes(n.portMapper, n.ipv6PortMapper)
+	applyPortMappings := func() {
+		projectedEndpoint := portMappings.project(n.endpoint.Snapshot())
 		n.updateSnapshot(func(snapshot *RoomSnapshot) {
 			snapshot.Endpoint = projectedEndpoint
-			snapshot.PortMappingError = mappingError
+			snapshot.PortMappingError = portMappings.errorText()
 		})
 		if n.tracker != nil {
 			n.tracker.UpdateCandidates(trackerAnnounceCandidates(projectedEndpoint))
 		}
 	}
 	finish := func(runErr error) error {
-		if portMapCancel != nil && !portMapperFinished {
-			portMapCancel()
-			cleanupDeadline := time.After(5 * time.Second)
-			for !portMapperFinished {
-				select {
-				case <-portMapStates:
-				case <-portMapResult:
-					portMapperFinished = true
-				case <-cleanupDeadline:
-					portMapperFinished = true
-					cleanupErr := errors.New("timed out cleaning up port mapping")
-					n.logger.Warn("port mapper cleanup timed out", "error", cleanupErr)
-					runErr = errors.Join(runErr, cleanupErr)
-				}
-			}
+		hadPortMapping := portMappings.lanes[0].mapping != nil || portMappings.lanes[1].mapping != nil
+		if cleanupErr := portMappings.stop(); cleanupErr != nil {
+			n.logger.Warn("port mapper cleanup timed out", "error", cleanupErr)
+			runErr = errors.Join(runErr, cleanupErr)
 		}
-		if currentMapping != nil {
-			currentMapping = nil
-			projectedEndpoint := withPortMapping(n.endpoint.Snapshot(), nil)
+		if hadPortMapping {
+			projectedEndpoint := portMappings.project(n.endpoint.Snapshot())
 			n.updateSnapshot(func(snapshot *RoomSnapshot) {
 				snapshot.Endpoint = projectedEndpoint
 			})
@@ -217,7 +317,7 @@ func (n *RoomNetwork) Run(parent context.Context) error {
 				continue
 			}
 			endpointSnapshot := n.endpoint.Snapshot()
-			projectedEndpoint := withPortMapping(endpointSnapshot, currentMapping)
+			projectedEndpoint := portMappings.project(endpointSnapshot)
 			n.updateSnapshot(func(current *RoomSnapshot) {
 				current.Endpoint = projectedEndpoint
 			})
@@ -231,17 +331,7 @@ func (n *RoomNetwork) Run(parent context.Context) error {
 					go func() { result <- n.tracker.Run(trackerCtx, n.discovered) }()
 				}
 			}
-			if n.portMapper != nil && portMapResult == nil && !portMapperFinished && endpointSnapshot.ListenAddress != "" {
-				if internalPort := portMappingInternalPort(endpointSnapshot); internalPort != 0 {
-					states := make(chan portmap.State, 4)
-					result := make(chan error, 1)
-					portMapStates = states
-					portMapResult = result
-					mapperCtx, stopMapper := context.WithCancel(ctx)
-					portMapCancel = stopMapper
-					go func() { result <- n.portMapper.Run(mapperCtx, internalPort, states) }()
-				}
-			}
+			portMappings.startAvailable(ctx, endpointSnapshot)
 			if discoveryEvents == nil && endpointSnapshot.ListenAddress != "" {
 				listenAddress, err := netip.ParseAddrPort(endpointSnapshot.ListenAddress)
 				if err != nil {
@@ -287,19 +377,11 @@ func (n *RoomNetwork) Run(parent context.Context) error {
 				continue
 			}
 			n.updateSnapshot(func(snapshot *RoomSnapshot) { snapshot.Tracker = n.tracker.Snapshot() })
-		case state := <-portMapStates:
-			applyMapping(state.Mapping, state.Error)
-		case err := <-portMapResult:
-			portMapperFinished = true
-			portMapResult = nil
-			portMapStates = nil
-			if ctx.Err() == nil {
-				if err == nil {
-					err = errors.New("port mapper stopped unexpectedly")
-				}
-				n.logger.Warn("port mapper stopped", "error", err)
-				applyMapping(nil, err.Error())
+		case event := <-portMappings.events:
+			if err := portMappings.apply(event); err != nil {
+				n.logger.Warn("port mapper stopped", "family", portMappings.lanes[event.lane].family, "error", err)
 			}
+			applyPortMappings()
 		case err := <-endpointResult:
 			endpointResult = nil
 			if ctx.Err() != nil {
@@ -316,13 +398,13 @@ func (n *RoomNetwork) Run(parent context.Context) error {
 	}
 }
 
-func portMappingInternalPort(snapshot endpoint.Snapshot) uint16 {
+func portMappingInternalPort(snapshot endpoint.Snapshot, family string) uint16 {
 	listenAddress, err := netip.ParseAddrPort(snapshot.ListenAddress)
 	if err != nil || listenAddress.Port() == 0 || !listenAddress.Addr().IsUnspecified() {
 		return 0
 	}
 	for _, candidate := range snapshot.Candidates {
-		if candidate.Type != endpoint.CandidateNIC || candidate.Family != "ipv4" {
+		if candidate.Type != endpoint.CandidateNIC || candidate.Family != family {
 			continue
 		}
 		address, err := netip.ParseAddrPort(candidate.Address)
@@ -409,16 +491,23 @@ func usablePublicTrackerAddress(address netip.Addr) bool {
 		!carrierGradeNATPrefix.Contains(address)
 }
 
-func withPortMapping(snapshot endpoint.Snapshot, mapping *portmap.Mapping) endpoint.Snapshot {
-	if mapping == nil || !mapping.ExternalAddress.IsValid() || mapping.ExternalAddress.Port() == 0 {
-		return snapshot
+func withPortMappings(snapshot endpoint.Snapshot, mappings ...*portmap.Mapping) endpoint.Snapshot {
+	snapshot.Candidates = snapshot.Candidates[:len(snapshot.Candidates):len(snapshot.Candidates)]
+	for _, mapping := range mappings {
+		if mapping == nil || !mapping.ExternalAddress.IsValid() || mapping.ExternalAddress.Port() == 0 {
+			continue
+		}
+		family := "ipv6"
+		if mapping.ExternalAddress.Addr().Unmap().Is4() {
+			family = "ipv4"
+		}
+		snapshot.Candidates = append(snapshot.Candidates, endpoint.Candidate{
+			Type:    endpoint.CandidatePortMapped,
+			Address: mapping.ExternalAddress.String(),
+			Family:  family,
+			Source:  mapping.Provider,
+		})
 	}
-	snapshot.Candidates = append(snapshot.Candidates[:len(snapshot.Candidates):len(snapshot.Candidates)], endpoint.Candidate{
-		Type:    endpoint.CandidatePortMapped,
-		Address: mapping.ExternalAddress.String(),
-		Family:  "ipv4",
-		Source:  mapping.Provider,
-	})
 	return snapshot
 }
 

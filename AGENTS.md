@@ -7,7 +7,7 @@
 
 ### 环境要求
 
-- Go 1.25 或更高版本
+- Go 1.26.2 或更高版本
 - Node.js、npm 和 GNU Make
 - Wails v2 CLI
 - 支持 cgo 的原生 C 工具链

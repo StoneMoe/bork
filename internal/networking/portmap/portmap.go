@@ -56,7 +56,8 @@ type State struct {
 	RetryAfter time.Time
 }
 
-// Mapper maintains one UDP port mapping until its context is canceled.
+// Mapper maintains one UDP port mapping until its context is canceled. It
+// sends complete snapshots but does not close the caller-owned state channel.
 type Mapper interface {
 	Run(context.Context, uint16, chan<- State) error
 }

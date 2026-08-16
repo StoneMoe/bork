@@ -38,18 +38,32 @@ type Gateway struct {
 
 var _ Mapper = (*Gateway)(nil)
 
-// NewGateway creates a mapper that tries PCP, NAT-PMP, and UPnP in order.
+// NewGateway creates an IPv4 mapper that tries PCP, NAT-PMP, and UPnP in order.
 func NewGateway(logger *slog.Logger) Mapper {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	return newGateway([]mapperProvider{
+		{name: providerPCP, mapper: NewPCP(logger)},
+		{name: providerNATPMP, mapper: NewNATPMP(logger)},
+		{name: "UPnP", mapper: NewUPnP(logger)},
+	})
+}
+
+// NewIPv6PCP creates an IPv6 PCP mapper. RFC 7723 places the well-known
+// anycast address after the default router list, so the existing Gateway
+// lifecycle can provide that ordered failover without combining mappings.
+func NewIPv6PCP(logger *slog.Logger) Mapper {
+	return newGateway([]mapperProvider{
+		{name: "PCP IPv6 default gateway", mapper: newPCP(logger, discoverIPv6PCPGateway)},
+		{name: "PCP IPv6 anycast", mapper: newPCP(logger, discoverIPv6PCPAnycast)},
+	})
+}
+
+func newGateway(providers []mapperProvider) Mapper {
 	return &Gateway{
-		providers: []mapperProvider{
-			{name: providerPCP, mapper: NewPCP(logger)},
-			{name: providerNATPMP, mapper: NewNATPMP(logger)},
-			{name: "UPnP", mapper: NewUPnP(logger)},
-		},
-		wait: waitContext,
+		providers: providers,
+		wait:      waitContext,
 		timing: gatewayTiming{
 			retryInitial: defaultRetryInitial,
 			retryMaximum: defaultRetryMaximum,
