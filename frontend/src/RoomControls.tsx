@@ -706,7 +706,7 @@ function FileShareIcon() {
   );
 }
 
-function MicrophoneIcon(props: { muted: boolean }) {
+export function MicrophoneIcon(props: { muted: boolean }) {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <rect x="9" y="3" width="6" height="11" rx="3" />
@@ -716,7 +716,7 @@ function MicrophoneIcon(props: { muted: boolean }) {
   );
 }
 
-function SpeakerIcon(props: { muted: boolean }) {
+export function SpeakerIcon(props: { muted: boolean }) {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M11 5 6.5 9H3v6h3.5l4.5 4z" />

@@ -1,6 +1,10 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import * as Backend from "@wailsjs/go/app/App";
+import { MicrophoneIcon, SpeakerIcon } from "./RoomControls";
+import Select, { type SelectOption } from "./Select";
 import type { ActionProps, AppState, Candidate, PushToTalkPreference, TrackerStatus } from "./types";
+
+type ThemePreference = "system" | "dark" | "light";
 
 interface SettingsProps extends ActionProps {
   state: AppState;
@@ -8,6 +12,8 @@ interface SettingsProps extends ActionProps {
   pushToTalk: PushToTalkPreference;
   configurePushToTalk: (enabled: boolean, code: string) => Promise<boolean>;
 }
+
+const themeStorageKey = "bork.theme";
 
 const settingsTabs = [
   { id: "device", label: "我" },
@@ -35,8 +41,19 @@ function formatPushToTalkKey(code: string) {
   return code;
 }
 
+function audioDeviceOptions(devices: readonly { id: string; name: string; isDefault: boolean }[]): SelectOption[] {
+  return [
+    { value: "", label: "系统默认" },
+    ...devices.map((device) => ({ value: device.id, label: `${device.name}${device.isDefault ? "（默认）" : ""}` })),
+  ];
+}
+
 export default function Settings(props: SettingsProps) {
+  const initialTheme = document.documentElement.dataset.theme;
   const [activeTab, setActiveTab] = createSignal<SettingsTab>("device");
+  const [theme, setTheme] = createSignal<ThemePreference>(
+    initialTheme === "dark" || initialTheme === "light" ? initialTheme : "system",
+  );
   const tabButtons: Partial<Record<SettingsTab, HTMLButtonElement>> = {};
   let settingsDrawer: HTMLElement | undefined;
   const audio = () => props.state.audio;
@@ -73,6 +90,16 @@ export default function Settings(props: SettingsProps) {
   async function saveNickname() {
     if (nickname() === props.state.nickname) return;
     if (!await props.runAction(() => Backend.SetNickname(nickname()))) setNickname(props.state.nickname);
+  }
+
+  function updateTheme(next: ThemePreference) {
+    setTheme(next);
+    if (next === "system") delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = next;
+    try {
+      if (next === "system") localStorage.removeItem(themeStorageKey);
+      else localStorage.setItem(themeStorageKey, next);
+    } catch { /* storage unavailable */ }
   }
 
   function moveTab(event: KeyboardEvent, index: number) {
@@ -166,37 +193,39 @@ export default function Settings(props: SettingsProps) {
               onClick={() => props.runAction(Backend.RefreshAudioDevices)}
             >刷新</button>
           </div>
-          <label class="audio-device-field">
-            <span>麦克风</span>
-            <select
-              value={audio().captureDeviceId}
-              disabled={props.busy || !props.ready || props.state.audio.running}
-              onChange={(event) => props.runAction(() => Backend.SetAudioDevices(event.currentTarget.value, audio().playbackDeviceId))}
-            >
-              <option value="">系统默认</option>
-              <For each={audio().captureDevices}>{(device) => (
-                <option value={device.id}>{device.name}{device.isDefault ? "（默认）" : ""}</option>
-              )}</For>
-            </select>
-          </label>
-          <label class="audio-device-field">
-            <span>扬声器</span>
-            <select
+          <div class="audio-device-field audio-device-row">
+            <span id="playback-device-label" class="audio-device-icon">
+              <SpeakerIcon muted={false} />
+              <span class="visually-hidden">扬声器</span>
+            </span>
+            <Select
+              id="playback-device-select"
               value={audio().playbackDeviceId}
+              options={audioDeviceOptions(audio().playbackDevices)}
+              labelledBy="playback-device-label"
               disabled={props.busy || !props.ready || props.state.audio.running}
-              onChange={(event) => props.runAction(() => Backend.SetAudioDevices(audio().captureDeviceId, event.currentTarget.value))}
-            >
-              <option value="">系统默认</option>
-              <For each={audio().playbackDevices}>{(device) => (
-                <option value={device.id}>{device.name}{device.isDefault ? "（默认）" : ""}</option>
-              )}</For>
-            </select>
-          </label>
+              onChange={(value) => void props.runAction(() => Backend.SetAudioDevices(audio().captureDeviceId, value))}
+            />
+          </div>
+          <div class="audio-device-field audio-device-row">
+            <span id="capture-device-label" class="audio-device-icon">
+              <MicrophoneIcon muted={false} />
+              <span class="visually-hidden">麦克风</span>
+            </span>
+            <Select
+              id="capture-device-select"
+              value={audio().captureDeviceId}
+              options={audioDeviceOptions(audio().captureDevices)}
+              labelledBy="capture-device-label"
+              disabled={props.busy || !props.ready || props.state.audio.running}
+              onChange={(value) => void props.runAction(() => Backend.SetAudioDevices(value, audio().playbackDeviceId))}
+            />
+          </div>
           <div class="audio-toggles">
             <label class="setting-row audio-toggle">
               <span>
                 <strong>按键说话</strong>
-                <small>按住设定按键时发送麦克风声音。</small>
+                <small>按下指定的快捷键才启用麦克风</small>
               </span>
               <input
                 type="checkbox"
@@ -209,33 +238,35 @@ export default function Settings(props: SettingsProps) {
                 }}
               />
             </label>
-            <div class="setting-row audio-toggle">
-              <span>
-                <strong>首选说话按键</strong>
-                <small>请设定一个非修饰键；系统可能要求确认，全局监听仅在房间内注册。</small>
-              </span>
-              <button
-                class="push-to-talk-key-button"
-                type="button"
-                disabled={props.busy || !props.ready}
-                aria-label={capturingPushToTalkKey() ? "请按一个按键，按 Escape 取消" : `说话按键 ${formatPushToTalkKey(props.pushToTalk.code)}，点击更改`}
-                title={capturingPushToTalkKey() ? "按 Escape 取消" : "更改说话按键"}
-                onClick={() => setCapturingPushToTalkKey(true)}
-                onKeyDown={capturePushToTalkKey}
-                onBlur={() => setCapturingPushToTalkKey(false)}
-              >
-                <Show when={!capturingPushToTalkKey()} fallback={<span>请按键…</span>}>
-                  <kbd>{formatPushToTalkKey(props.pushToTalk.code)}</kbd>
-                </Show>
-              </button>
-              <span class="visually-hidden" role="status" aria-live="polite">
-                {capturingPushToTalkKey() ? "请按一个非修饰键，按 Escape 取消" : ""}
-              </span>
-            </div>
+            <Show when={props.pushToTalk.enabled}>
+              <div class="setting-row audio-toggle">
+                <span>
+                  <strong>说话键</strong>
+                  <small>为按键说话设置一个快捷键</small>
+                </span>
+                <button
+                  class="push-to-talk-key-button"
+                  type="button"
+                  disabled={props.busy || !props.ready}
+                  aria-label={capturingPushToTalkKey() ? "请按一个按键，按 Escape 取消" : `说话按键 ${formatPushToTalkKey(props.pushToTalk.code)}，点击更改`}
+                  title={capturingPushToTalkKey() ? "按 Escape 取消" : "更改说话按键"}
+                  onClick={() => setCapturingPushToTalkKey(true)}
+                  onKeyDown={capturePushToTalkKey}
+                  onBlur={() => setCapturingPushToTalkKey(false)}
+                >
+                  <Show when={!capturingPushToTalkKey()} fallback={<span>请按键…</span>}>
+                    <kbd>{formatPushToTalkKey(props.pushToTalk.code)}</kbd>
+                  </Show>
+                </button>
+                <span class="visually-hidden" role="status" aria-live="polite">
+                  {capturingPushToTalkKey() ? "请按一个非修饰键，按 Escape 取消" : ""}
+                </span>
+              </div>
+            </Show>
             <label class="setting-row audio-toggle">
               <span>
                 <strong>回声消除</strong>
-                <small>减少扬声器声音被麦克风再次收录。</small>
+                <small>减少扬声器声音被麦克风再次收录的可能性</small>
               </span>
               <input
                 type="checkbox"
@@ -251,7 +282,7 @@ export default function Settings(props: SettingsProps) {
             <label class="setting-row audio-toggle">
               <span>
                 <strong>智能降噪</strong>
-                <small>降低键盘、风扇等持续背景噪声。</small>
+                <small>抑制键盘、风扇等常见背景噪声</small>
               </span>
               <input
                 type="checkbox"
@@ -267,7 +298,7 @@ export default function Settings(props: SettingsProps) {
             <label class="setting-row audio-toggle">
               <span>
                 <strong>响度平衡</strong>
-                <small>自动平衡不同成员的播放响度。</small>
+                <small>自动平衡不同成员的音量大小</small>
               </span>
               <input
                 type="checkbox"
@@ -310,7 +341,14 @@ export default function Settings(props: SettingsProps) {
               onChange={() => void saveNickname()}
               onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}
             />
-            <small>修改后自动保存并对其他成员可见。</small>
+          </div>
+          <div class="audio-device-field">
+            <span id="theme-label">界面主题</span>
+            <div class="theme-button-group" role="group" aria-labelledby="theme-label">
+              <button type="button" aria-pressed={theme() === "system"} onClick={() => updateTheme("system")}>跟随系统</button>
+              <button type="button" aria-pressed={theme() === "dark"} onClick={() => updateTheme("dark")}>深黑</button>
+              <button type="button" aria-pressed={theme() === "light"} onClick={() => updateTheme("light")}>浅灰</button>
+            </div>
           </div>
           </section>
           <section
