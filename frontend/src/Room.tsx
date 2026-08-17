@@ -74,10 +74,12 @@ export default function Room(props: RoomProps) {
 
   const remotePeers = () => props.state.room?.remotePeers ?? [];
   const remoteSharers = () => remotePeers().filter((peer) => peer.screenSharing);
+  const selectedRemoteSharer = () => remoteSharers().find((candidate) => candidate.peerId === selectedSharer()) ?? remoteSharers()[0];
   const selectedSharerName = () => {
-    const peer = remoteSharers().find((candidate) => candidate.peerId === selectedSharer()) ?? remoteSharers()[0];
+    const peer = selectedRemoteSharer();
     return peer?.nickname || peer?.peerId.slice(0, 14) || "房间成员";
   };
+  const remoteVideoInterrupted = () => remoteVideoRecovering() || selectedRemoteSharer()?.connected === false;
   let previousPeerCount = remotePeers().length;
   const keepScreenStageOnTop = (event: Event) => {
     if (!nativePopoverSupported || event.target === screenStage || (event as ToggleEvent).newState !== "open") return;
@@ -677,9 +679,9 @@ export default function Room(props: RoomProps) {
                     role="img"
                     aria-label={`${selectedSharerName()}分享的屏幕`}
                   />
-                  <Show when={!remoteVideoReady() || remoteVideoRecovering()}>
+                  <Show when={!remoteVideoReady() || remoteVideoInterrupted()}>
                     <p class="screen-video-status" role="status">
-                      {remoteVideoRecovering() ? "画面中断，正在恢复…" : "正在接收画面…"}
+                      {remoteVideoInterrupted() ? "画面中断，正在恢复…" : "正在接收画面…"}
                     </p>
                   </Show>
                   <figcaption class="screen-sharer">

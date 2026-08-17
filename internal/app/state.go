@@ -22,6 +22,7 @@ type RemotePeer struct {
 	SessionID        string `json:"sessionId"`
 	RTTMillis        int64  `json:"rttMillis"`
 	Transport        string `json:"transport"`
+	Connected        bool   `json:"connected"`
 	ScreenSharing    bool   `json:"screenSharing"`
 	ScreenGeneration uint64 `json:"screenGeneration"`
 	ScreenStreamID   string `json:"screenStreamId"`
@@ -93,7 +94,7 @@ func projectRemotePeer(remotePeer peer.RemotePeerSnapshot) RemotePeer {
 	return RemotePeer{
 		PeerID: remotePeer.PeerID, Nickname: remotePeer.Nickname, Muted: remotePeer.Muted, PlaybackMuted: remotePeer.PlaybackMuted,
 		Address: remotePeer.Address, SessionID: remotePeer.SessionID,
-		RTTMillis: remotePeer.RTTMillis, Transport: remotePeer.Transport,
+		RTTMillis: remotePeer.RTTMillis, Transport: remotePeer.Transport, Connected: remotePeer.Connected,
 		ScreenSharing: remotePeer.ScreenSharing, ScreenGeneration: remotePeer.ScreenGeneration, ScreenStreamID: remotePeer.ScreenStreamID,
 	}
 }

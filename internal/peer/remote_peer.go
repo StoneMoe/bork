@@ -14,6 +14,7 @@ type RemotePeerSnapshot struct {
 	SessionID        string
 	RTTMillis        int64
 	Transport        string
+	Connected        bool
 	Nickname         string
 	Muted            bool
 	PlaybackMuted    bool

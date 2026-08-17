@@ -99,7 +99,8 @@ func (c *Client) handleRoomDatagram(packet endpoint.Datagram, mediaPort media.Pe
 	if remote == nil || remote.activeSession == nil || !remote.activeSession.authenticated {
 		return
 	}
-	if !c.authenticatedDirectSource(packet.From) {
+	sourceSession := c.authenticatedDirectSession(packet.From)
+	if sourceSession == nil {
 		return
 	}
 	if header.Class == protocol.TrafficAudio && (remote.activeSession.audioStreamID == ([16]byte{}) || remote.activeSession.audioStreamID != header.StreamID) {
@@ -159,6 +160,11 @@ func (c *Client) handleRoomDatagram(packet endpoint.Datagram, mediaPort media.Pe
 	if now.IsZero() {
 		now = time.Now()
 	}
+	// Forwarded datagrams keep the original sender's signature, so only the
+	// authenticated direct session at the UDP source address is kept alive.
+	if now.After(sourceSession.lastAuthenticatedPacketAt) {
+		sourceSession.lastAuthenticatedPacketAt = now
+	}
 	state.lastSeen = now
 	if header.Class == protocol.TrafficInteractive {
 		complete := c.acceptScreenVideoFragment(key, decoded.Timestamp, fragment, packet.Data, now)
@@ -198,13 +204,13 @@ func (c *Client) audioStreamTopologyReady() bool {
 	return true
 }
 
-func (c *Client) authenticatedDirectSource(address netip.AddrPort) bool {
+func (c *Client) authenticatedDirectSession(address netip.AddrPort) *PeeringSession {
 	for _, peer := range c.remotePeers {
 		if peer.activeSession != nil && peer.activeSession.authenticated && peer.activeSession.path.IsDirect() && peer.activeSession.path.Address() == address {
-			return true
+			return peer.activeSession
 		}
 	}
-	return false
+	return nil
 }
 
 func (c *Client) expireRoomDatagramStreams(now time.Time) {

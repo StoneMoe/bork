@@ -35,6 +35,7 @@ type roomNetwork interface {
 	AudioPackets() <-chan endpoint.Datagram
 	InteractivePackets() <-chan endpoint.Datagram
 	EnqueueControl([]byte, netip.AddrPort) error
+	WriteControl(context.Context, []byte, netip.AddrPort) error
 	EnqueueBackground([]byte, netip.AddrPort) error
 	SendRealtimeBatch(endpoint.RealtimeBatch) error
 	InvalidateRealtime(uint64)
@@ -185,10 +186,12 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	c.applyDesiredMemberState()
 
 	ctx, cancel := context.WithCancel(parent)
+	networkCtx, stopNetwork := context.WithCancel(context.WithoutCancel(parent))
 	c.fileContext = ctx
 	defer func() {
 		c.stopFileTransfers()
 		cancel()
+		stopNetwork()
 		c.fileWorkers.Wait()
 		c.discardFileWorkResults()
 	}()
@@ -204,7 +207,7 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	}()
 
 	networkResult := make(chan error, 1)
-	go func() { networkResult <- roomNetwork.Run(ctx) }()
+	go func() { networkResult <- roomNetwork.Run(networkCtx) }()
 	networkChanges := roomNetwork.StateChanges()
 	discoveredPeers := roomNetwork.DiscoveredPeers()
 	controlPackets := roomNetwork.ControlPackets()
@@ -338,6 +341,8 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 			c.applyNetworkSnapshot(roomNetwork.Snapshot())
 			return err
 		case <-ctx.Done():
+			c.sendLeaves()
+			stopNetwork()
 			<-networkResult
 			return nil
 		}

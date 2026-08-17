@@ -12,7 +12,7 @@ const (
 
 	MaxReliableFragments       = 1024
 	reliablePlaintextFixedSize = 2 + 1 + 8 + 8 + 2 + 2 + 8 + 8
-	MaxReliablePayload         = MaxBridgeInnerSize - establishedHeaderSize - reliablePlaintextFixedSize - aeadTagSize
+	MaxReliablePayload         = MaxBridgeInnerSize - sessionHeaderSize - reliablePlaintextFixedSize - aeadTagSize
 )
 
 type ReliablePacket struct {
@@ -54,8 +54,8 @@ func MarshalReliable(roomTag, sessionID [16]byte, packetSequence uint64, p Relia
 		return nil, err
 	}
 
-	packet := make([]byte, 0, establishedHeaderSize+reliablePlaintextFixedSize+len(p.Payload)+aeadTagSize)
-	packet = appendEstablishedHeader(packet, PacketReliable, roomTag, sessionID, packetSequence)
+	packet := make([]byte, 0, sessionHeaderSize+reliablePlaintextFixedSize+len(p.Payload)+aeadTagSize)
+	packet = appendSessionHeader(packet, PacketReliable, roomTag, sessionID, packetSequence)
 	var fixed [reliablePlaintextFixedSize]byte
 	binary.BigEndian.PutUint16(fixed[0:2], p.Channel)
 	fixed[2] = p.Flags
@@ -67,25 +67,25 @@ func MarshalReliable(roomTag, sessionID [16]byte, packetSequence uint64, p Relia
 	binary.BigEndian.PutUint64(fixed[31:39], p.AckBitmap)
 	packet = append(packet, fixed[:]...)
 	packet = append(packet, p.Payload...)
-	body := packet[establishedHeaderSize:]
-	sealed := protector.Seal(body[:0], establishedNonce(packet), body, packet[:establishedHeaderSize])
-	return packet[:establishedHeaderSize+len(sealed)], nil
+	body := packet[sessionHeaderSize:]
+	sealed := protector.Seal(body[:0], sessionNonce(packet), body, packet[:sessionHeaderSize])
+	return packet[:sessionHeaderSize+len(sealed)], nil
 }
 
 func ParseReliable(packet []byte, expectedRoomTag, expectedSessionID [16]byte, protector cipher.AEAD) (ReliablePacket, error) {
-	minimumSize := establishedHeaderSize + reliablePlaintextFixedSize + aeadTagSize
+	minimumSize := sessionHeaderSize + reliablePlaintextFixedSize + aeadTagSize
 	if len(packet) < minimumSize || len(packet) > MaxBridgeInnerSize {
 		return ReliablePacket{}, errors.New("reliable packet length is invalid")
 	}
 	if !validPairwiseCipher(protector) {
 		return ReliablePacket{}, errors.New("reliable packet protector is invalid")
 	}
-	header, err := ParseEstablishedHeader(packet)
+	header, err := ParseSessionHeader(packet)
 	if err != nil || header.Type != PacketReliable || header.RoomTag != expectedRoomTag || header.SessionID != expectedSessionID {
 		return ReliablePacket{}, errors.New("reliable packet header is invalid")
 	}
-	body := packet[establishedHeaderSize:]
-	opened, err := protector.Open(body[:0], establishedNonce(packet), body, packet[:establishedHeaderSize])
+	body := packet[sessionHeaderSize:]
+	opened, err := protector.Open(body[:0], sessionNonce(packet), body, packet[:sessionHeaderSize])
 	if err != nil || len(opened) < reliablePlaintextFixedSize {
 		return ReliablePacket{}, errors.New("reliable packet authentication failed")
 	}

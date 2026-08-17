@@ -8,8 +8,8 @@ import (
 
 const (
 	bridgeBodyFixedSize = 32 + 32 + 2
-	MaxBridgeInnerSize  = MaxDatagramSize - establishedHeaderSize - aeadTagSize - bridgeBodyFixedSize
-	bridgeMinPacketSize = establishedHeaderSize + aeadTagSize + bridgeBodyFixedSize + controlPacketSize
+	MaxBridgeInnerSize  = MaxDatagramSize - sessionHeaderSize - aeadTagSize - bridgeBodyFixedSize
+	bridgeMinPacketSize = sessionHeaderSize + aeadTagSize + bridgeBodyFixedSize + controlPacketSize
 )
 
 type BridgePacket struct {
@@ -34,7 +34,7 @@ func MarshalBridge(roomTag, sessionID [16]byte, sequence uint64, origin, target 
 	}
 
 	packet := make([]byte, 0, MaxDatagramSize)
-	packet = appendEstablishedHeader(packet, PacketBridgeControl, roomTag, sessionID, sequence)
+	packet = appendSessionHeader(packet, PacketBridgeControl, roomTag, sessionID, sequence)
 	packet = append(packet, origin[:]...)
 	packet = append(packet, target[:]...)
 	innerLength := uint16(len(inner))
@@ -43,9 +43,9 @@ func MarshalBridge(roomTag, sessionID [16]byte, sequence uint64, origin, target 
 	}
 	packet = binary.BigEndian.AppendUint16(packet, innerLength)
 	packet = append(packet, inner...)
-	body := packet[establishedHeaderSize:]
-	sealed := protector.Seal(body[:0], establishedNonce(packet), body, packet[:establishedHeaderSize])
-	return packet[:establishedHeaderSize+len(sealed)], nil
+	body := packet[sessionHeaderSize:]
+	sealed := protector.Seal(body[:0], sessionNonce(packet), body, packet[:sessionHeaderSize])
+	return packet[:sessionHeaderSize+len(sealed)], nil
 }
 
 func ParseBridge(packet []byte, expectedRoomTag, expectedSessionID [16]byte, protector cipher.AEAD) (BridgePacket, error) {
@@ -55,12 +55,12 @@ func ParseBridge(packet []byte, expectedRoomTag, expectedSessionID [16]byte, pro
 	if !validPairwiseCipher(protector) {
 		return BridgePacket{}, errors.New("bridge packet protector is invalid")
 	}
-	header, err := ParseEstablishedHeader(packet)
+	header, err := ParseSessionHeader(packet)
 	if err != nil || header.Type != PacketBridgeControl || header.RoomTag != expectedRoomTag || header.SessionID != expectedSessionID {
 		return BridgePacket{}, errors.New("bridge packet header is invalid")
 	}
-	body := packet[establishedHeaderSize:]
-	opened, err := protector.Open(body[:0], establishedNonce(packet), body, packet[:establishedHeaderSize])
+	body := packet[sessionHeaderSize:]
+	opened, err := protector.Open(body[:0], sessionNonce(packet), body, packet[:sessionHeaderSize])
 	if err != nil || len(opened) < bridgeBodyFixedSize {
 		return BridgePacket{}, errors.New("bridge packet authentication failed")
 	}
@@ -96,5 +96,5 @@ func validBridgeInner(inner []byte, roomTag [16]byte) bool {
 	if err != nil || innerRoomTag != roomTag || !ValidPacketSize(packetType, len(inner)) {
 		return false
 	}
-	return packetType == PacketHello || packetType == PacketPing || packetType == PacketPong || packetType == PacketReliable
+	return packetType == PacketHello || packetType == PacketPing || packetType == PacketPong || packetType == PacketReliable || packetType == PacketLeave
 }

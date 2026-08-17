@@ -148,7 +148,7 @@ func (e *Endpoint) classifyRoomPacket(packet []byte) packetClass {
 		case protocol.TrafficInteractive:
 			return packetInteractive
 		}
-	case protocol.PacketHello, protocol.PacketPing, protocol.PacketPong:
+	case protocol.PacketHello, protocol.PacketPing, protocol.PacketPong, protocol.PacketLeave:
 		return packetControl
 	case protocol.PacketReliable:
 		return packetReliable
@@ -178,6 +178,24 @@ func (e *Endpoint) InteractivePackets() <-chan Datagram { return e.interactivePa
 // the kernel write because peer control paths must not inherit socket latency.
 func (e *Endpoint) EnqueueControl(data []byte, destination netip.AddrPort) error {
 	return e.enqueuePeerDatagram(data, destination, e.controlWrites, "control")
+}
+
+// WriteControl waits until a control datagram reaches the UDP socket. Graceful
+// room shutdown uses it before stopping the shared endpoint.
+func (e *Endpoint) WriteControl(ctx context.Context, data []byte, destination netip.AddrPort) error {
+	if len(data) == 0 || len(data) > maxDatagramSize {
+		return fmt.Errorf("peer datagram must contain 1 to %d bytes", maxDatagramSize)
+	}
+	if !destination.IsValid() || destination.Port() == 0 {
+		return errors.New("peer datagram destination is invalid")
+	}
+	e.mu.RLock()
+	running := e.conn != nil && !e.closed
+	e.mu.RUnlock()
+	if !running {
+		return errors.New("UDP endpoint is not running")
+	}
+	return e.queueWrite(ctx, e.controlWrites, data, destination)
 }
 
 // EnqueueBackground admits low-priority peer data without blocking its owner.

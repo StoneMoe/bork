@@ -17,10 +17,11 @@ const (
 	PacketBridgeControl PacketType = 4
 	PacketRoomDatagram  PacketType = 5
 	PacketReliable      PacketType = 6
+	PacketLeave         PacketType = 7
 
-	prefixSize            = 4 + 1 + 16
-	establishedHeaderSize = prefixSize + 16 + 8
-	aeadTagSize           = 16
+	prefixSize        = 4 + 1 + 16
+	sessionHeaderSize = prefixSize + 16 + 8
+	aeadTagSize       = 16
 
 	helloBodySize   = 16 + 32 + 32
 	helloMACSize    = 32
@@ -28,7 +29,7 @@ const (
 	helloPacketSize = prefixSize + helloBodySize + helloMACSize + helloSigSize
 
 	controlPlaintextSize = 8
-	controlPacketSize    = establishedHeaderSize + controlPlaintextSize + aeadTagSize
+	controlPacketSize    = sessionHeaderSize + controlPlaintextSize + aeadTagSize
 
 	MaxDatagramSize = 1200
 
@@ -67,53 +68,53 @@ func ValidPacketSize(packetType PacketType, size int) bool {
 	switch packetType {
 	case PacketHello:
 		return size == helloPacketSize
-	case PacketPing, PacketPong:
+	case PacketPing, PacketPong, PacketLeave:
 		return size == controlPacketSize
 	case PacketBridgeControl:
 		return size >= bridgeMinPacketSize && size <= MaxDatagramSize
 	case PacketRoomDatagram:
 		return size >= roomDatagramMinPacketSize && size <= MaxDatagramSize
 	case PacketReliable:
-		return size >= establishedHeaderSize+reliablePlaintextFixedSize+aeadTagSize && size <= MaxBridgeInnerSize
+		return size >= sessionHeaderSize+reliablePlaintextFixedSize+aeadTagSize && size <= MaxBridgeInnerSize
 	default:
 		return false
 	}
 }
 
-type EstablishedHeader struct {
+type SessionHeader struct {
 	Type      PacketType
 	RoomTag   [16]byte
 	SessionID [16]byte
 	Sequence  uint64
 }
 
-func appendEstablishedHeader(destination []byte, packetType PacketType, roomTag, sessionID [16]byte, sequence uint64) []byte {
+func appendSessionHeader(destination []byte, packetType PacketType, roomTag, sessionID [16]byte, sequence uint64) []byte {
 	destination = appendPrefix(destination, packetType, roomTag)
 	destination = append(destination, sessionID[:]...)
 	return appendUint64(destination, sequence)
 }
 
-func ParseEstablishedHeader(packet []byte) (EstablishedHeader, error) {
-	if len(packet) < establishedHeaderSize {
-		return EstablishedHeader{}, errors.New("established packet is truncated")
+func ParseSessionHeader(packet []byte) (SessionHeader, error) {
+	if len(packet) < sessionHeaderSize {
+		return SessionHeader{}, errors.New("session packet is truncated")
 	}
 	packetType, roomTag, err := ParsePrefix(packet)
-	if err != nil || (packetType != PacketPing && packetType != PacketPong && packetType != PacketBridgeControl && packetType != PacketReliable) {
-		return EstablishedHeader{}, errors.New("established packet prefix is invalid")
+	if err != nil || (packetType != PacketPing && packetType != PacketPong && packetType != PacketBridgeControl && packetType != PacketReliable && packetType != PacketLeave) {
+		return SessionHeader{}, errors.New("session packet prefix is invalid")
 	}
-	var header EstablishedHeader
+	var header SessionHeader
 	header.Type = packetType
 	header.RoomTag = roomTag
 	copy(header.SessionID[:], packet[prefixSize:prefixSize+16])
-	header.Sequence = binary.BigEndian.Uint64(packet[prefixSize+16 : establishedHeaderSize])
+	header.Sequence = binary.BigEndian.Uint64(packet[prefixSize+16 : sessionHeaderSize])
 	if header.Sequence == 0 {
-		return EstablishedHeader{}, errors.New("established packet sequence is zero")
+		return SessionHeader{}, errors.New("session packet sequence is zero")
 	}
 	return header, nil
 }
 
-func establishedNonce(packet []byte) []byte {
-	return packet[establishedHeaderSize-12 : establishedHeaderSize]
+func sessionNonce(packet []byte) []byte {
+	return packet[sessionHeaderSize-12 : sessionHeaderSize]
 }
 
 func validPairwiseCipher(protector cipher.AEAD) bool {

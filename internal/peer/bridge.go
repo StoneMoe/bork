@@ -2,8 +2,10 @@ package peer
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"errors"
+	"net/netip"
 	"sort"
 	"time"
 
@@ -131,31 +133,53 @@ func (c *Client) sendPacketOnPath(path Path, inner []byte, background bool) erro
 		}
 		return c.roomNetwork.EnqueueControl(inner, path.Address())
 	}
-	origin := rawPeerIdentity(c.localIdentity.Identity)
-	if origin == ([32]byte{}) || path.Target() == ([32]byte{}) || path.Target() == origin || path.Intermediary() == origin {
-		return errors.New("bridge path endpoints are invalid")
-	}
-	intermediaryIdentity, err := identityFromRaw(path.Intermediary())
-	if err != nil {
-		return err
-	}
-	intermediary := c.remotePeers[intermediaryIdentity.PeerID()]
-	if intermediary == nil || intermediary.activeSession == nil || !intermediary.activeSession.authenticated || !intermediary.activeSession.path.IsDirect() {
-		return errors.New("bridge intermediary is unavailable")
-	}
-	adjacent := intermediary.activeSession
-	sequence, err := adjacent.control.nextSendSequence()
-	if err != nil {
-		return err
-	}
-	packet, err := protocol.MarshalBridge(c.roomTag, adjacent.sessionID, sequence, origin, path.Target(), background, inner, adjacent.ciphers.ControlSend)
+	packet, destination, err := c.bridgePacket(path, inner, background)
 	if err != nil {
 		return err
 	}
 	if background {
-		return c.roomNetwork.EnqueueBackground(packet, adjacent.path.Address())
+		return c.roomNetwork.EnqueueBackground(packet, destination)
 	}
-	return c.roomNetwork.EnqueueControl(packet, adjacent.path.Address())
+	return c.roomNetwork.EnqueueControl(packet, destination)
+}
+
+func (c *Client) writeControlOnPath(ctx context.Context, path Path, inner []byte) error {
+	if c.roomNetwork == nil || !path.IsValid() {
+		return errors.New("network path is unavailable")
+	}
+	if path.IsDirect() {
+		return c.roomNetwork.WriteControl(ctx, inner, path.Address())
+	}
+	packet, destination, err := c.bridgePacket(path, inner, false)
+	if err != nil {
+		return err
+	}
+	return c.roomNetwork.WriteControl(ctx, packet, destination)
+}
+
+func (c *Client) bridgePacket(path Path, inner []byte, background bool) ([]byte, netip.AddrPort, error) {
+	origin := rawPeerIdentity(c.localIdentity.Identity)
+	if origin == ([32]byte{}) || path.Target() == ([32]byte{}) || path.Target() == origin || path.Intermediary() == origin {
+		return nil, netip.AddrPort{}, errors.New("bridge path endpoints are invalid")
+	}
+	intermediaryIdentity, err := identityFromRaw(path.Intermediary())
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
+	intermediary := c.remotePeers[intermediaryIdentity.PeerID()]
+	if intermediary == nil || intermediary.activeSession == nil || !intermediary.activeSession.authenticated || !intermediary.activeSession.path.IsDirect() {
+		return nil, netip.AddrPort{}, errors.New("bridge intermediary is unavailable")
+	}
+	adjacent := intermediary.activeSession
+	sequence, err := adjacent.control.nextSendSequence()
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
+	packet, err := protocol.MarshalBridge(c.roomTag, adjacent.sessionID, sequence, origin, path.Target(), background, inner, adjacent.ciphers.ControlSend)
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
+	return packet, adjacent.path.Address(), nil
 }
 
 func (c *Client) handleBridgePacket(packet endpoint.Datagram) {
@@ -163,11 +187,11 @@ func (c *Client) handleBridgePacket(packet endpoint.Datagram) {
 	if err != nil {
 		return
 	}
-	header, err := protocol.ParseEstablishedHeader(packet.Data)
+	header, err := protocol.ParseSessionHeader(packet.Data)
 	if err != nil || header.RoomTag != c.roomTag || header.Type != protocol.PacketBridgeControl {
 		return
 	}
-	previous, adjacent, isPendingSession := c.sessionForControlHeader(header, outerPath)
+	previous, adjacent, isPendingSession := c.sessionForHeader(header, outerPath)
 	if adjacent == nil || isPendingSession || !adjacent.authenticated || !adjacent.path.IsDirect() || !adjacent.acceptsDataPath(outerPath) || !adjacent.control.mayReceive(header.Sequence) {
 		return
 	}
@@ -209,6 +233,8 @@ func (c *Client) handleBridgedInner(inner []byte, path Path, origin [32]byte) {
 		c.handleSessionPacketOnPath(inner, path)
 	case protocol.PacketReliable:
 		c.handleReliablePacketOnPath(inner, path)
+	case protocol.PacketLeave:
+		c.handleLeavePacketOnPath(inner, path)
 	}
 }
 

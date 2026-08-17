@@ -53,6 +53,7 @@ type roomEndpoint interface {
 	AudioPackets() <-chan endpoint.Datagram
 	InteractivePackets() <-chan endpoint.Datagram
 	EnqueueControl([]byte, netip.AddrPort) error
+	WriteControl(context.Context, []byte, netip.AddrPort) error
 	EnqueueBackground([]byte, netip.AddrPort) error
 	SendRealtimeBatch(endpoint.RealtimeBatch) error
 	InvalidateRealtime(uint64)
@@ -628,6 +629,10 @@ func (n *RoomNetwork) InteractivePackets() <-chan endpoint.Datagram {
 // EnqueueControl reports validation and queue admission, not the UDP write result.
 func (n *RoomNetwork) EnqueueControl(data []byte, destination netip.AddrPort) error {
 	return n.endpoint.EnqueueControl(data, destination)
+}
+
+func (n *RoomNetwork) WriteControl(ctx context.Context, data []byte, destination netip.AddrPort) error {
+	return n.endpoint.WriteControl(ctx, data, destination)
 }
 
 func (n *RoomNetwork) EnqueueBackground(data []byte, destination netip.AddrPort) error {

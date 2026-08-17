@@ -351,8 +351,8 @@ func (c *Client) handlePacket(packet endpoint.Datagram, mediaPort media.PeerPort
 	switch packetType {
 	case protocol.PacketHello:
 		c.handleHello(packet)
-	case protocol.PacketPing, protocol.PacketPong:
-		c.handleSessionPacket(packet)
+	case protocol.PacketPing, protocol.PacketPong, protocol.PacketLeave:
+		c.handleSessionControlPacket(packet, packetType)
 	case protocol.PacketReliable:
 		path, pathErr := NewPath(packet.From)
 		if pathErr == nil {
@@ -363,6 +363,18 @@ func (c *Client) handlePacket(packet endpoint.Datagram, mediaPort media.PeerPort
 	case protocol.PacketBridgeControl:
 		c.handleBridgePacket(packet)
 	}
+}
+
+func (c *Client) handleSessionControlPacket(packet endpoint.Datagram, packetType protocol.PacketType) {
+	path, err := NewPath(packet.From)
+	if err != nil {
+		return
+	}
+	if packetType == protocol.PacketLeave {
+		c.handleLeavePacketOnPath(packet.Data, path)
+		return
+	}
+	c.handleSessionPacketOnPath(packet.Data, path)
 }
 
 func (c *Client) sendReliable(now time.Time) {
@@ -422,11 +434,11 @@ func (c *Client) sendReliable(now time.Time) {
 }
 
 func (c *Client) handleReliablePacketOnPath(data []byte, path Path) {
-	header, err := protocol.ParseEstablishedHeader(data)
+	header, err := protocol.ParseSessionHeader(data)
 	if err != nil || header.Type != protocol.PacketReliable || header.RoomTag != c.roomTag {
 		return
 	}
-	sender, peerSess, isPendingSession := c.sessionForControlHeader(header, path)
+	sender, peerSess, isPendingSession := c.sessionForHeader(header, path)
 	if peerSess == nil || isPendingSession || !peerSess.authenticated || !peerSess.acceptsDataPath(path) || !peerSess.control.mayReceive(header.Sequence) {
 		return
 	}
@@ -566,20 +578,12 @@ func (c *Client) sendPingOnPath(peerSess *PeeringSession, path Path, pending *pe
 	}
 }
 
-func (c *Client) handleSessionPacket(packet endpoint.Datagram) {
-	packetPath, err := NewPath(packet.From)
-	if err != nil {
-		return
-	}
-	c.handleSessionPacketOnPath(packet.Data, packetPath)
-}
-
 func (c *Client) handleSessionPacketOnPath(data []byte, packetPath Path) {
-	header, err := protocol.ParseEstablishedHeader(data)
+	header, err := protocol.ParseSessionHeader(data)
 	if err != nil || (header.Type != protocol.PacketPing && header.Type != protocol.PacketPong) || header.RoomTag != c.roomTag {
 		return
 	}
-	remotePeer, peerSess, isPendingSession := c.sessionForControlHeader(header, packetPath)
+	remotePeer, peerSess, isPendingSession := c.sessionForHeader(header, packetPath)
 	if peerSess == nil || !peerSess.control.mayReceive(header.Sequence) {
 		return
 	}
@@ -671,7 +675,7 @@ func (c *Client) handleSessionPacketOnPath(data []byte, packetPath Path) {
 	}
 }
 
-func (c *Client) sessionForControlHeader(header protocol.EstablishedHeader, path Path) (*RemotePeer, *PeeringSession, bool) {
+func (c *Client) sessionForHeader(header protocol.SessionHeader, path Path) (*RemotePeer, *PeeringSession, bool) {
 	for _, peer := range c.remotePeers {
 		peerSess := peer.activeSession
 		if peerSess != nil && peerSess.sessionID == header.SessionID && peerSess.acceptsPath(path) {
@@ -692,6 +696,7 @@ func (c *Client) expireRemotePeers() {
 	cutoff := now.Add(-remotePeerTimeout)
 	failoverCutoff := now.Add(-pathFailoverTimeout)
 	changed := false
+	snapshotChanged := false
 	topologyChanged := false
 	for peerID, peer := range c.remotePeers {
 		activeSession := peer.activeSession
@@ -707,9 +712,11 @@ func (c *Client) expireRemotePeers() {
 				activeSession.pendingPing = pendingPing{}
 				activeSession.clearCandidatePath()
 				changed = true
+				snapshotChanged = true
 			}
 		}
 		if activeSession != nil && activeSession.lastAuthenticatedPacketAt.Before(cutoff) {
+			snapshotChanged = snapshotChanged || activeSession.everAuthenticated
 			peer.activeSession = nil
 			if peer.pendingSession == nil {
 				delete(c.remotePeers, peerID)
@@ -728,6 +735,8 @@ func (c *Client) expireRemotePeers() {
 	if changed {
 		c.markPeerGraphDirty(topologyChanged)
 		c.logger.Info("authenticated remote peers changed", "count", c.authenticatedRemotePeerCount())
+	}
+	if snapshotChanged {
 		c.publishStateChange()
 	}
 }
@@ -755,7 +764,7 @@ func (c *Client) remotePeerSnapshots() []RemotePeerSnapshot {
 	remotePeers := make([]RemotePeerSnapshot, 0, len(c.remotePeers))
 	for _, peer := range c.remotePeers {
 		activeSession := peer.activeSession
-		if activeSession == nil || !activeSession.authenticated {
+		if activeSession == nil || !activeSession.everAuthenticated {
 			continue
 		}
 		transport := "direct"
@@ -768,6 +777,7 @@ func (c *Client) remotePeerSnapshots() []RemotePeerSnapshot {
 			SessionID:        hex.EncodeToString(activeSession.sessionID[:]),
 			RTTMillis:        activeSession.rttMillis,
 			Transport:        transport,
+			Connected:        activeSession.authenticated,
 			Nickname:         activeSession.remoteMemberState.nickname,
 			Muted:            activeSession.remoteMemberState.muted,
 			PlaybackMuted:    activeSession.remoteMemberState.playbackMuted,

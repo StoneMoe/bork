@@ -2,6 +2,7 @@ package peer
 
 import (
 	"bytes"
+	"log/slog"
 	"net/netip"
 	"testing"
 	"time"
@@ -52,7 +53,7 @@ func TestExpireRemotePeersDropsStaleSessionRecord(t *testing.T) {
 			activeSession:  &PeeringSession{everAuthenticated: true, lastAuthenticatedPacketAt: stale},
 			pendingSession: freshPending,
 		},
-	}}
+	}, stateChanges: make(chan struct{}, 1)}
 
 	client.expireRemotePeers()
 
@@ -62,6 +63,35 @@ func TestExpireRemotePeersDropsStaleSessionRecord(t *testing.T) {
 	peer := client.remotePeers["pending"]
 	if peer == nil || peer.activeSession != nil || peer.pendingSession != freshPending {
 		t.Fatal("fresh pending session was not preserved")
+	}
+	select {
+	case <-client.stateChanges:
+	default:
+		t.Fatal("removing the visible stale session did not publish a state change")
+	}
+}
+
+func TestExpireRemotePeersKeepsVisiblePeerWhileReconnecting(t *testing.T) {
+	session := &PeeringSession{
+		authenticated:             true,
+		everAuthenticated:         true,
+		lastAuthenticatedPacketAt: time.Now().Add(-pathFailoverTimeout - time.Second),
+	}
+	client := &Client{
+		logger: slog.New(slog.DiscardHandler),
+		remotePeers: map[string]*RemotePeer{
+			"recovering": {activeSession: session},
+		},
+	}
+
+	client.expireRemotePeers()
+
+	if session.authenticated {
+		t.Fatal("stale transport remained authenticated")
+	}
+	snapshots := client.remotePeerSnapshots()
+	if len(snapshots) != 1 || snapshots[0].Connected {
+		t.Fatalf("reconnecting peer snapshot = %+v", snapshots)
 	}
 }
 

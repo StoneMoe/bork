@@ -128,8 +128,8 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
     screenSharing ? "分享屏幕" : "",
   ].filter(Boolean).join(" · ");
   const localStatus = () => memberStatus(props.state.audio.captureMuted, props.state.audio.playbackMuted, Boolean(props.state.room?.screenSharing)) || "在线";
-  const remoteStatus = (remotePeer: RemotePeer) => memberStatus(remotePeer.muted, remotePeer.playbackMuted, remotePeer.screenSharing) || "在线";
-  const remoteTransport = (remotePeer: RemotePeer) => remotePeer.transport === "bridge" ? "桥接" : "直连";
+  const remoteStatus = (remotePeer: RemotePeer) => remotePeer.connected ? memberStatus(remotePeer.muted, remotePeer.playbackMuted, remotePeer.screenSharing) || "在线" : "恢复连接中";
+  const remoteTransport = (remotePeer: RemotePeer) => !remotePeer.connected ? "恢复连接中" : remotePeer.transport === "bridge" ? "桥接" : "直连";
   const selectedRemote = () => props.remotePeers.find((peer) => peer.peerId === selectedMember());
   const memberInfoIsOpen = () => nativePopoverSupported ? nativePopoverOpen(memberInfoCard) : memberInfoOpen();
 
@@ -299,7 +299,9 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
               </span>
               <span class="member-network">
                 <strong class="member-connection" classList={{ bridge: peer().transport === "bridge" }}>{remoteTransport(peer())}</strong>
-                <small class="member-latency">{peer().rttMillis || 1} ms</small>
+                <Show when={peer().connected}>
+                  <small class="member-latency">{peer().rttMillis || 1} ms</small>
+                </Show>
               </span>
             </div>
           );
@@ -339,7 +341,7 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
           <div class="member-info-grid">
             <span><small>昵称</small><b>{remoteName(selectedRemote()!)}</b></span>
             <span><small>Session</small><code>{selectedRemote()!.sessionId || "未知"}</code></span>
-            <span><small>连接</small><b>{remoteTransport(selectedRemote()!)} · {selectedRemote()!.rttMillis || 1} ms</b></span>
+            <span><small>连接</small><b>{remoteTransport(selectedRemote()!)}{selectedRemote()!.connected ? ` · ${selectedRemote()!.rttMillis || 1} ms` : ""}</b></span>
             <span><small>{selectedRemote()!.transport === "bridge" ? "下一跳" : "远端地址"}</small><code>{selectedRemote()!.address}</code></span>
             <span><small>状态</small><b>{remoteStatus(selectedRemote()!)}</b></span>
           </div>
@@ -476,7 +478,7 @@ function FileSharePopover(props: {
             return (
               <button
                 type="button"
-                disabled={props.busy}
+                disabled={props.busy || !peer().connected}
                 onFocus={() => setFocusedRecipient(peerID)}
                 onBlur={() => queueMicrotask(() => {
                   if (!props.busy && focusedRecipient() === peerID) setFocusedRecipient("");
@@ -502,8 +504,8 @@ function FileSharePopover(props: {
                   });
                 }}
               >
-                <span><strong>{remoteName(peer())}</strong><small>{peer().transport === "bridge" ? "桥接" : "直连"} · {peer().rttMillis || 1} ms</small></span>
-                <b>选择文件</b>
+                <span><strong>{remoteName(peer())}</strong><small>{peer().connected ? `${peer().transport === "bridge" ? "桥接" : "直连"} · ${peer().rttMillis || 1} ms` : "恢复连接中"}</small></span>
+                <b>{peer().connected ? "选择文件" : "暂不可用"}</b>
               </button>
             );
           }}</For>
