@@ -5,6 +5,7 @@ import { EventsOn } from "@wailsjs/runtime/runtime";
 import type { AppState } from "./types";
 
 const emptyState = new app.AppSnapshot({
+  version: "dev",
   nickname: "",
   audio: {
     available: false,

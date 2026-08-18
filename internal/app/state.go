@@ -72,6 +72,7 @@ type AppError struct {
 }
 
 type AppSnapshot struct {
+	Version     string       `json:"version"`
 	Nickname    string       `json:"nickname"`
 	Room        *RoomState   `json:"room,omitempty"`
 	Audio       audio.Status `json:"audio"`

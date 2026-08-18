@@ -369,6 +369,10 @@ export default function Settings(props: SettingsProps) {
           hidden={activeTab() !== "network"}
         >
           <div class="diagnostic-section">
+            <div class="diagnostic-heading"><span>版本</span></div>
+            <code class="diagnostic-value">{props.state.version}</code>
+          </div>
+          <div class="diagnostic-section">
             <div class="diagnostic-heading"><span>本机端点</span></div>
             <Show when={diagnostics().listenAddress} fallback={
               <small class="empty-diagnostic">{props.state.room ? "正在打开本机 UDP 端点。" : "加入房间后打开 UDP 端点。"}</small>

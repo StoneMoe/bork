@@ -25,6 +25,8 @@ const (
 	audioRecoveryInterval = 2 * time.Second
 )
 
+var BuildVersion = "dev"
+
 type App struct {
 	config         config.AppConfig
 	logger         *slog.Logger
@@ -491,6 +493,7 @@ func (a *App) snapshot() AppSnapshot {
 	a.stateMu.RUnlock()
 
 	state := AppSnapshot{
+		Version:     BuildVersion,
 		Nickname:    nickname,
 		Audio:       emptyAudioStatus(),
 		Diagnostics: diagnostics,

@@ -3,7 +3,11 @@
 WAILS ?= wails
 WAILS_DIR := cmd/bork
 WAILS_CMD := cd $(WAILS_DIR) && $(WAILS)
-VERSION ?= $(shell node -p "require('./cmd/bork/wails.json').info.productVersion")
+ifndef VERSION
+COMMIT_HASH = $(shell git rev-parse --short=7 HEAD 2>/dev/null)
+VERSION = $(shell date +%Y%m%d)-$(COMMIT_HASH)
+CHECK_BUILD_VERSION = @test -n "$(COMMIT_HASH)" || (echo "Unable to determine the build version; run from a Git checkout or set VERSION" >&2; exit 1)
+endif
 PLATFORMS ?=
 TAGS ?=
 BUILD_FLAGS ?=
@@ -49,7 +53,8 @@ prepare-packaging:
 	cp frontend/packaging/darwin/Info.dev.plist build/darwin/Info.dev.plist
 
 build: prepare-packaging
-	$(WAILS_CMD) build -clean -trimpath -ldflags "-s -w -X main.version=$(VERSION)" $(PLATFORM_FLAGS) $(TAG_FLAGS) $(BUILD_FLAGS)
+	$(CHECK_BUILD_VERSION)
+	$(WAILS_CMD) build -clean -trimpath -ldflags "-s -w -X bork/internal/app.BuildVersion=$(VERSION)" $(PLATFORM_FLAGS) $(TAG_FLAGS) $(BUILD_FLAGS)
 
 dev: prepare-packaging
 	$(WAILS_CMD) dev $(TAG_FLAGS) $(DEV_FLAGS)

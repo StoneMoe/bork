@@ -13,8 +13,6 @@ import (
 	"bork/internal/webassets"
 )
 
-var version = "dev"
-
 func main() {
 	prepareConsole(os.Args[1:])
 	os.Exit(run(os.Args[1:]))
@@ -36,7 +34,7 @@ func run(args []string) int {
 		return 2
 	}
 	if *showVersion {
-		fmt.Printf("bork %s\n", version)
+		fmt.Printf("bork %s\n", app.BuildVersion)
 		return 0
 	}
 
