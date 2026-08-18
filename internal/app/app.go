@@ -20,7 +20,10 @@ import (
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-const stateCoalesceInterval = 50 * time.Millisecond
+const (
+	stateCoalesceInterval = 50 * time.Millisecond
+	audioRecoveryInterval = 2 * time.Second
+)
 
 type App struct {
 	config         config.AppConfig
@@ -241,15 +244,36 @@ func (a *App) startAudioWatcher(parent context.Context) {
 	a.stateMu.Unlock()
 	go func() {
 		defer close(done)
+		recovery := time.NewTicker(audioRecoveryInterval)
+		defer recovery.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-audioEngine.StatusChanges():
 				a.markStateChanged()
+			case <-recovery.C:
+				a.recoverAudioDevices(audioEngine)
 			}
 		}
 	}()
+}
+
+func (a *App) recoverAudioDevices(audioEngine *audio.Engine) {
+	a.commandMu.Lock()
+	defer a.commandMu.Unlock()
+	if a.isShuttingDown() || audioEngine.Status().Running {
+		return
+	}
+	a.stateMu.RLock()
+	room := a.room
+	a.stateMu.RUnlock()
+	if room == nil || room.stopping {
+		return
+	}
+	if err := a.syncAudioDevicesLocked(audioEngine, room); err != nil {
+		a.logger.Debug("recover voice audio", "error", err)
+	}
 }
 
 func (a *App) activateRoom(client *peer.Client) error {

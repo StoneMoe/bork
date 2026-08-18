@@ -534,7 +534,7 @@ func (a *App) SetAudioDevices(captureID, playbackID string) error {
 	return nil
 }
 
-func (a *App) RefreshAudioDevices() error {
+func (a *App) SyncAudioDevices() error {
 	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
@@ -557,16 +557,22 @@ func (a *App) RefreshAudioDevices() error {
 		ctx := a.appContext
 		a.stateMu.RUnlock()
 		a.startAudioWatcher(ctx)
-	}
-	if err = audioEngine.RefreshDevices(); err != nil {
-		return err
+		a.markStateChanged()
 	}
 	a.stateMu.RLock()
 	room := a.room
 	a.stateMu.RUnlock()
+	return a.syncAudioDevicesLocked(audioEngine, room)
+}
+
+// syncAudioDevicesLocked is shared by UI synchronization and automatic
+// recovery. Callers hold commandMu so device rebuilds cannot race room exit.
+func (a *App) syncAudioDevicesLocked(audioEngine *audio.Engine, room *roomSession) error {
+	if err := audioEngine.RefreshDevices(); err != nil {
+		return err
+	}
 	if room != nil {
 		a.reconcileAudioLocked(room)
 	}
-	a.markStateChanged()
 	return nil
 }

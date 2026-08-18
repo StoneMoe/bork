@@ -16,8 +16,8 @@ interface SettingsProps extends ActionProps {
 const themeStorageKey = "bork.theme";
 
 const settingsTabs = [
-  { id: "device", label: "我" },
   { id: "audio", label: "语音" },
+  { id: "device", label: "偏好" },
   { id: "network", label: "诊断" },
 ] as const;
 
@@ -50,7 +50,7 @@ function audioDeviceOptions(devices: readonly { id: string; name: string; isDefa
 
 export default function Settings(props: SettingsProps) {
   const initialTheme = document.documentElement.dataset.theme;
-  const [activeTab, setActiveTab] = createSignal<SettingsTab>("device");
+  const [activeTab, setActiveTab] = createSignal<SettingsTab>("audio");
   const [theme, setTheme] = createSignal<ThemePreference>(
     initialTheme === "dark" || initialTheme === "light" ? initialTheme : "system",
   );
@@ -85,7 +85,25 @@ export default function Settings(props: SettingsProps) {
   const [dismissedTrackerTooltip, setDismissedTrackerTooltip] = createSignal("");
   const clock = window.setInterval(() => setNow(Date.now()), 1000);
   onCleanup(() => window.clearInterval(clock));
-  onMount(() => tabButtons.device?.focus({ preventScroll: true }));
+  onMount(() => {
+    tabButtons.audio?.focus({ preventScroll: true });
+
+    let syncingAudioDevices = false;
+    const syncAudioDevices = async () => {
+      if (!props.ready || props.busy || syncingAudioDevices) return;
+      syncingAudioDevices = true;
+      try {
+        await Backend.SyncAudioDevices();
+      } catch {
+        // This background refresh is best effort; user actions still report their own errors.
+      } finally {
+        syncingAudioDevices = false;
+      }
+    };
+    void syncAudioDevices();
+    const deviceSync = window.setInterval(() => void syncAudioDevices(), 2000);
+    onCleanup(() => window.clearInterval(deviceSync));
+  });
 
   async function saveNickname() {
     if (nickname() === props.state.nickname) return;
@@ -185,14 +203,6 @@ export default function Settings(props: SettingsProps) {
           aria-labelledby="settings-tab-audio"
           hidden={activeTab() !== "audio"}
         >
-          <div class="settings-section-heading">
-            <button
-              class="section-action"
-              type="button"
-              disabled={props.busy || !props.ready || props.state.audio.running}
-              onClick={() => props.runAction(Backend.RefreshAudioDevices)}
-            >刷新</button>
-          </div>
           <div class="audio-device-field audio-device-row">
             <span id="playback-device-label" class="audio-device-icon">
               <SpeakerIcon muted={false} />
@@ -203,7 +213,7 @@ export default function Settings(props: SettingsProps) {
               value={audio().playbackDeviceId}
               options={audioDeviceOptions(audio().playbackDevices)}
               labelledBy="playback-device-label"
-              disabled={props.busy || !props.ready || props.state.audio.running}
+              disabled={props.busy || !props.ready}
               onChange={(value) => void props.runAction(() => Backend.SetAudioDevices(audio().captureDeviceId, value))}
             />
           </div>
@@ -217,7 +227,7 @@ export default function Settings(props: SettingsProps) {
               value={audio().captureDeviceId}
               options={audioDeviceOptions(audio().captureDevices)}
               labelledBy="capture-device-label"
-              disabled={props.busy || !props.ready || props.state.audio.running}
+              disabled={props.busy || !props.ready}
               onChange={(value) => void props.runAction(() => Backend.SetAudioDevices(value, audio().playbackDeviceId))}
             />
           </div>

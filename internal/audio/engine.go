@@ -19,10 +19,11 @@ import (
 )
 
 const (
-	captureQueueFrames  = 2
-	playbackQueueFrames = 2
-	voiceSendBudget     = 20 * time.Millisecond
-	maxPlaybackAge      = 100 * time.Millisecond
+	captureQueueFrames      = 2
+	playbackQueueFrames     = 2
+	voiceSendBudget         = 20 * time.Millisecond
+	maxPlaybackAge          = 100 * time.Millisecond
+	audioRerouteGracePeriod = 500 * time.Millisecond
 
 	peerJoinedNotification   = 1
 	peerLeftNotification     = 2
@@ -93,7 +94,7 @@ func New(options Options, logger *slog.Logger) (*Engine, error) {
 	engine.echoCancellation.Store(true)
 	engine.noiseSuppression.Store(true)
 	engine.remoteLoudnessNormalization.Store(true)
-	if err := engine.refreshDevicesLocked(); err != nil {
+	if _, err := engine.refreshDevicesLocked(); err != nil {
 		_ = audioContext.Uninit()
 		audioContext.Free()
 		return nil, err
@@ -128,41 +129,52 @@ func (e *Engine) RefreshDevices() error {
 	if e.closed {
 		return errors.New("audio engine is closed")
 	}
-	e.mu.RLock()
-	running := e.state.Running
-	e.mu.RUnlock()
-	if running {
-		return errors.New("stop voice before refreshing audio devices")
-	}
-	if err := e.refreshDevicesLocked(); err != nil {
+	selectionChanged, err := e.refreshDevicesLocked()
+	if err != nil {
 		return err
 	}
-	return nil
+	if e.run == nil {
+		return nil
+	}
+	e.mu.RLock()
+	available := e.state.Available
+	e.mu.RUnlock()
+	if !selectionChanged && available {
+		return nil
+	}
+	return e.rebuildRunLocked(e.run)
 }
 
-func (e *Engine) refreshDevicesLocked() error {
+func (e *Engine) refreshDevicesLocked() (bool, error) {
 	capture, err := enumerateDevices(e.context.Context, malgo.Capture)
 	if err != nil {
-		return fmt.Errorf("enumerate capture devices: %w", err)
+		return false, fmt.Errorf("enumerate capture devices: %w", err)
 	}
 	playback, err := enumerateDevices(e.context.Context, malgo.Playback)
 	if err != nil {
-		return fmt.Errorf("enumerate playback devices: %w", err)
+		return false, fmt.Errorf("enumerate playback devices: %w", err)
 	}
 	e.mu.Lock()
+	previousCaptureID := e.state.CaptureDeviceID
+	previousPlaybackID := e.state.PlaybackDeviceID
+	nextCaptureID := availableDeviceID(capture, previousCaptureID)
+	nextPlaybackID := availableDeviceID(playback, previousPlaybackID)
+	selectionChanged := previousCaptureID != nextCaptureID || previousPlaybackID != nextPlaybackID
+	available := len(capture) > 0 && len(playback) > 0
+	unchanged := e.state.CaptureDeviceID == nextCaptureID && e.state.PlaybackDeviceID == nextPlaybackID &&
+		e.state.Available == available && slices.Equal(e.state.CaptureDevices, capture) && slices.Equal(e.state.PlaybackDevices, playback)
+	if unchanged {
+		e.mu.Unlock()
+		return false, nil
+	}
 	e.state.CaptureDevices = capture
 	e.state.PlaybackDevices = playback
-	e.state.Available = len(capture) > 0 && len(playback) > 0
-	e.state.Error = ""
-	if !deviceExists(capture, e.state.CaptureDeviceID) {
-		e.state.CaptureDeviceID = ""
-	}
-	if !deviceExists(playback, e.state.PlaybackDeviceID) {
-		e.state.PlaybackDeviceID = ""
-	}
+	e.state.Available = available
+	e.state.CaptureDeviceID = nextCaptureID
+	e.state.PlaybackDeviceID = nextPlaybackID
 	e.mu.Unlock()
 	e.publish()
-	return nil
+	return selectionChanged, nil
 }
 
 func enumerateDevices(audioContext malgo.Context, kind malgo.DeviceType) ([]Device, error) {
@@ -193,29 +205,48 @@ func deviceExists(devices []Device, id string) bool {
 	return false
 }
 
+func availableDeviceID(devices []Device, selected string) string {
+	if deviceExists(devices, selected) {
+		return selected
+	}
+	return ""
+}
+
 func (e *Engine) SetDevices(captureID, playbackID string) error {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
 	if e.closed {
 		return errors.New("audio engine is closed")
 	}
+	e.mu.RLock()
+	if err := validateDeviceIDs(e.state.CaptureDevices, e.state.PlaybackDevices, captureID, playbackID); err != nil {
+		e.mu.RUnlock()
+		return err
+	}
+	unchanged := e.state.CaptureDeviceID == captureID && e.state.PlaybackDeviceID == playbackID
+	e.mu.RUnlock()
+	if unchanged {
+		return nil
+	}
+	run := e.run
 	e.mu.Lock()
-	if e.state.Running {
-		e.mu.Unlock()
-		return errors.New("stop voice before changing audio devices")
-	}
-	if !deviceExists(e.state.CaptureDevices, captureID) {
-		e.mu.Unlock()
-		return errors.New("capture device is unavailable")
-	}
-	if !deviceExists(e.state.PlaybackDevices, playbackID) {
-		e.mu.Unlock()
-		return errors.New("playback device is unavailable")
-	}
 	e.state.CaptureDeviceID = captureID
 	e.state.PlaybackDeviceID = playbackID
 	e.mu.Unlock()
-	e.publish()
+	if run == nil {
+		e.publish()
+		return nil
+	}
+	return e.rebuildRunLocked(run)
+}
+
+func validateDeviceIDs(capture, playback []Device, captureID, playbackID string) error {
+	if !deviceExists(capture, captureID) {
+		return errors.New("capture device is unavailable")
+	}
+	if !deviceExists(playback, playbackID) {
+		return errors.New("playback device is unavailable")
+	}
 	return nil
 }
 
@@ -376,6 +407,10 @@ func (e *Engine) SetNoiseSuppression(enabled bool) {
 func (e *Engine) Start(mediaPort media.AudioPort) error {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
+	return e.startLocked(mediaPort)
+}
+
+func (e *Engine) startLocked(mediaPort media.AudioPort) error {
 	if e.closed {
 		return errors.New("audio engine is closed")
 	}
@@ -735,21 +770,51 @@ func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrame
 
 func (e *Engine) watchDeviceStop(ctx context.Context, run *engineRun, stopped <-chan struct{}) {
 	defer close(run.monitorDone)
-	select {
-	case <-ctx.Done():
-		return
-	case <-stopped:
-		if ctx.Err() != nil {
+	for waitForDeviceStopCheck(ctx, stopped) {
+		e.opMu.Lock()
+		if e.closed || ctx.Err() != nil || e.run != run {
+			e.opMu.Unlock()
 			return
 		}
-	}
-	e.opMu.Lock()
-	defer e.opMu.Unlock()
-	if e.closed || ctx.Err() != nil || e.run != run {
+		// WASAPI reports a legacy Stop while miniaudio changes the system default
+		// device. Keep watching after a successful native reroute.
+		if run.device.IsStarted() {
+			e.opMu.Unlock()
+			continue
+		}
+		e.setRuntimeError(errors.New("audio device stopped unexpectedly"))
+		e.stopRunLocked(run)
+		e.opMu.Unlock()
 		return
 	}
-	e.setRuntimeError(errors.New("audio device stopped unexpectedly"))
+}
+
+func waitForDeviceStopCheck(ctx context.Context, stopped <-chan struct{}) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-stopped:
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(audioRerouteGracePeriod):
+		return true
+	}
+}
+
+// rebuildRunLocked keeps the room media port while rebuilding the native
+// duplex stream. Device selection and user audio settings live on Engine.
+func (e *Engine) rebuildRunLocked(run *engineRun) error {
+	mediaPort := run.port
 	e.stopRunLocked(run)
+	e.mu.RLock()
+	available := e.state.Available
+	e.mu.RUnlock()
+	if !available {
+		return nil
+	}
+	return e.startLocked(mediaPort)
 }
 
 func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFrameQueue, wake <-chan struct{}, demand *atomic.Uint64) {

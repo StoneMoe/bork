@@ -43,3 +43,19 @@ func TestCaptureMeter(t *testing.T) {
 		t.Fatalf("capture meter window = (%v, %v), want (%v, true)", level, ready, want)
 	}
 }
+
+func TestAvailableDeviceID(t *testing.T) {
+	devices := []Device{{ID: "capture-1"}}
+	for _, test := range []struct {
+		selected string
+		want     string
+	}{
+		{selected: "", want: ""},
+		{selected: "capture-1", want: "capture-1"},
+		{selected: "missing", want: ""},
+	} {
+		if got := availableDeviceID(devices, test.selected); got != test.want {
+			t.Fatalf("availableDeviceID(%q) = %q, want %q", test.selected, got, test.want)
+		}
+	}
+}

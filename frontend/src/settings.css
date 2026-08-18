@@ -58,27 +58,6 @@
 .settings-tab:focus-visible { outline-offset: -3px; }
 .settings-section { padding: 24px; }
 
-.settings-section-heading {
-  display: flex;
-  align-items: start;
-  justify-content: flex-end;
-}
-
-.section-action {
-  min-height: 30px;
-  border: 0;
-  border-radius: 6px;
-  padding: 0 8px;
-  color: var(--accent);
-  cursor: pointer;
-  background: transparent;
-  font: 600 11px/1 var(--font-ui);
-}
-
-.section-action:disabled { cursor: default; opacity: 0.4; }
-.section-action:hover:not(:disabled),
-.section-action:focus-visible { color: var(--accent-strong); background: rgba(var(--accent-rgb), 0.07); }
-
 .audio-device-field {
   display: grid;
   gap: 7px;
