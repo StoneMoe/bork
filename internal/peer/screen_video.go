@@ -31,6 +31,7 @@ const (
 	maxScreenVideoDurationMicros       = 1_000_000
 	maxScreenVideoTimestamp            = (1 << 53) - 1
 	screenVideoChunkTTL                = 750 * time.Millisecond
+	screenAudioSendBudget              = 20 * time.Millisecond
 	maxScreenVideoRetainedBytes        = 4 << 20
 	maxCompletedScreenVideoChunks      = 4
 	screenVideoFlagKeyFrame       byte = 1
@@ -49,7 +50,8 @@ type screenCommandKind byte
 
 const (
 	screenCommandStart screenCommandKind = iota + 1
-	screenCommandSend
+	screenCommandSendVideo
+	screenCommandSendAudio
 	screenCommandStop
 )
 
@@ -343,9 +345,17 @@ func (c *Client) SendScreenVideoChunk(timestamp uint64, duration uint32, keyFram
 		return false, errors.New("screen video chunk size is invalid")
 	}
 	result := c.requestScreenCommand(screenCommand{
-		kind: screenCommandSend, timestamp: timestamp, duration: duration, keyFrame: keyFrame, bytes: data, result: make(chan screenCommandResult, 1),
+		kind: screenCommandSendVideo, timestamp: timestamp, duration: duration, keyFrame: keyFrame, bytes: data, result: make(chan screenCommandResult, 1),
 	})
 	return result.sent, result.err
+}
+
+// SendScreenAudioFrame sends one 48 kHz mono, 10 ms raw Opus frame. Timestamp
+// is the frame's sample position and therefore advances by 480 per frame.
+func (c *Client) SendScreenAudioFrame(timestamp uint32, rawOpus []byte) error {
+	return c.requestScreenCommand(screenCommand{
+		kind: screenCommandSendAudio, timestamp: uint64(timestamp), bytes: rawOpus, result: make(chan screenCommandResult, 1),
+	}).err
 }
 
 func (c *Client) StopScreenShare() error {
@@ -379,8 +389,10 @@ func (c *Client) handleScreenCommand(command screenCommand) {
 	switch command.kind {
 	case screenCommandStart:
 		result.err = c.startScreenShare(command.codec, command.width, command.height)
-	case screenCommandSend:
+	case screenCommandSendVideo:
 		result.sent, result.err = c.sendScreenVideoChunk(command.timestamp, command.duration, command.keyFrame, command.bytes)
+	case screenCommandSendAudio:
+		result.err = c.sendScreenAudioFrame(uint32(command.timestamp), command.bytes)
 	case screenCommandStop:
 		result.err = c.stopScreenShare()
 	default:
@@ -413,7 +425,7 @@ func (c *Client) startScreenShare(codec string, width, height uint16) error {
 		width:      width,
 		height:     height,
 	}
-	c.screenVideoSendSequence = 0
+	c.screenMediaSendSequence = 0
 	c.screenVideoChunkID = 0
 	c.queueScreenStates()
 	c.publishStateChange()
@@ -428,7 +440,7 @@ func (c *Client) stopScreenShare() error {
 		return errors.New("screen state generation is exhausted")
 	}
 	c.localScreenState = screenState{generation: c.localScreenState.generation + 1}
-	c.screenVideoSendSequence = 0
+	c.screenMediaSendSequence = 0
 	c.screenVideoChunkID = 0
 	c.queueScreenStates()
 	c.publishStateChange()
@@ -484,16 +496,16 @@ func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFram
 		return false, err
 	}
 	c.queueScreenStates()
-	if c.screenVideoChunkID == math.MaxUint32 || uint64(len(fragments)) > math.MaxUint64-c.screenVideoSendSequence {
-		return false, errors.New("screen video stream sequence is exhausted")
+	if c.screenVideoChunkID == math.MaxUint32 || uint64(len(fragments)) > math.MaxUint64-c.screenMediaSendSequence {
+		return false, errors.New("screen media stream sequence is exhausted")
 	}
 	c.screenVideoChunkID++
 	packets := make([][]byte, 0, len(fragments))
 	for _, fragment := range fragments {
-		c.screenVideoSendSequence++
+		c.screenMediaSendSequence++
 		header := protocol.RoomDatagramHeader{
 			Class: protocol.TrafficInteractive, SenderID: c.roomDatagramSenderID,
-			StreamID: c.localScreenState.streamID, Sequence: c.screenVideoSendSequence,
+			StreamID: c.localScreenState.streamID, Sequence: c.screenMediaSendSequence,
 		}
 		packet, marshalErr := protocol.MarshalRoomDatagram(c.roomTag, header, c.screenVideoChunkID, fragment, c.roomDatagramProtector, c.localIdentity)
 		if marshalErr != nil {
@@ -502,6 +514,40 @@ func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFram
 		packets = append(packets, packet)
 	}
 	now := time.Now()
+	ready := c.screenMediaDestinations(now)
+	if len(ready) == 0 {
+		return true, nil
+	}
+	return c.sendRealtimePacketsToPeers(protocol.TrafficInteractive, packets, ready, now.Add(screenVideoChunkTTL), 0), nil
+}
+
+func (c *Client) sendScreenAudioFrame(timestamp uint32, rawOpus []byte) error {
+	if !c.localScreenState.active {
+		return errors.New("screen sharing is not active")
+	}
+	c.queueScreenStates()
+	if c.screenMediaSendSequence == math.MaxUint64 {
+		return errors.New("screen media stream sequence is exhausted")
+	}
+	c.screenMediaSendSequence++
+	header := protocol.RoomDatagramHeader{
+		Class: protocol.TrafficScreenAudio, SenderID: c.roomDatagramSenderID,
+		StreamID: c.localScreenState.streamID, Sequence: c.screenMediaSendSequence,
+	}
+	packet, err := protocol.MarshalRoomDatagram(c.roomTag, header, timestamp, rawOpus, c.roomDatagramProtector, c.localIdentity)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	ready := c.screenMediaDestinations(now)
+	if len(ready) == 0 {
+		return nil
+	}
+	c.sendRealtimePacketsToPeers(protocol.TrafficScreenAudio, [][]byte{packet}, ready, now.Add(screenAudioSendBudget), 0)
+	return nil
+}
+
+func (c *Client) screenMediaDestinations(now time.Time) []string {
 	c.refreshFanout(now)
 	destinations := c.fanout.destinations
 	if !c.fanoutReady(now) {
@@ -519,10 +565,7 @@ func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFram
 			ready = append(ready, peerID)
 		}
 	}
-	if len(ready) == 0 {
-		return false, nil
-	}
-	return c.sendRealtimePacketsToPeers(protocol.TrafficInteractive, packets, ready, now.Add(screenVideoChunkTTL), 0), nil
+	return ready
 }
 
 func (c *Client) acceptScreenVideoFragment(key roomDatagramStreamKey, chunkID uint32, fragment decodedScreenVideoFragment, packet []byte, now time.Time) *completedScreenVideoChunk {

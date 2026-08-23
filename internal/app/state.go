@@ -9,8 +9,10 @@ import (
 )
 
 const (
-	stateChangedEvent     = "bork:state-changed"
-	screenVideoChunkEvent = "bork:screen-video-chunk"
+	stateChangedEvent       = "bork:state-changed"
+	screenVideoChunkEvent   = "bork:screen-video-chunk"
+	screenPreviewChunkEvent = "bork:screen-preview-chunk"
+	screenPreviewEndedEvent = "bork:screen-preview-ended"
 )
 
 type RemotePeer struct {
@@ -64,6 +66,17 @@ type ScreenVideoChunkEvent struct {
 	Duration   uint32 `json:"duration"`
 	KeyFrame   bool   `json:"keyFrame"`
 	Bytes      []byte `json:"bytes"`
+}
+
+type ScreenPreviewChunkEvent struct {
+	CaptureID uint32 `json:"captureId"`
+	Codec     string `json:"codec"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+	Timestamp uint64 `json:"timestamp"`
+	Duration  uint32 `json:"duration"`
+	KeyFrame  bool   `json:"keyFrame"`
+	Bytes     []byte `json:"bytes"`
 }
 
 type AppError struct {

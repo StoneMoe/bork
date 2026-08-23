@@ -1,30 +1,73 @@
-import { For, Show, createEffect, createSignal, onCleanup } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import * as Backend from "@wailsjs/go/app/App";
+import type { screenshare } from "@wailsjs/go/models";
 import { EventsOn } from "@wailsjs/runtime/runtime";
 import { RoomControlRow, RoomMemberList } from "./RoomControls";
 import { nativePopoverOpen, nativePopoverSupported } from "./popover";
 import type { ActionProps, AppState, FriendlyStatus, PushToTalkPreference } from "./types";
 
 const screenVideoCodecs = ["avc1.42E01F", "avc1.4D401F"] as const;
-const screenVideoFrameRate = 15;
-const screenVideoFrameDuration = Math.round(1_000_000 / screenVideoFrameRate);
 const maxScreenVideoChunkBytes = 256 * 1024;
 const screenVideoCanvasOptions: CanvasRenderingContext2DSettings = { alpha: false, colorSpace: "srgb" };
-// Screen frames pass through an 8-bit sRGB canvas before H.264 encoding, so
-// receivers must not reuse HDR color metadata from the captured surface.
+// Native capture produces SDR H.264. Tell WebCodecs not to infer HDR metadata
+// from the display where the frame is rendered.
 const screenVideoColorSpace = {
   primaries: "bt709",
   transfer: "bt709",
   matrix: "bt709",
   fullRange: false,
 } satisfies VideoColorSpaceInit;
+const localScreenSharer = "local";
+const defaultScreenAspectRatio = 16 / 9;
 const screenViewportMargin = 8;
+const screenStageDefaultInset = 24;
 const screenStageMinWidth = 220;
-const screenStageDoubleMinWidth = 360;
 const screenStageMinHeight = 124;
 const screenResizeDirections = ["n", "ne", "e", "se", "s", "sw", "w", "nw"] as const;
 
 type ScreenResizeDirection = typeof screenResizeDirections[number];
+
+// Corner handles follow whichever pointer axis changes the size more. A side
+// handle centers the other axis, then shifts the stage to stay in the viewport.
+function resizedScreenWidth(direction: ScreenResizeDirection, bounds: DOMRect, deltaX: number, deltaY: number, aspectRatio: number) {
+  const horizontalChange = (direction.includes("e") ? 1 : direction.includes("w") ? -1 : 0) * deltaX;
+  const verticalChange = (direction.includes("s") ? 1 : direction.includes("n") ? -1 : 0) * deltaY * aspectRatio;
+  return bounds.width + (Math.abs(verticalChange) > Math.abs(horizontalChange) ? verticalChange : horizontalChange);
+}
+
+function availableScreenAxisSize(start: number, end: number, viewportSize: number, growsBefore: boolean, growsAfter: boolean) {
+  if (growsBefore) return end - screenViewportMargin;
+  if (growsAfter) return viewportSize - screenViewportMargin - start;
+  return viewportSize - screenViewportMargin * 2;
+}
+
+function resizedScreenAxisStart(start: number, end: number, size: number, viewportSize: number, growsBefore: boolean, growsAfter: boolean) {
+  if (growsBefore) return end - size;
+  if (growsAfter) return start;
+  return Math.min(
+    viewportSize - screenViewportMargin - size,
+    Math.max(screenViewportMargin, (start + end - size) / 2),
+  );
+}
+
+function resizedScreenStage(bounds: DOMRect, direction: ScreenResizeDirection, deltaX: number, deltaY: number, aspectRatio: number) {
+  const growsWest = direction.includes("w");
+  const growsEast = direction.includes("e");
+  const growsNorth = direction.includes("n");
+  const growsSouth = direction.includes("s");
+  const maxWidth = Math.max(1, Math.min(
+    availableScreenAxisSize(bounds.left, bounds.right, window.innerWidth, growsWest, growsEast),
+    availableScreenAxisSize(bounds.top, bounds.bottom, window.innerHeight, growsNorth, growsSouth) * aspectRatio,
+  ));
+  const minWidth = Math.min(maxWidth, Math.max(screenStageMinWidth, screenStageMinHeight * aspectRatio));
+  const width = Math.min(maxWidth, Math.max(minWidth, resizedScreenWidth(direction, bounds, deltaX, deltaY, aspectRatio)));
+  const height = width / aspectRatio;
+  return {
+    left: resizedScreenAxisStart(bounds.left, bounds.right, width, window.innerWidth, growsWest, growsEast),
+    top: resizedScreenAxisStart(bounds.top, bounds.bottom, height, window.innerHeight, growsNorth, growsSouth),
+    width,
+  };
+}
 
 interface RoomProps extends ActionProps {
   state: AppState;
@@ -40,21 +83,19 @@ interface RoomProps extends ActionProps {
 
 export default function Room(props: RoomProps) {
   const [captureBusy, setCaptureBusy] = createSignal(false);
-  const [localStream, setLocalStream] = createSignal<MediaStream>();
+  const [currentCaptureID, setCurrentCaptureID] = createSignal(0);
+  const [screenSources, setScreenSources] = createSignal<screenshare.Source[]>([]);
+  const [localVideoReady, setLocalVideoReady] = createSignal(false);
   const [selectedSharer, setSelectedSharer] = createSignal("");
+  const [screenAspectRatio, setScreenAspectRatio] = createSignal(defaultScreenAspectRatio);
   const [remoteVideoReady, setRemoteVideoReady] = createSignal(false);
   const [remoteVideoRecovering, setRemoteVideoRecovering] = createSignal(false);
-  const captureVideo = document.createElement("video");
-  const captureCanvas = document.createElement("canvas");
-  let displayStream: MediaStream | undefined;
-  let videoEncoder: VideoEncoder | undefined;
-  let currentCaptureID = 0;
   let captureRun = 0;
-  let captureTimer: number | undefined;
-  let captureTimestamp = 0;
-  let lastKeyframeTimestamp = Number.NEGATIVE_INFINITY;
-  let forceKeyframe = true;
-  let screenChunkSending = false;
+  let sourceDialog: HTMLDialogElement | undefined;
+  let localCanvas: HTMLCanvasElement | undefined;
+  let localDecoder: VideoDecoder | undefined;
+  let localNeedsKeyframe = true;
+  let pendingEndedCaptureID = 0;
   let remoteCanvas: HTMLCanvasElement | undefined;
   let remoteDecoder: VideoDecoder | undefined;
   let remoteDecoderSetup: Promise<void> | undefined;
@@ -63,6 +104,7 @@ export default function Room(props: RoomProps) {
   let remoteVideoRun = 0;
   let remoteNeedsKeyframe = true;
   let remoteLastChunkID = 0;
+  let screenAudioSourceUpdate = Promise.resolve();
   let screenStage: HTMLElement | undefined;
   const screenStageObserver = new ResizeObserver(() => {
     if (screenStage?.isConnected) clampScreenStage(screenStage);
@@ -73,13 +115,27 @@ export default function Room(props: RoomProps) {
   let roomPeersRegion: HTMLElement | undefined;
 
   const remotePeers = () => props.state.room?.remotePeers ?? [];
+  // Snapshot objects change for unrelated room state. Keep the capture
+  // transition tied to the screen-sharing bit itself.
+  const backendScreenSharing = createMemo(() => Boolean(props.state.room?.screenSharing));
+  const roomPeerID = createMemo(() => props.state.room?.peerId || "");
+  const localScreenSharing = () => currentCaptureID() > 0 || backendScreenSharing();
+  const monitorSources = () => screenSources().filter((source) => source.kind === "monitor");
+  const windowSources = () => screenSources().filter((source) => source.kind === "window");
   const remoteSharers = () => remotePeers().filter((peer) => peer.screenSharing);
-  const selectedRemoteSharer = () => remoteSharers().find((candidate) => candidate.peerId === selectedSharer()) ?? remoteSharers()[0];
+  const selectedLocalScreen = () => selectedSharer() === localScreenSharer;
+  const screenSharerIDs = () => [
+    ...(localScreenSharing() ? [localScreenSharer] : []),
+    ...remoteSharers().map((peer) => peer.peerId),
+  ];
+  const selectedRemoteSharer = () => remoteSharers().find((candidate) => candidate.peerId === selectedSharer());
   const selectedSharerName = () => {
+    if (selectedLocalScreen()) return "你";
     const peer = selectedRemoteSharer();
     return peer?.nickname || peer?.peerId.slice(0, 14) || "房间成员";
   };
-  const remoteVideoInterrupted = () => remoteVideoRecovering() || selectedRemoteSharer()?.connected === false;
+  const selectedVideoReady = () => selectedLocalScreen() ? localVideoReady() : remoteVideoReady();
+  const remoteVideoInterrupted = () => !selectedLocalScreen() && (remoteVideoRecovering() || selectedRemoteSharer()?.connected === false);
   let previousPeerCount = remotePeers().length;
   const keepScreenStageOnTop = (event: Event) => {
     if (!nativePopoverSupported || event.target === screenStage || (event as ToggleEvent).newState !== "open") return;
@@ -92,6 +148,7 @@ export default function Room(props: RoomProps) {
   };
   document.addEventListener("beforetoggle", keepScreenStageOnTop, true);
   props.registerLeaveAction(leaveRoom);
+  let previousLocalScreenSharing = backendScreenSharing();
 
   function focusRoomFallback() {
     queueMicrotask(() => {
@@ -115,10 +172,24 @@ export default function Room(props: RoomProps) {
     if (!selectedSharer()) selectSharer(chunk.peerId);
     if (selectedSharer() === chunk.peerId) void receiveScreenVideoChunk(chunk);
   });
+  const removeScreenPreviewListener = EventsOn("bork:screen-preview-chunk", (chunk: LocalScreenVideoChunkEvent) => {
+    if (chunk?.captureId !== currentCaptureID() || !validEncodedScreenVideo(chunk)) return;
+    if (!selectedSharer()) selectSharer(localScreenSharer);
+    if (selectedLocalScreen()) receiveLocalScreenVideoChunk(chunk);
+  });
+  const removeScreenPreviewEndedListener = EventsOn("bork:screen-preview-ended", (captureID: number) => {
+    if (!Number.isInteger(captureID) || captureID <= 0 || captureID > 0xffffffff) return;
+    if (captureID === currentCaptureID()) {
+      finishEndedScreenShare();
+    } else {
+      pendingEndedCaptureID = Math.max(pendingEndedCaptureID, captureID);
+    }
+  });
 
   createEffect(() => {
     const sharers = remoteSharers();
-    if (!sharers.some((peer) => peer.peerId === selectedSharer())) selectSharer(sharers[0]?.peerId || "");
+    const sharerIDs = screenSharerIDs();
+    if (!sharerIDs.includes(selectedSharer())) selectSharer(sharerIDs[0] || "");
     const selected = sharers.find((peer) => peer.peerId === selectedSharer());
     const streamIdentity = selected ? `${selected.peerId}:${selected.sessionId}:${selected.screenGeneration}:${selected.screenStreamId}` : "";
     if (streamIdentity !== selectedStreamIdentity) {
@@ -139,9 +210,21 @@ export default function Room(props: RoomProps) {
   });
 
   createEffect(() => {
+    const currentRoomPeerID = roomPeerID();
+    const selected = selectedSharer();
+    if (!currentRoomPeerID) return;
+    // Local preview audio is already excluded from playback. An empty source
+    // also silences screen audio while there is no selected share. Keep these
+    // calls in selection order because Wails dispatches backend calls in parallel.
+    screenAudioSourceUpdate = screenAudioSourceUpdate
+      .then(() => Backend.SetScreenAudioSource(currentRoomPeerID, selected === localScreenSharer ? "" : selected))
+      .catch(reportScreenError);
+  });
+
+  createEffect(() => {
     const peerCount = remotePeers().length;
     if (previousPeerCount > 0 && peerCount === 0) {
-      if (captureBusy() || displayStream || currentCaptureID || props.state.room?.screenSharing) void stopScreenShare(true);
+      if (captureBusy() || localScreenSharing()) void stopScreenShare(true);
       queueMicrotask(() => {
         const active = document.activeElement;
         if (!active || active === document.body || !active.isConnected) focusRoomFallback();
@@ -151,12 +234,25 @@ export default function Room(props: RoomProps) {
   });
 
   createEffect(() => {
-    if (!localStream() && remoteSharers().length === 0) props.exitScreenFullscreen();
+    const screenSharing = backendScreenSharing();
+    const captureID = currentCaptureID();
+    if (previousLocalScreenSharing && !screenSharing) {
+      setCurrentCaptureID(0);
+      resetLocalScreenVideo();
+    }
+    if (Boolean(captureID) === screenSharing) setCaptureBusy(false);
+    previousLocalScreenSharing = screenSharing;
+  });
+
+  createEffect(() => {
+    if (!localScreenSharing() && remoteSharers().length === 0) props.exitScreenFullscreen();
   });
 
   function selectSharer(peerID: string) {
     if (selectedSharer() === peerID) return;
+    resetLocalScreenVideo();
     resetRemoteScreenVideo();
+    setScreenAspectRatio(defaultScreenAspectRatio);
     setSelectedSharer(peerID);
   }
 
@@ -188,34 +284,13 @@ export default function Room(props: RoomProps) {
     stage.style.right = "auto";
     stage.style.bottom = "auto";
     stage.style.width = `${bounds.width}px`;
-    stage.style.height = `${bounds.height}px`;
     trackScreenStagePointer(event, "resizing", (next) => {
       const deltaX = next.clientX - event.clientX;
       const deltaY = next.clientY - event.clientY;
-      const minWidth = stage.classList.contains("single") ? screenStageMinWidth : screenStageDoubleMinWidth;
-      const minHeight = screenStageMinHeight;
-      let left = bounds.left;
-      let top = bounds.top;
-      let width = bounds.width;
-      let height = bounds.height;
-      if (direction.includes("e")) {
-        width = Math.min(window.innerWidth - screenViewportMargin, Math.max(bounds.left + minWidth, bounds.right + deltaX)) - bounds.left;
-      }
-      if (direction.includes("s")) {
-        height = Math.min(window.innerHeight - screenViewportMargin, Math.max(bounds.top + minHeight, bounds.bottom + deltaY)) - bounds.top;
-      }
-      if (direction.includes("w")) {
-        left = Math.max(screenViewportMargin, Math.min(bounds.right - minWidth, bounds.left + deltaX));
-        width = bounds.right - left;
-      }
-      if (direction.includes("n")) {
-        top = Math.max(screenViewportMargin, Math.min(bounds.bottom - minHeight, bounds.top + deltaY));
-        height = bounds.bottom - top;
-      }
-      stage.style.left = `${left}px`;
-      stage.style.top = `${top}px`;
-      stage.style.width = `${width}px`;
-      stage.style.height = `${height}px`;
+      const resized = resizedScreenStage(bounds, direction, deltaX, deltaY, screenAspectRatio());
+      stage.style.left = `${resized.left}px`;
+      stage.style.top = `${resized.top}px`;
+      stage.style.width = `${resized.width}px`;
     });
   }
 
@@ -254,15 +329,39 @@ export default function Room(props: RoomProps) {
   }
 
   function clampScreenStage(stage: HTMLElement) {
-    if (!stage.style.left || props.screenFullscreen) return;
+    if (props.screenFullscreen) return;
+    const aspectRatio = screenAspectRatio();
+    const maxWidth = Math.max(1, Math.min(
+      window.innerWidth - screenViewportMargin * 2,
+      (window.innerHeight - screenViewportMargin * 2) * aspectRatio,
+    ));
+    const minWidth = Math.min(maxWidth, Math.max(screenStageMinWidth, screenStageMinHeight * aspectRatio));
+    const currentWidth = stage.getBoundingClientRect().width;
+    const width = Math.min(maxWidth, Math.max(minWidth, currentWidth));
+    if (Math.abs(width - currentWidth) > 0.5) {
+      stage.style.width = `${width}px`;
+    }
+    const defaultPosition = !stage.style.left && !stage.style.top;
+    if (defaultPosition) {
+      const right = stage.offsetWidth + screenStageDefaultInset <= window.innerWidth - screenViewportMargin
+        ? screenStageDefaultInset : screenViewportMargin;
+      const bottom = stage.offsetHeight + screenStageDefaultInset <= window.innerHeight - screenViewportMargin
+        ? screenStageDefaultInset : screenViewportMargin;
+      stage.style.right = `${right}px`;
+      stage.style.bottom = `${bottom}px`;
+      return;
+    }
+    const bounds = stage.getBoundingClientRect();
     const left = Math.min(
       Math.max(screenViewportMargin, window.innerWidth - stage.offsetWidth - screenViewportMargin),
-      Math.max(screenViewportMargin, Number.parseFloat(stage.style.left)),
+      Math.max(screenViewportMargin, bounds.left),
     );
     const top = Math.min(
       Math.max(screenViewportMargin, window.innerHeight - stage.offsetHeight - screenViewportMargin),
-      Math.max(screenViewportMargin, Number.parseFloat(stage.style.top)),
+      Math.max(screenViewportMargin, bounds.top),
     );
+    stage.style.right = "auto";
+    stage.style.bottom = "auto";
     stage.style.left = `${left}px`;
     stage.style.top = `${top}px`;
   }
@@ -272,7 +371,11 @@ export default function Room(props: RoomProps) {
     props.exitScreenFullscreen();
     screenStageObserver.disconnect();
     document.removeEventListener("beforetoggle", keepScreenStageOnTop, true);
+    if (sourceDialog?.open) sourceDialog.close();
     removeScreenListener();
+    removeScreenPreviewListener();
+    removeScreenPreviewEndedListener();
+    resetLocalScreenVideo();
     resetRemoteScreenVideo();
     void stopScreenShare(false);
   });
@@ -282,181 +385,150 @@ export default function Room(props: RoomProps) {
     props.reportError(message.replace(/^Error:\s*/, ""));
   }
 
-  async function startScreenShare() {
-    if (captureBusy() || displayStream) return;
-    try {
-      requireScreenVideoAPIs(true);
-    } catch (cause) {
-      reportScreenError(cause);
-      return;
-    }
-    const getDisplayMedia = navigator.mediaDevices?.getDisplayMedia;
-    if (typeof getDisplayMedia !== "function") {
-      reportScreenError(new Error("当前系统 WebView 不支持屏幕捕获"));
-      return;
-    }
+  async function openScreenSourcePicker() {
+    if (captureBusy() || sourceDialog?.open) return;
     setCaptureBusy(true);
+    const run = ++captureRun;
+    try {
+      const sources = await Backend.ListScreenSources();
+      if (run !== captureRun) return;
+      if (sources.length === 0) throw new Error("没有可分享的窗口或显示器");
+      setScreenSources(sources);
+      sourceDialog?.showModal();
+    } catch (cause) {
+      if (run === captureRun) reportScreenError(cause);
+    } finally {
+      if (run === captureRun && !sourceDialog?.open) setCaptureBusy(false);
+    }
+  }
+
+  function closeScreenSourcePicker() {
+    setScreenSources([]);
+    setCaptureBusy(false);
+    if (sourceDialog?.open) sourceDialog.close();
+  }
+
+  async function startScreenShare(sourceID: string) {
+    if (!captureBusy() || !sourceDialog?.open) return;
+    sourceDialog.close();
+    focusRoomFallback();
+    setScreenSources([]);
+    resetLocalScreenVideo();
     const run = ++captureRun;
     let startedID = 0;
     try {
-      const stream = await getDisplayMedia.call(navigator.mediaDevices, {
-        video: { width: { max: 1280 }, height: { max: 720 }, frameRate: { ideal: screenVideoFrameRate, max: screenVideoFrameRate } },
-        audio: false,
-      });
-      if (run !== captureRun) {
-        stopTracks(stream);
-        return;
-      }
-      const track = stream.getVideoTracks()[0];
-      if (!track) throw new Error("屏幕捕获没有返回视频轨道");
-      displayStream = stream;
-      setLocalStream(stream);
-      track.addEventListener("ended", () => {
-        if (displayStream === stream) void stopScreenShare(true);
-      }, { once: true });
-      captureVideo.muted = true;
-      captureVideo.playsInline = true;
-      captureVideo.srcObject = stream;
-      await captureVideo.play();
-      if (run !== captureRun || displayStream !== stream) return;
-      const dimensions = screenVideoDimensions(captureVideo.videoWidth, captureVideo.videoHeight);
-      const config = await supportedScreenVideoConfig(dimensions.width, dimensions.height);
-      if (run !== captureRun || displayStream !== stream) return;
-      captureCanvas.width = dimensions.width;
-      captureCanvas.height = dimensions.height;
-      if (!captureCanvas.getContext("2d", screenVideoCanvasOptions)) throw new Error("当前 WebView 无法创建屏幕视频画布");
-      const encoder = new VideoEncoder({
-        output: (chunk) => sendEncodedScreenVideoChunk(run, chunk),
-        error: (cause) => failLocalScreenVideo(run, cause),
-      });
-      videoEncoder = encoder;
-      encoder.configure(config);
-      startedID = await Backend.StartScreenShare(config.codec, dimensions.width, dimensions.height);
+      startedID = await Backend.StartScreenShare(sourceID);
       if (!Number.isInteger(startedID) || startedID <= 0) throw new Error("后端没有创建屏幕捕获会话");
-      if (run !== captureRun || displayStream !== stream) {
+      if (run !== captureRun) {
         await Backend.StopScreenShare(startedID);
         return;
       }
-      currentCaptureID = startedID;
-      captureTimestamp = 0;
-      lastKeyframeTimestamp = Number.NEGATIVE_INFINITY;
-      forceKeyframe = true;
-      setCaptureBusy(false);
-      captureScreenVideoFrame(run, startedID);
+      if (pendingEndedCaptureID === startedID) {
+        finishEndedScreenShare();
+        return;
+      }
+      pendingEndedCaptureID = 0;
+      setCurrentCaptureID(startedID);
+      selectSharer(localScreenSharer);
     } catch (cause) {
       if (startedID) {
         try { await Backend.StopScreenShare(startedID); } catch { /* stale cleanup */ }
       }
       if (run === captureRun) {
-        clearLocalCapture();
+        clearLocalScreenShare();
         reportScreenError(cause);
       }
     }
   }
 
   async function stopScreenShare(reportBackendError: boolean) {
-    const captureID = currentCaptureID;
-    const backendShareActive = Boolean(props.state.room?.screenSharing);
+    const captureID = currentCaptureID();
+    const backendShareActive = backendScreenSharing();
     ++captureRun;
-    clearLocalCapture();
-    if (!captureID && !backendShareActive) return;
+    setCaptureBusy(true);
+    clearLocalScreenShare(false);
+    if (!captureID && !backendShareActive) {
+      setCaptureBusy(false);
+      return;
+    }
     try {
       await Backend.StopScreenShare(captureID);
     } catch (cause) {
-      if (captureID) currentCaptureID = captureID;
+      if (captureID && pendingEndedCaptureID !== captureID) setCurrentCaptureID(captureID);
+      setCaptureBusy(false);
       if (reportBackendError) reportScreenError(cause);
     }
   }
 
-  function clearLocalCapture() {
-    window.clearTimeout(captureTimer);
-    captureTimer = undefined;
-    currentCaptureID = 0;
-    const encoder = videoEncoder;
-    videoEncoder = undefined;
-    if (encoder && encoder.state !== "closed") {
-      try { encoder.close(); } catch { /* already failed */ }
-    }
-    screenChunkSending = false;
-    captureTimestamp = 0;
-    lastKeyframeTimestamp = Number.NEGATIVE_INFINITY;
-    forceKeyframe = true;
-    captureVideo.pause();
-    captureVideo.srcObject = null;
-    captureCanvas.width = 0;
-    captureCanvas.height = 0;
-    stopTracks(displayStream);
-    displayStream = undefined;
-    setLocalStream(undefined);
-    setCaptureBusy(false);
+  function clearLocalScreenShare(finishTransition = true) {
+    if (sourceDialog?.open) sourceDialog.close();
+    setScreenSources([]);
+    setCurrentCaptureID(0);
+    pendingEndedCaptureID = 0;
+    resetLocalScreenVideo();
+    if (finishTransition) setCaptureBusy(false);
   }
 
-  function captureScreenVideoFrame(run: number, captureID: number) {
-    const startedAt = performance.now();
+  function finishEndedScreenShare() {
+    clearLocalScreenShare(false);
+    // Keep the control disabled until the coalesced backend snapshot also says
+    // the share ended. This prevents a stale stop click during that short gap.
+    setCaptureBusy(backendScreenSharing());
+  }
+
+  function receiveLocalScreenVideoChunk(chunk: LocalScreenVideoChunkEvent) {
+    setScreenAspectRatio(chunk.width / chunk.height);
+    if (localNeedsKeyframe && !chunk.keyFrame) return;
     try {
-      if (run !== captureRun || captureID !== currentCaptureID || !displayStream) return;
-      const timestamp = captureTimestamp;
-      captureTimestamp += screenVideoFrameDuration;
-      const encoder = videoEncoder;
-      if (encoder?.state === "configured" && encoder.encodeQueueSize === 0 && !screenChunkSending) {
-        const context = captureCanvas.getContext("2d", screenVideoCanvasOptions);
-        if (!context) throw new Error("屏幕视频画布不可用");
-        context.drawImage(captureVideo, 0, 0, captureCanvas.width, captureCanvas.height);
-        const keyFrame = forceKeyframe || timestamp-lastKeyframeTimestamp >= 2_000_000;
-        const frame = new VideoFrame(captureCanvas, { timestamp, duration: screenVideoFrameDuration });
-        try {
-          encoder.encode(frame, { keyFrame });
-          if (keyFrame) {
-            forceKeyframe = false;
-            lastKeyframeTimestamp = timestamp;
-          }
-        } finally {
-          frame.close();
-        }
+      let decoder = localDecoder;
+      if (!decoder) {
+        if (typeof VideoDecoder !== "function" || typeof EncodedVideoChunk !== "function") return;
+        decoder = new VideoDecoder({
+          output: (frame) => renderLocalVideoFrame(frame, chunk.captureId, chunk.width, chunk.height),
+          error: () => resetLocalScreenVideo(false),
+        });
+        decoder.configure(screenVideoDecoderConfig(chunk));
+        localDecoder = decoder;
       }
-    } catch (cause) {
-      failLocalScreenVideo(run, cause);
-      return;
+      if (decoder.state !== "configured") return;
+      if (decoder.decodeQueueSize > 2) {
+        resetLocalScreenVideo(false);
+        return;
+      }
+      decoder.decode(encodedScreenVideoChunk(chunk));
+      if (chunk.keyFrame) localNeedsKeyframe = false;
+    } catch {
+      resetLocalScreenVideo(false);
     }
-    captureTimer = window.setTimeout(
-      () => captureScreenVideoFrame(run, captureID),
-      Math.max(0, 1000 / screenVideoFrameRate - (performance.now() - startedAt)),
-    );
   }
 
-  function sendEncodedScreenVideoChunk(run: number, chunk: EncodedVideoChunk) {
-    if (run !== captureRun || !currentCaptureID) return;
-    if (chunk.byteLength <= 0 || chunk.byteLength > maxScreenVideoChunkBytes) {
-      failLocalScreenVideo(run, new Error(`屏幕视频块超过 ${maxScreenVideoChunkBytes / 1024} KiB 限制`));
-      return;
+  function renderLocalVideoFrame(frame: VideoFrame, captureID: number, width: number, height: number) {
+    try {
+      if (captureID !== currentCaptureID() || !localCanvas) return;
+      drawScreenVideoFrame(frame, localCanvas, width, height);
+      setLocalVideoReady(true);
+    } catch {
+      resetLocalScreenVideo(false);
+    } finally {
+      frame.close();
     }
-    if (screenChunkSending) {
-      forceKeyframe = true;
-      return;
-    }
-    const duration = chunk.duration ?? screenVideoFrameDuration;
-    if (!Number.isSafeInteger(chunk.timestamp) || chunk.timestamp < 0 || !Number.isInteger(duration) || duration <= 0 || duration > 1_000_000) {
-      failLocalScreenVideo(run, new Error("屏幕视频编码器返回了无效时间戳"));
-      return;
-    }
-    const bytes = new Uint8Array(chunk.byteLength);
-    chunk.copyTo(bytes);
-    screenChunkSending = true;
-    void Backend.SendScreenVideoChunk(currentCaptureID, chunk.timestamp, duration, chunk.type === "key", bytesBase64(bytes))
-      .then((sent) => { if (!sent) forceKeyframe = true; })
-      .catch((cause) => failLocalScreenVideo(run, cause))
-      .finally(() => {
-        if (run === captureRun) screenChunkSending = false;
-      });
   }
 
-  function failLocalScreenVideo(run: number, cause: unknown) {
-    if (run !== captureRun) return;
-    reportScreenError(cause);
-    void stopScreenShare(false);
+  function resetLocalScreenVideo(clearFrame = true) {
+    const decoder = localDecoder;
+    localDecoder = undefined;
+    if (decoder && decoder.state !== "closed") {
+      try { decoder.close(); } catch { /* already failed */ }
+    }
+    localNeedsKeyframe = true;
+    if (!clearFrame) return;
+    setLocalVideoReady(false);
+    const context = localCanvas?.getContext("2d");
+    if (context && localCanvas) context.clearRect(0, 0, localCanvas.width, localCanvas.height);
   }
 
   async function receiveScreenVideoChunk(chunk: ScreenVideoChunkEvent) {
+    setScreenAspectRatio(chunk.width / chunk.height);
     const identity = `${chunk.peerId}:${chunk.sessionId}:${chunk.generation}:${chunk.streamId}:${chunk.codec}:${chunk.width}x${chunk.height}`;
     if (identity !== remoteVideoIdentity) {
       resetRemoteScreenVideo();
@@ -465,9 +537,9 @@ export default function Room(props: RoomProps) {
     if (remoteLastChunkID && chunk.chunkId !== remoteLastChunkID + 1) resetRemoteScreenVideo(false);
     remoteLastChunkID = chunk.chunkId;
     if (remoteNeedsKeyframe && !chunk.keyFrame) return;
-    let bytes: Uint8Array;
+    let encodedChunk: EncodedVideoChunk;
     try {
-      bytes = base64Bytes(chunk.bytes);
+      encodedChunk = encodedScreenVideoChunk(chunk);
     } catch (cause) {
       reportScreenError(cause);
       resetRemoteScreenVideo(false);
@@ -484,12 +556,7 @@ export default function Room(props: RoomProps) {
         return;
       }
       if (remoteNeedsKeyframe && !chunk.keyFrame) return;
-      decoder.decode(new EncodedVideoChunk({
-        type: chunk.keyFrame ? "key" : "delta",
-        timestamp: chunk.timestamp,
-        duration: chunk.duration,
-        data: bytes,
-      }));
+      decoder.decode(encodedChunk);
       if (chunk.keyFrame) remoteNeedsKeyframe = false;
     } catch (cause) {
       if (run === remoteVideoRun) {
@@ -503,14 +570,11 @@ export default function Room(props: RoomProps) {
     if (remoteDecoder?.state === "configured") return;
     if (!remoteDecoderSetup) {
       remoteDecoderSetup = (async () => {
-        requireScreenVideoAPIs(false);
-        const config: VideoDecoderConfig = {
-          codec: chunk.codec,
-          codedWidth: chunk.width,
-          codedHeight: chunk.height,
-          colorSpace: screenVideoColorSpace,
-          optimizeForLatency: true,
-        };
+        if (!window.isSecureContext) throw new Error("屏幕视频需要安全上下文 (HTTPS 或本机应用)");
+        if (typeof VideoDecoder !== "function" || typeof EncodedVideoChunk !== "function") {
+          throw new Error("当前系统暂不支持播放屏幕分享");
+        }
+        const config = screenVideoDecoderConfig(chunk);
         const support = await VideoDecoder.isConfigSupported(config);
         if (!support.supported) throw new Error("当前系统暂不支持播放此屏幕分享");
         if (run !== remoteVideoRun || identity !== remoteVideoIdentity) return;
@@ -541,17 +605,9 @@ export default function Room(props: RoomProps) {
   function renderRemoteVideoFrame(frame: VideoFrame, chunk: ScreenVideoChunkEvent, identity: string, run: number) {
     try {
       if (run !== remoteVideoRun || identity !== remoteVideoIdentity || selectedSharer() !== chunk.peerId) return;
-      if (frame.displayWidth <= 0 || frame.displayHeight <= 0 || frame.displayWidth > 1280 || frame.displayHeight > 720) {
-        throw new Error("远端屏幕视频帧尺寸无效");
-      }
       const canvas = remoteCanvas;
-      const context = canvas?.getContext("2d", screenVideoCanvasOptions);
-      if (!canvas || !context) throw new Error("当前 WebView 无法渲染屏幕视频");
-      if (canvas.width !== chunk.width || canvas.height !== chunk.height) {
-        canvas.width = chunk.width;
-        canvas.height = chunk.height;
-      }
-      context.drawImage(frame, 0, 0, chunk.width, chunk.height);
+      if (!canvas) throw new Error("当前 WebView 无法渲染屏幕视频");
+      drawScreenVideoFrame(frame, canvas, chunk.width, chunk.height);
       setRemoteVideoReady(true);
       setRemoteVideoRecovering(false);
     } catch (cause) {
@@ -597,6 +653,29 @@ export default function Room(props: RoomProps) {
 
   return (
     <section class="room-view">
+      <dialog
+        ref={sourceDialog}
+        class="floating-card screen-source-card"
+        aria-modal="true"
+        aria-labelledby="screen-source-title"
+        aria-describedby="screen-source-description"
+        onCancel={(event) => {
+          event.preventDefault();
+          closeScreenSourcePicker();
+        }}
+      >
+        <header>
+          <div>
+            <strong id="screen-source-title">选择分享内容</strong>
+            <small id="screen-source-description">选择显示器或窗口；系统支持时，同时共享 Bork 之外的系统声音。</small>
+          </div>
+          <button type="button" onClick={closeScreenSourcePicker}>关闭</button>
+        </header>
+        <div class="screen-source-groups">
+          <ScreenSourceGroup title="显示器" sources={monitorSources()} select={startScreenShare} />
+          <ScreenSourceGroup title="窗口" sources={windowSources()} select={startScreenShare} />
+        </div>
+      </dialog>
       <div class="room-content">
         <section class="voice-stage">
           <section ref={roomPeersRegion} class="room-peers" aria-label="房间成员" tabindex="-1">
@@ -618,7 +697,7 @@ export default function Room(props: RoomProps) {
             <RoomControlRow
               state={props.state}
               remotePeers={remotePeers()}
-              screenSharing={Boolean(localStream()) || Boolean(props.state.room?.screenSharing)}
+              screenSharing={localScreenSharing()}
               captureBusy={captureBusy()}
               remoteSharerCount={remoteSharers().length}
               busy={props.busy}
@@ -627,16 +706,14 @@ export default function Room(props: RoomProps) {
               pushToTalk={props.pushToTalk}
               configurePushToTalk={props.configurePushToTalk}
               focusFallback={focusRoomFallback}
-              toggleScreenShare={() => localStream() || props.state.room?.screenSharing ? void stopScreenShare(true) : void startScreenShare()}
+              toggleScreenShare={() => localScreenSharing() ? void stopScreenShare(true) : void openScreenSourcePicker()}
             />
           </section>
-          <Show when={localStream() || remoteSharers().length > 0}>
+          <Show when={localScreenSharing() || remoteSharers().length > 0}>
             <section
               class="screen-stage"
-              classList={{
-                single: Number(Boolean(localStream())) + Number(remoteSharers().length > 0) === 1,
-                fullscreen: props.screenFullscreen,
-              }}
+              classList={{ fullscreen: props.screenFullscreen }}
+              style={{ "aspect-ratio": `${screenAspectRatio()}` }}
               aria-label="屏幕分享画面"
               popover={nativePopoverSupported ? "manual" : undefined}
               ref={bindScreenStage}
@@ -659,49 +736,52 @@ export default function Room(props: RoomProps) {
                   </Show>
                 </svg>
               </button>
-              <Show when={localStream()}>{(stream) => (
-                <figure class="screen-preview">
-                  <video
-                    muted
-                    autoplay
-                    playsinline
-                    aria-label="你分享的屏幕"
-                    ref={(element) => { element.srcObject = stream(); }}
-                  />
-                  <figcaption class="screen-sharer">你</figcaption>
-                </figure>
-              )}</Show>
-              <Show when={remoteSharers().length > 0}>
-                <figure class="screen-preview remote-screen">
+              <figure class="screen-preview">
+                <Show
+                  when={selectedLocalScreen()}
+                  fallback={
+                    <canvas
+                      ref={(element) => { remoteCanvas = element; }}
+                      classList={{ ready: remoteVideoReady() }}
+                      role="img"
+                      aria-label={`${selectedSharerName()}分享的屏幕`}
+                    />
+                  }
+                >
                   <canvas
-                    ref={(element) => { remoteCanvas = element; }}
-                    classList={{ ready: remoteVideoReady() }}
+                    ref={(element) => { localCanvas = element; }}
+                    classList={{ ready: localVideoReady() }}
                     role="img"
-                    aria-label={`${selectedSharerName()}分享的屏幕`}
+                    aria-label="你分享的屏幕"
                   />
-                  <Show when={!remoteVideoReady() || remoteVideoInterrupted()}>
-                    <p class="screen-video-status" role="status">
-                      {remoteVideoInterrupted() ? "画面中断，正在恢复…" : "正在接收画面…"}
-                    </p>
+                </Show>
+                <Show when={!selectedVideoReady() || remoteVideoInterrupted()}>
+                  <p class="screen-video-status" role="status">
+                    {selectedLocalScreen()
+                      ? (typeof VideoDecoder === "function" ? "正在准备本机预览…" : "画面正在共享")
+                      : (remoteVideoInterrupted() ? "画面中断，正在恢复…" : "正在接收画面…")}
+                  </p>
+                </Show>
+                <figcaption class="screen-sharer">
+                  <Show when={screenSharerIDs().length > 1} fallback={<span>{selectedSharerName()}</span>}>
+                    <select
+                      class="screen-sharer-select"
+                      aria-label="选择要观看的屏幕分享者"
+                      value={selectedSharer()}
+                      onPointerDown={(event) => event.stopPropagation()}
+                      onChange={(event) => selectSharer(event.currentTarget.value)}
+                    >
+                      <Show when={localScreenSharing()}>
+                        <option value={localScreenSharer}>你</option>
+                      </Show>
+                      <For each={remoteSharers().map((peer) => peer.peerId)}>{(peerID) => {
+                        const peer = () => remoteSharers().find((candidate) => candidate.peerId === peerID)!;
+                        return <option value={peerID}>{peer().nickname || peerID.slice(0, 14)}</option>;
+                      }}</For>
+                    </select>
                   </Show>
-                  <figcaption class="screen-sharer">
-                    <Show when={remoteSharers().length > 1} fallback={<span>{selectedSharerName()}</span>}>
-                      <select
-                        class="screen-sharer-select"
-                        aria-label="选择要观看的屏幕分享者"
-                        value={selectedSharer()}
-                        onPointerDown={(event) => event.stopPropagation()}
-                        onChange={(event) => selectSharer(event.currentTarget.value)}
-                      >
-                        <For each={remoteSharers().map((peer) => peer.peerId)}>{(peerID) => {
-                          const peer = () => remoteSharers().find((candidate) => candidate.peerId === peerID)!;
-                          return <option value={peerID}>{peer().nickname || peerID.slice(0, 14)}</option>;
-                        }}</For>
-                      </select>
-                    </Show>
-                  </figcaption>
-                </figure>
-              </Show>
+                </figcaption>
+              </figure>
               <For each={screenResizeDirections}>{(direction) => (
                 <span
                   class="screen-resize-handle"
@@ -718,62 +798,70 @@ export default function Room(props: RoomProps) {
   );
 }
 
-interface ScreenVideoChunkEvent {
+function ScreenSourceGroup(props: {
+  title: string;
+  sources: screenshare.Source[];
+  select: (sourceID: string) => Promise<void>;
+}) {
+  return (
+    <Show when={props.sources.length > 0}>
+      <section class="screen-source-group" aria-label={props.title}>
+        <h3>{props.title}</h3>
+        <div class="screen-source-list">
+          <For each={props.sources}>{(source) => (
+            <button type="button" onClick={() => void props.select(source.id)}>
+              <strong>{source.name}</strong>
+              <small>{source.width} × {source.height}</small>
+            </button>
+          )}</For>
+        </div>
+      </section>
+    </Show>
+  );
+}
+
+interface LocalScreenVideoChunkEvent extends EncodedScreenVideo {
+  captureId: number;
+}
+
+interface ScreenVideoChunkEvent extends EncodedScreenVideo {
   peerId: string;
   sessionId: string;
   generation: number;
   streamId: string;
   chunkId: number;
-  codec: string;
-  width: number;
-  height: number;
-  timestamp: number;
-  duration: number;
-  keyFrame: boolean;
-  bytes: string;
 }
 
-function stopTracks(stream?: MediaStream) {
-  stream?.getTracks().forEach((track) => track.stop());
-}
-
-function requireScreenVideoAPIs(encoder: boolean) {
-  if (!window.isSecureContext) throw new Error("屏幕视频需要安全上下文 (HTTPS 或本机应用)");
-  if (encoder) {
-    if (typeof VideoEncoder !== "function" || typeof VideoFrame !== "function") throw new Error("当前系统暂不支持屏幕分享");
-  } else if (typeof VideoDecoder !== "function" || typeof EncodedVideoChunk !== "function") {
-    throw new Error("当前系统暂不支持播放屏幕分享");
-  }
-}
-
-function screenVideoDimensions(sourceWidth: number, sourceHeight: number) {
-  if (!Number.isFinite(sourceWidth) || !Number.isFinite(sourceHeight) || sourceWidth <= 0 || sourceHeight <= 0) {
-    throw new Error("屏幕捕获尚未产生视频画面");
-  }
-  const scale = Math.min(1, 1280 / sourceWidth, 720 / sourceHeight);
+function screenVideoDecoderConfig(chunk: EncodedScreenVideo): VideoDecoderConfig {
   return {
-    width: Math.max(2, Math.floor(sourceWidth * scale / 2) * 2),
-    height: Math.max(2, Math.floor(sourceHeight * scale / 2) * 2),
+    codec: chunk.codec,
+    codedWidth: chunk.width,
+    codedHeight: chunk.height,
+    colorSpace: screenVideoColorSpace,
+    optimizeForLatency: true,
   };
 }
 
-async function supportedScreenVideoConfig(width: number, height: number): Promise<VideoEncoderConfig> {
-  for (const codec of screenVideoCodecs) {
-    const config: VideoEncoderConfig = {
-      codec,
-      width,
-      height,
-      bitrate: 1_000_000,
-      framerate: screenVideoFrameRate,
-      latencyMode: "realtime",
-      avc: { format: "annexb" },
-    };
-    try {
-      const support = await VideoEncoder.isConfigSupported(config);
-      if (support.supported) return config;
-    } catch { /* try the other canonical H.264 profile */ }
+function encodedScreenVideoChunk(chunk: EncodedScreenVideo): EncodedVideoChunk {
+  return new EncodedVideoChunk({
+    type: chunk.keyFrame ? "key" : "delta",
+    timestamp: chunk.timestamp,
+    duration: chunk.duration,
+    data: base64Bytes(chunk.bytes),
+  });
+}
+
+function drawScreenVideoFrame(frame: VideoFrame, canvas: HTMLCanvasElement, width: number, height: number) {
+  if (frame.displayWidth <= 0 || frame.displayHeight <= 0 || frame.displayWidth > 1280 || frame.displayHeight > 720) {
+    throw new Error("屏幕视频帧尺寸无效");
   }
-  throw new Error("当前系统暂不支持分享此屏幕");
+  const context = canvas.getContext("2d", screenVideoCanvasOptions);
+  if (!context) throw new Error("当前 WebView 无法渲染屏幕视频");
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  context.drawImage(frame, 0, 0, width, height);
 }
 
 function validScreenVideoChunkEvent(value: unknown): value is ScreenVideoChunkEvent {
@@ -784,7 +872,21 @@ function validScreenVideoChunkEvent(value: unknown): value is ScreenVideoChunkEv
     && Number.isSafeInteger(chunk.generation) && Number(chunk.generation) > 0
     && typeof chunk.streamId === "string" && /^[0-9a-f]{32}$/.test(chunk.streamId)
     && Number.isInteger(chunk.chunkId) && Number(chunk.chunkId) > 0 && Number(chunk.chunkId) <= 0xffffffff
-    && typeof chunk.codec === "string" && (screenVideoCodecs as readonly string[]).includes(chunk.codec)
+    && validEncodedScreenVideo(chunk);
+}
+
+interface EncodedScreenVideo {
+  codec: string;
+  width: number;
+  height: number;
+  timestamp: number;
+  duration: number;
+  keyFrame: boolean;
+  bytes: string;
+}
+
+function validEncodedScreenVideo(chunk: Partial<EncodedScreenVideo>): chunk is EncodedScreenVideo {
+  return typeof chunk.codec === "string" && (screenVideoCodecs as readonly string[]).includes(chunk.codec)
     && Number.isInteger(chunk.width) && Number(chunk.width) >= 2 && Number(chunk.width) <= 1280 && Number(chunk.width) % 2 === 0
     && Number.isInteger(chunk.height) && Number(chunk.height) >= 2 && Number(chunk.height) <= 720 && Number(chunk.height) % 2 === 0
     && Number.isSafeInteger(chunk.timestamp) && Number(chunk.timestamp) >= 0
@@ -794,22 +896,14 @@ function validScreenVideoChunkEvent(value: unknown): value is ScreenVideoChunkEv
     && typeof chunk.bytes === "string" && chunk.bytes.length > 0 && chunk.bytes.length <= Math.ceil(maxScreenVideoChunkBytes / 3) * 4;
 }
 
-function bytesBase64(bytes: Uint8Array): string {
-  let binary = "";
-  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-  }
-  return btoa(binary);
-}
-
 function base64Bytes(value: string): Uint8Array {
   let binary: string;
   try {
     binary = atob(value);
   } catch {
-    throw new Error("远端屏幕视频块不是有效的 base64");
+    throw new Error("屏幕视频块不是有效的 base64");
   }
-  if (binary.length === 0 || binary.length > maxScreenVideoChunkBytes) throw new Error("远端屏幕视频块大小无效");
+  if (binary.length === 0 || binary.length > maxScreenVideoChunkBytes) throw new Error("屏幕视频块大小无效");
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
   return bytes;

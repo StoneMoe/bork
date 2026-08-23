@@ -16,6 +16,7 @@ import (
 	"bork/internal/networking/endpoint"
 	"bork/internal/peer"
 	"bork/internal/protocol"
+	"bork/internal/screenshare"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -67,8 +68,20 @@ type roomSession struct {
 	cancel          context.CancelFunc
 	done            chan struct{}
 	remotePeerCount int
-	screenCaptureID uint32
+	screenVideo     *screenVideoRun
+	screenAudio     *screenAudioRun
 	stopping        bool
+}
+
+type screenVideoRun struct {
+	id      uint32
+	capture *screenshare.VideoCapture
+	done    chan struct{}
+}
+
+type screenAudioRun struct {
+	capture *screenshare.AudioCapture
+	done    chan struct{}
 }
 
 type roomStateChange struct {
@@ -176,6 +189,8 @@ func (a *App) publishRoomChange(change roomStateChange) {
 		return
 	}
 	if change.terminal {
+		a.stopScreenVideoLocked(change.room)
+		a.stopScreenAudioLocked(change.room)
 		peerSnapshot, networkSnapshot := change.room.client.StateSnapshot()
 		diagnostics := projectDiagnostics(networkSnapshot, peerSnapshot.Connectivity)
 		a.stateMu.Lock()
@@ -346,6 +361,130 @@ func (a *App) publishScreenVideoChunk(room *roomSession, chunk peer.ScreenVideoC
 			Timestamp: chunk.Timestamp, Duration: chunk.Duration, KeyFrame: chunk.KeyFrame, Bytes: chunk.Bytes,
 		})
 	}
+}
+
+func (a *App) runScreenVideo(room *roomSession, run *screenVideoRun) {
+	info := run.capture.Info()
+	a.stateMu.RLock()
+	ctx := a.appContext
+	a.stateMu.RUnlock()
+	var runErr error
+	defer func() {
+		_ = run.capture.Close()
+		// A command may wait for this goroutine while holding commandMu. Finish
+		// the wait before reporting an asynchronous capture failure.
+		close(run.done)
+		a.commandMu.Lock()
+		defer a.commandMu.Unlock()
+		if room.screenVideo != run {
+			return
+		}
+		room.screenVideo = nil
+		a.stopScreenAudioLocked(room)
+		_ = room.client.StopScreenShare()
+		a.emit(ctx, screenPreviewEndedEvent, run.id)
+		if runErr != nil && a.isActiveRoom(room) {
+			a.recordError(errors.New("屏幕分享已停止: " + runErr.Error()))
+			a.markStateChanged()
+		}
+	}()
+
+	for {
+		frame, err := run.capture.ReadFrame()
+		if err != nil {
+			runErr = err
+			return
+		}
+		a.emit(ctx, screenPreviewChunkEvent, ScreenPreviewChunkEvent{
+			CaptureID: run.id,
+			Codec:     info.Codec,
+			Width:     info.Width,
+			Height:    info.Height,
+			Timestamp: frame.Timestamp,
+			Duration:  frame.Duration,
+			KeyFrame:  frame.KeyFrame,
+			Bytes:     frame.Payload,
+		})
+		sent, err := room.client.SendScreenVideoChunk(frame.Timestamp, frame.Duration, frame.KeyFrame, frame.Payload)
+		if err != nil {
+			runErr = err
+			return
+		}
+		if !sent {
+			_ = run.capture.ForceKeyFrame()
+		}
+	}
+}
+
+func (a *App) stopScreenVideoLocked(room *roomSession) {
+	if room == nil || room.screenVideo == nil {
+		return
+	}
+	run := room.screenVideo
+	room.screenVideo = nil
+	if err := run.capture.Close(); err != nil {
+		a.logger.Debug("stop screen video capture", "error", err)
+	}
+	<-run.done
+}
+
+func (a *App) startScreenAudioLocked(room *roomSession) {
+	capture, err := screenshare.StartAudioCapture(protocol.MaxRoomDatagramPayload)
+	if err != nil {
+		message := "屏幕声音不可用，已继续共享画面"
+		if !errors.Is(err, screenshare.ErrUnsupported) {
+			message += ": " + err.Error()
+		}
+		a.recordError(errors.New(message))
+		a.markStateChanged()
+		return
+	}
+	run := &screenAudioRun{capture: capture, done: make(chan struct{})}
+	room.screenAudio = run
+	go a.runScreenAudio(room, run)
+}
+
+func (a *App) runScreenAudio(room *roomSession, run *screenAudioRun) {
+	var runErr error
+	defer func() {
+		_ = run.capture.Close()
+		// stopScreenAudioLocked waits while holding commandMu, so release its
+		// wait before reporting an asynchronous capture failure.
+		close(run.done)
+		a.commandMu.Lock()
+		defer a.commandMu.Unlock()
+		if room.screenAudio != run {
+			return
+		}
+		room.screenAudio = nil
+		if runErr != nil && a.isActiveRoom(room) {
+			a.recordError(errors.New("屏幕声音已停止，画面仍在共享: " + runErr.Error()))
+			a.markStateChanged()
+		}
+	}()
+	for {
+		frame, err := run.capture.ReadFrame()
+		if err != nil {
+			runErr = err
+			return
+		}
+		if err := room.client.SendScreenAudioFrame(frame.Timestamp, frame.Payload); err != nil {
+			runErr = err
+			return
+		}
+	}
+}
+
+func (a *App) stopScreenAudioLocked(room *roomSession) {
+	if room == nil || room.screenAudio == nil {
+		return
+	}
+	run := room.screenAudio
+	room.screenAudio = nil
+	if err := run.capture.Close(); err != nil {
+		a.logger.Debug("stop screen audio capture", "error", err)
+	}
+	<-run.done
 }
 
 func (a *App) detachActiveRoom() *roomSession {
@@ -571,11 +710,14 @@ func (a *App) shutdown(context.Context) {
 		room.stopping = true
 	}
 	a.stateMu.Unlock()
-	a.stopStateNotifications()
-	a.stopPushToTalkLocked()
 	if room != nil {
+		// Start the peer shutdown before waiting for native capture teardown.
 		room.cancel()
 	}
+	a.stopStateNotifications()
+	a.stopPushToTalkLocked()
+	a.stopScreenVideoLocked(room)
+	a.stopScreenAudioLocked(room)
 	if audioEngine, err := a.readyAudioEngine(); err == nil {
 		audioEngine.Stop()
 	}

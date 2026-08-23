@@ -1,14 +1,23 @@
 package media
 
 import (
+	"slices"
 	"sync"
 	"time"
 )
 
 const maxReceivedFramesPerSource = 2
 
+type AudioStreamKind byte
+
+const (
+	AudioStreamVoice AudioStreamKind = iota
+	AudioStreamScreen
+)
+
 type ReceivedFrame struct {
 	SourceID   string
+	StreamKind AudioStreamKind
 	StreamID   [16]byte
 	Sequence   uint64
 	Timestamp  uint32
@@ -33,6 +42,7 @@ type PeerPort interface {
 type AudioPort interface {
 	ReceivedReady() <-chan struct{}
 	TakeReceived() (ReceivedFrame, bool)
+	ScreenAudioSource() string
 	SubmitSend(SendFrame) bool
 	InvalidateSend() uint64
 	Reset() uint64
@@ -43,10 +53,11 @@ type AudioPort interface {
 type Flow struct {
 	mu sync.Mutex
 
-	receivedQueues map[string][]ReceivedFrame
-	receivedOrder  []string
-	receivedNext   int
-	receivedReady  chan struct{}
+	receivedQueues      map[receivedStreamKey][]ReceivedFrame
+	receivedOrder       []receivedStreamKey
+	receivedNext        int
+	receivedReady       chan struct{}
+	screenAudioSourceID string
 
 	send            SendFrame
 	hasSend         bool
@@ -55,9 +66,16 @@ type Flow struct {
 	sendReady       chan struct{}
 }
 
+// receivedStreamKey keeps a peer's voice and screen audio in separate queues.
+// Each stream has its own packet sequence and decoder state.
+type receivedStreamKey struct {
+	sourceID string
+	kind     AudioStreamKind
+}
+
 func NewFlow() *Flow {
 	return &Flow{
-		receivedQueues: make(map[string][]ReceivedFrame),
+		receivedQueues: make(map[receivedStreamKey][]ReceivedFrame),
 		receivedReady:  make(chan struct{}, 1),
 		sendGeneration: 1,
 		sendReady:      make(chan struct{}, 1),
@@ -72,9 +90,14 @@ func (f *Flow) SubmitReceived(frame ReceivedFrame) bool {
 		return false
 	}
 	f.mu.Lock()
-	queue := f.receivedQueues[frame.SourceID]
+	if frame.StreamKind == AudioStreamScreen && frame.SourceID != f.screenAudioSourceID {
+		f.mu.Unlock()
+		return false
+	}
+	key := receivedStreamKey{sourceID: frame.SourceID, kind: frame.StreamKind}
+	queue := f.receivedQueues[key]
 	if len(queue) == 0 {
-		f.receivedOrder = append(f.receivedOrder, frame.SourceID)
+		f.receivedOrder = append(f.receivedOrder, key)
 	}
 	if len(queue) > 0 && queue[0].StreamID != frame.StreamID {
 		queue = nil
@@ -96,7 +119,7 @@ func (f *Flow) SubmitReceived(frame ReceivedFrame) bool {
 	if len(queue) > maxReceivedFramesPerSource {
 		queue = queue[len(queue)-maxReceivedFramesPerSource:]
 	}
-	f.receivedQueues[frame.SourceID] = queue
+	f.receivedQueues[key] = queue
 	notify(f.receivedReady)
 	f.mu.Unlock()
 	return true
@@ -107,14 +130,14 @@ func (f *Flow) TakeReceived() (ReceivedFrame, bool) {
 	defer f.mu.Unlock()
 	for offset := range len(f.receivedOrder) {
 		index := (f.receivedNext + offset) % len(f.receivedOrder)
-		sourceID := f.receivedOrder[index]
-		queue := f.receivedQueues[sourceID]
+		key := f.receivedOrder[index]
+		queue := f.receivedQueues[key]
 		if len(queue) == 0 {
 			continue
 		}
 		frame := queue[0]
 		if len(queue) == 1 {
-			delete(f.receivedQueues, sourceID)
+			delete(f.receivedQueues, key)
 			f.receivedOrder = append(f.receivedOrder[:index], f.receivedOrder[index+1:]...)
 			if len(f.receivedOrder) == 0 {
 				f.receivedNext = 0
@@ -122,12 +145,35 @@ func (f *Flow) TakeReceived() (ReceivedFrame, bool) {
 				f.receivedNext = index % len(f.receivedOrder)
 			}
 		} else {
-			f.receivedQueues[sourceID] = queue[1:]
+			f.receivedQueues[key] = queue[1:]
 			f.receivedNext = (index + 1) % len(f.receivedOrder)
 		}
 		return frame, true
 	}
 	return ReceivedFrame{}, false
+}
+
+// SetScreenAudioSource makes screen audio follow the screen selected by the
+// viewer. An empty source means the local preview or no remote screen.
+func (f *Flow) SetScreenAudioSource(sourceID string) {
+	f.mu.Lock()
+	if f.screenAudioSourceID == sourceID {
+		f.mu.Unlock()
+		return
+	}
+	oldKey := receivedStreamKey{sourceID: f.screenAudioSourceID, kind: AudioStreamScreen}
+	delete(f.receivedQueues, oldKey)
+	f.receivedOrder = slices.DeleteFunc(f.receivedOrder, func(key receivedStreamKey) bool { return key == oldKey })
+	f.screenAudioSourceID = sourceID
+	f.receivedNext = 0
+	notify(f.receivedReady)
+	f.mu.Unlock()
+}
+
+func (f *Flow) ScreenAudioSource() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.screenAudioSourceID
 }
 
 func (f *Flow) SubmitSend(frame SendFrame) bool {

@@ -1,7 +1,6 @@
 package app
 
 import (
-	"encoding/base64"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	"bork/internal/globalkey"
 	"bork/internal/invite"
 	"bork/internal/peer"
+	"bork/internal/screenshare"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -230,14 +230,13 @@ func (a *App) LeaveRoom() error {
 		return errors.New("application is shutting down")
 	}
 	room := a.detachActiveRoom()
-	a.stopPushToTalkLocked()
 	if room != nil {
-		if room.screenCaptureID != 0 {
-			_ = room.client.StopScreenShare()
-			room.screenCaptureID = 0
-		}
+		// Let the peer loop publish Leave while native capture is unwinding.
 		room.cancel()
 	}
+	a.stopPushToTalkLocked()
+	a.stopScreenVideoLocked(room)
+	a.stopScreenAudioLocked(room)
 	if audioEngine, err := a.readyAudioEngine(); err == nil {
 		audioEngine.Stop()
 	}
@@ -251,7 +250,11 @@ func (a *App) LeaveRoom() error {
 	return nil
 }
 
-func (a *App) StartScreenShare(codec string, width, height int) (uint32, error) {
+func (a *App) ListScreenSources() ([]screenshare.Source, error) {
+	return screenshare.Sources()
+}
+
+func (a *App) StartScreenShare(sourceID string) (uint32, error) {
 	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
@@ -264,38 +267,24 @@ func (a *App) StartScreenShare(codec string, width, height int) (uint32, error) 
 	if room == nil || room.stopping {
 		return 0, errors.New("not in a room")
 	}
-	if room.screenCaptureID != 0 {
+	if room.screenVideo != nil {
 		return 0, errors.New("screen sharing is already active")
 	}
-	if err := room.client.StartScreenShare(codec, width, height); err != nil {
+	capture, err := screenshare.StartVideoCapture(sourceID, peer.MaxScreenVideoChunkBytes)
+	if err != nil {
+		return 0, err
+	}
+	info := capture.Info()
+	if err := room.client.StartScreenShare(info.Codec, info.Width, info.Height); err != nil {
+		_ = capture.Close()
 		return 0, err
 	}
 	a.nextScreenCaptureID++
-	if a.nextScreenCaptureID == 0 {
-		a.nextScreenCaptureID++
-	}
-	room.screenCaptureID = a.nextScreenCaptureID
-	return room.screenCaptureID, nil
-}
-
-func (a *App) SendScreenVideoChunk(captureID uint32, timestamp uint64, duration uint32, keyFrame bool, bytesBase64 string) (bool, error) {
-	a.waitForStartup()
-	a.commandMu.Lock()
-	defer a.commandMu.Unlock()
-	if a.isShuttingDown() {
-		return false, errors.New("application is shutting down")
-	}
-	a.stateMu.RLock()
-	room := a.room
-	a.stateMu.RUnlock()
-	if captureID == 0 || room == nil || room.stopping || room.screenCaptureID != captureID {
-		return false, errors.New("screen capture is stale")
-	}
-	data, err := decodeScreenVideoBase64(bytesBase64)
-	if err != nil {
-		return false, err
-	}
-	return room.client.SendScreenVideoChunk(timestamp, duration, keyFrame, data)
+	run := &screenVideoRun{id: a.nextScreenCaptureID, capture: capture, done: make(chan struct{})}
+	room.screenVideo = run
+	a.startScreenAudioLocked(room)
+	go a.runScreenVideo(room, run)
+	return run.id, nil
 }
 
 func (a *App) StopScreenShare(captureID uint32) error {
@@ -309,25 +298,35 @@ func (a *App) StopScreenShare(captureID uint32) error {
 	room := a.room
 	a.stateMu.RUnlock()
 	// Zero is reserved for frontend recovery; concrete IDs still cannot stop a newer capture.
-	if room == nil || room.stopping || room.screenCaptureID == 0 || (captureID != 0 && room.screenCaptureID != captureID) {
+	if room == nil || room.stopping || room.screenVideo == nil || (captureID != 0 && room.screenVideo.id != captureID) {
 		return errors.New("screen capture is stale")
 	}
 	if err := room.client.StopScreenShare(); err != nil {
 		return err
 	}
-	room.screenCaptureID = 0
+	a.stopScreenVideoLocked(room)
+	a.stopScreenAudioLocked(room)
 	return nil
 }
 
-func decodeScreenVideoBase64(value string) ([]byte, error) {
-	if len(value) == 0 || len(value) > base64.StdEncoding.EncodedLen(peer.MaxScreenVideoChunkBytes) || strings.ContainsAny(value, "\r\n") {
-		return nil, errors.New("screen video base64 length is invalid")
+// SetScreenAudioSource follows a remote screen's sound. The frontend sends an
+// empty source peer ID while showing the local preview or no screen. The room
+// peer ID prevents a delayed call from changing the next room.
+func (a *App) SetScreenAudioSource(roomPeerID, sourcePeerID string) error {
+	a.waitForStartup()
+	a.commandMu.Lock()
+	defer a.commandMu.Unlock()
+	if a.isShuttingDown() {
+		return errors.New("application is shutting down")
 	}
-	decoded, err := base64.StdEncoding.Strict().DecodeString(value)
-	if err != nil || len(decoded) == 0 || len(decoded) > peer.MaxScreenVideoChunkBytes {
-		return nil, errors.New("screen video base64 is invalid")
+	a.stateMu.RLock()
+	room := a.room
+	a.stateMu.RUnlock()
+	if room == nil || room.stopping || room.client.PeerID() != roomPeerID {
+		return nil
 	}
-	return decoded, nil
+	room.media.SetScreenAudioSource(sourcePeerID)
+	return nil
 }
 
 func (a *App) SetCaptureMuted(muted bool) error {

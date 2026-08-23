@@ -825,6 +825,7 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 	appliedPlaybackGain := playbackGainFactor(e.playbackGain.Load())
 	var notification notificationTone
 	mixFrame := func(destination []float32) (bool, error) {
+		mixer.setScreenAudioSource(run.port.ScreenAudioSource())
 		mixer.loudnessNormalization = e.remoteLoudnessNormalization.Load()
 		_, err := mixer.NextInto(destination)
 		e.setSpeakingPeerIDs(run, mixer.SpeakingPeerIDs())
@@ -843,6 +844,7 @@ func (e *Engine) playbackLoop(ctx context.Context, run *engineRun, queue *pcmFra
 		return localOnly, err
 	}
 	drainPlayback := func() {
+		mixer.setScreenAudioSource(run.port.ScreenAudioSource())
 		for {
 			frame, ok := run.port.TakeReceived()
 			if !ok {

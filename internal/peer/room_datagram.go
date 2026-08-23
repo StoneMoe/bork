@@ -14,7 +14,8 @@ import (
 )
 
 const (
-	roomDatagramStreamIdle = 30 * time.Second
+	// Keep replay windows for the room lifetime. Expiring one during DTX would
+	// let an old packet recreate it; the fixed cap still bounds retained state.
 	// Signed room members can create arbitrary StreamIDs; bound retained replay
 	// state without imposing a member or concurrent-speaker product limit.
 	maxRoomDatagramReceiveStreams = 4096
@@ -88,7 +89,7 @@ func (c *Client) sendAudioFrame(frame media.SendFrame) {
 
 func (c *Client) handleRoomDatagram(packet endpoint.Datagram, mediaPort media.PeerPort) {
 	header, err := protocol.ParseRoomDatagramHeader(packet.Data, c.roomTag)
-	if err != nil || (header.Class != protocol.TrafficAudio && header.Class != protocol.TrafficInteractive) || header.SenderID == c.roomDatagramSenderID {
+	if err != nil || (header.Class != protocol.TrafficAudio && header.Class != protocol.TrafficInteractive && header.Class != protocol.TrafficScreenAudio) || header.SenderID == c.roomDatagramSenderID {
 		return
 	}
 	remoteIdentity, err := identity.FromPublicKey(ed25519.PublicKey(header.SenderID[:]))
@@ -106,7 +107,7 @@ func (c *Client) handleRoomDatagram(packet endpoint.Datagram, mediaPort media.Pe
 	if header.Class == protocol.TrafficAudio && (remote.activeSession.audioStreamID == ([16]byte{}) || remote.activeSession.audioStreamID != header.StreamID) {
 		return
 	}
-	if header.Class == protocol.TrafficInteractive && (!remote.activeSession.remoteScreenState.active || remote.activeSession.remoteScreenState.streamID != header.StreamID) {
+	if (header.Class == protocol.TrafficInteractive || header.Class == protocol.TrafficScreenAudio) && (!remote.activeSession.remoteScreenState.active || remote.activeSession.remoteScreenState.streamID != header.StreamID) {
 		return
 	}
 	key := roomDatagramStreamKey{sender: header.SenderID, stream: header.StreamID, class: header.Class}
@@ -181,12 +182,18 @@ func (c *Client) handleRoomDatagram(packet endpoint.Datagram, mediaPort media.Pe
 		})
 		return
 	}
-	c.forwardRoomDatagram(remoteIdentity.PeerID(), header.Class, packet, now.Add(10*time.Millisecond))
+	streamKind := media.AudioStreamVoice
+	deadline := now.Add(10 * time.Millisecond)
+	if header.Class == protocol.TrafficScreenAudio {
+		streamKind = media.AudioStreamScreen
+		deadline = now.Add(screenAudioSendBudget)
+	}
+	peerID := remoteIdentity.PeerID()
+	c.forwardRoomDatagram(peerID, header.Class, packet, deadline)
 	if mediaPort != nil {
 		mediaPort.SubmitReceived(media.ReceivedFrame{
-			SourceID: remoteIdentity.PeerID(), StreamID: header.StreamID,
-			Sequence: header.Sequence, Timestamp: decoded.Timestamp,
-			Payload: decoded.Payload, ReceivedAt: now,
+			SourceID: peerID, StreamKind: streamKind, StreamID: header.StreamID,
+			Sequence: header.Sequence, Timestamp: decoded.Timestamp, Payload: decoded.Payload, ReceivedAt: now,
 		})
 	}
 }
@@ -211,14 +218,4 @@ func (c *Client) authenticatedDirectSession(address netip.AddrPort) *PeeringSess
 		}
 	}
 	return nil
-}
-
-func (c *Client) expireRoomDatagramStreams(now time.Time) {
-	for key, state := range c.roomDatagramReceivers {
-		if state.lastSeen.Add(roomDatagramStreamIdle).Before(now) {
-			delete(c.roomDatagramReceivers, key)
-			c.removeScreenVideoAssembly(key)
-			delete(c.screenVideoReceivers, key)
-		}
-	}
 }

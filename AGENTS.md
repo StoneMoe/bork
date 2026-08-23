@@ -10,9 +10,9 @@
 - Go 1.26.2 或更高版本
 - Node.js、npm 和 GNU Make
 - Wails v2 CLI
-- 支持 cgo 的原生 C 工具链
+- 支持 cgo 的原生 C/C++ 工具链
 
-每个目标操作系统都必须使用原生构建环境；音频代码依赖 cgo。
+每个目标操作系统都必须使用原生构建环境；音频和 Windows 屏幕共享代码依赖 cgo。
 
 ### 仓库结构
 
@@ -21,6 +21,7 @@
 | `cmd/bork` | 启动 Wails 应用并加载配置 |
 | `internal/app` | 管理生命周期、命令和 UI 快照 |
 | `internal/audio` | 采集、处理、编码、混音和播放音频 |
+| `internal/screenshare` | 枚举、采集、色调映射并编码本机屏幕与系统声音 |
 | `internal/networking` | 管理发现、RoomUDP、端口映射和房间网络 |
 | `internal/peer` | 管理 Session、拓扑、可靠传输和扇出 |
 | `internal/protocol` | 定义线协议编解码、数据包限制和密码学 |
@@ -145,7 +146,10 @@ Speaker -- F1+-- L2
 
 - Speaker 对每个音频帧只加密一次，由选定的 Forwarder 分担扇出上传。
 - Forwarder 只发送经过验证的原始数据包，不重新编码或加密。
-- 屏幕发送端使用系统 WebView 提供的 WebCodecs 生成 H.264 Annex-B 视频。
+- Windows 屏幕发送端使用 Windows Graphics Capture；系统 Video Processor MFT 将 HDR/scRGB 映射为 SDR，Media Foundation 硬件编码器生成 H.264 Annex-B 视频。
+- 屏幕声音包含 Bork 进程树之外的系统输出，不在分享者本机重复播放；声音不可用时继续共享画面。
+- WebView 只负责选择来源以及解码本机预览和远端画面，不参与采集或编码。
+- 当前原生屏幕发送端仅支持 Windows；其他平台仍可观看屏幕分享。
 - 不提供 JPEG 或软件编码器回退。
 - 单个屏幕数据块最大为 256 KiB。
 - 丢包后，接收端等待下一个关键帧，不显示受损的预测帧。

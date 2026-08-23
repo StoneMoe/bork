@@ -16,6 +16,9 @@ type TrafficClass byte
 const (
 	TrafficAudio TrafficClass = iota + 1
 	TrafficInteractive
+	// TrafficScreenAudio uses the interactive endpoint lane so microphone
+	// packets always keep their higher scheduling priority.
+	TrafficScreenAudio
 )
 
 type RoomDatagramHeader struct {
@@ -31,7 +34,7 @@ type RoomDatagram struct {
 }
 
 func validTrafficClass(class TrafficClass) bool {
-	return class >= TrafficAudio && class <= TrafficInteractive
+	return class >= TrafficAudio && class <= TrafficScreenAudio
 }
 
 func NewRoomDatagramCipher(roomDatagramKey [32]byte) cipher.AEAD {

@@ -145,7 +145,7 @@ func (e *Endpoint) classifyRoomPacket(packet []byte) packetClass {
 		switch header.Class {
 		case protocol.TrafficAudio:
 			return packetAudio
-		case protocol.TrafficInteractive:
+		case protocol.TrafficInteractive, protocol.TrafficScreenAudio:
 			return packetInteractive
 		}
 	case protocol.PacketHello, protocol.PacketPing, protocol.PacketPong, protocol.PacketLeave:
@@ -241,7 +241,7 @@ func (e *Endpoint) SendRealtimeBatch(batch RealtimeBatch) error {
 	switch batch.Class {
 	case protocol.TrafficAudio:
 		batches = e.audioBatches
-	case protocol.TrafficInteractive:
+	case protocol.TrafficInteractive, protocol.TrafficScreenAudio:
 		batches = e.interactiveBatches
 	default:
 		return errors.New("realtime batch traffic class is invalid")
@@ -581,7 +581,7 @@ func (e *Endpoint) writeRealtimeDatagram(ctx context.Context, conn *net.UDPConn,
 	switch batch.Class {
 	case protocol.TrafficAudio:
 		writeBudget = maxAudioWriteTime
-	case protocol.TrafficInteractive:
+	case protocol.TrafficInteractive, protocol.TrafficScreenAudio:
 		writeBudget = min(maxInteractiveWriteTime, maxNonAudioWriteTime)
 	default:
 		return RealtimeBatch{}, nil

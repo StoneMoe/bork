@@ -106,7 +106,7 @@ type Client struct {
 	reliablePeerCursor         string
 	localMemberState           memberState
 	localScreenState           screenState
-	screenVideoSendSequence    uint64
+	screenMediaSendSequence    uint64
 	screenVideoChunkID         uint32
 	fileTransfers              map[[16]byte]*fileTransfer
 
@@ -332,7 +332,6 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 				c.publishStateChange()
 			}
 			c.expireTopology(now)
-			c.expireRoomDatagramStreams(now)
 			c.expireScreenVideoChunks(now)
 		case err := <-networkResult:
 			if ctx.Err() != nil {

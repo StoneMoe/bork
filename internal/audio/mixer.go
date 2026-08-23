@@ -33,16 +33,22 @@ type jitterStream struct {
 	normalizer        loudnessNormalizer
 }
 
+type mixerStreamKey struct {
+	peerID string
+	kind   media.AudioStreamKind
+}
+
 type mixer struct {
-	streams               map[string]*jitterStream
+	streams               map[mixerStreamKey]*jitterStream
 	maxFrameBytes         int
 	speakingPeerIDs       []string
 	loudnessNormalization bool
+	screenAudioSourceID   string
 }
 
 func newMixer(maxFrameBytes int) *mixer {
 	return &mixer{
-		streams:               make(map[string]*jitterStream),
+		streams:               make(map[mixerStreamKey]*jitterStream),
 		maxFrameBytes:         maxFrameBytes,
 		speakingPeerIDs:       []string{},
 		loudnessNormalization: true,
@@ -50,7 +56,13 @@ func newMixer(maxFrameBytes int) *mixer {
 }
 
 func (m *mixer) Add(frame media.ReceivedFrame) error {
-	stream := m.streams[frame.SourceID]
+	key := mixerStreamKey{peerID: frame.SourceID, kind: frame.StreamKind}
+	// Selection can change after Flow removes a frame from its queue but before
+	// it reaches the mixer. Recheck here so a fast A-B-A switch cannot add B.
+	if key.kind == media.AudioStreamScreen && key.peerID != m.screenAudioSourceID {
+		return nil
+	}
+	stream := m.streams[key]
 	if stream == nil {
 		decoder, err := newOpusDecoder(m.maxFrameBytes)
 		if err != nil {
@@ -63,7 +75,7 @@ func (m *mixer) Add(frame media.ReceivedFrame) error {
 			pcm:      make([]float32, FrameSamples),
 		}
 		stream.normalizer.reset()
-		m.streams[frame.SourceID] = stream
+		m.streams[key] = stream
 	}
 	if frame.StreamID != stream.streamID {
 		resetJitterStream(stream, frame.StreamID, 0)
@@ -122,6 +134,14 @@ func (m *mixer) Add(frame media.ReceivedFrame) error {
 	return nil
 }
 
+func (m *mixer) setScreenAudioSource(sourceID string) {
+	if m.screenAudioSourceID == sourceID {
+		return
+	}
+	delete(m.streams, mixerStreamKey{peerID: m.screenAudioSourceID, kind: media.AudioStreamScreen})
+	m.screenAudioSourceID = sourceID
+}
+
 func resetJitterStream(stream *jitterStream, streamID [16]byte, sequenceFloor uint64) {
 	stream.decoder.Reset()
 	clear(stream.frames)
@@ -143,17 +163,19 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 	clear(destination)
 	active := 0
 	var mixErr error
-	for peerID, stream := range m.streams {
+	for key, stream := range m.streams {
 		stream.idle++
 		if stream.idle > streamIdleFrames {
-			delete(m.streams, peerID)
+			delete(m.streams, key)
 			continue
 		}
 		if !stream.started {
 			start, ok := contiguousStart(stream.frames)
 			if !ok {
-				stream.speaking.update(false)
-				stream.normalizer.process(nil, 0, false, m.loudnessNormalization)
+				if key.kind == media.AudioStreamVoice {
+					stream.speaking.update(false)
+					stream.normalizer.process(nil, 0, false, m.loudnessNormalization)
+				}
 				continue
 			}
 			stream.expectedTimestamp = start
@@ -171,8 +193,10 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 				stream.decoder.Reset()
 				stream.started = false
 				stream.losses = 0
-				stream.speaking.update(false)
-				stream.normalizer.reset()
+				if key.kind == media.AudioStreamVoice {
+					stream.speaking.update(false)
+					stream.normalizer.reset()
+				}
 				continue
 			}
 		}
@@ -188,14 +212,14 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 			count, err = stream.decoder.Decode(frame.payload, stream.pcm)
 		}
 		if err != nil {
-			delete(m.streams, peerID)
+			delete(m.streams, key)
 			if mixErr == nil {
-				mixErr = fmt.Errorf("decode voice from %s: %w", peerID, err)
+				mixErr = fmt.Errorf("decode audio from %s: %w", key.peerID, err)
 			}
 			continue
 		}
 		if count != FrameSamples {
-			delete(m.streams, peerID)
+			delete(m.streams, key)
 			if mixErr == nil {
 				mixErr = errors.New("Opus decoder returned an unexpected frame size")
 			}
@@ -203,8 +227,12 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 		}
 		stream.expectedTimestamp += FrameSamples
 		level := pcmRMS(stream.pcm)
-		stream.speaking.update(level > speakingThreshold)
-		stream.normalizer.process(stream.pcm, level, exists, m.loudnessNormalization)
+		// Screen audio keeps the source application's dynamics and must not make
+		// the sharing peer appear to be speaking.
+		if key.kind == media.AudioStreamVoice {
+			stream.speaking.update(level > speakingThreshold)
+			stream.normalizer.process(stream.pcm, level, exists, m.loudnessNormalization)
+		}
 		if !(level > 0.0001) {
 			continue
 		}
@@ -232,9 +260,9 @@ func (m *mixer) SpeakingPeerIDs() []string {
 
 func (m *mixer) refreshSpeakingPeerIDs() {
 	m.speakingPeerIDs = m.speakingPeerIDs[:0]
-	for peerID, stream := range m.streams {
-		if stream.speaking.active() {
-			m.speakingPeerIDs = append(m.speakingPeerIDs, peerID)
+	for key, stream := range m.streams {
+		if key.kind == media.AudioStreamVoice && stream.speaking.active() {
+			m.speakingPeerIDs = append(m.speakingPeerIDs, key.peerID)
 		}
 	}
 	slices.Sort(m.speakingPeerIDs)

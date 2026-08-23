@@ -7,6 +7,7 @@ import (
 
 	"bork/internal/identity"
 	"bork/internal/invite"
+	"bork/internal/media"
 	"bork/internal/networking"
 	"bork/internal/networking/endpoint"
 	"bork/internal/protocol"
@@ -96,5 +97,59 @@ func TestRoomDatagramRefreshesOnlyAuthenticatedDirectSource(t *testing.T) {
 	}, nil)
 	if forwarderSession.authenticated || forwarderSession.lastAuthenticatedPacketAt != receivedAt {
 		t.Fatal("room datagram restored an unavailable direct source session")
+	}
+}
+
+func TestScreenAudioRequiresActiveScreenStream(t *testing.T) {
+	roomInvite, err := invite.New("screen audio")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := NewClient(roomInvite, networking.Options{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender, err := identity.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := netip.MustParseAddrPort("192.0.2.20:4000")
+	path, err := NewPath(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamID := [16]byte{2}
+	session := &PeeringSession{
+		path: path, authenticated: true,
+		remoteScreenState: screenState{active: true, streamID: streamID},
+	}
+	receiver.remotePeers[sender.PeerID()] = &RemotePeer{identity: sender.Identity, activeSession: session}
+	flow := media.NewFlow()
+	flow.SetScreenAudioSource(sender.PeerID())
+
+	header := protocol.RoomDatagramHeader{
+		Class: protocol.TrafficScreenAudio, SenderID: rawPeerIdentity(sender.Identity),
+		StreamID: streamID, Sequence: 1,
+	}
+	payload := []byte{1, 2, 3}
+	packet, err := protocol.MarshalRoomDatagram(receiver.roomTag, header, 480, payload, receiver.roomDatagramProtector, sender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver.handleRoomDatagram(endpoint.Datagram{Data: packet, From: address, ReceivedAt: time.Now()}, flow)
+	frame, ok := flow.TakeReceived()
+	if !ok || frame.StreamKind != media.AudioStreamScreen || frame.StreamID != streamID || string(frame.Payload) != string(payload) {
+		t.Fatalf("accepted screen audio frame = %+v, %v", frame, ok)
+	}
+
+	session.remoteScreenState = screenState{}
+	header.Sequence++
+	packet, err = protocol.MarshalRoomDatagram(receiver.roomTag, header, 960, payload, receiver.roomDatagramProtector, sender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver.handleRoomDatagram(endpoint.Datagram{Data: packet, From: address, ReceivedAt: time.Now()}, flow)
+	if frame, ok := flow.TakeReceived(); ok {
+		t.Fatalf("inactive screen accepted audio frame: %+v", frame)
 	}
 }
