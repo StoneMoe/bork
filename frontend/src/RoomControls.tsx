@@ -116,11 +116,8 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
   const [memberInfoOpen, setMemberInfoOpen] = createSignal(false);
   const [focusedMember, setFocusedMember] = createSignal("");
   let memberInfoCard: HTMLElement | undefined;
-  let memberInfoCloseButton: HTMLButtonElement | undefined;
-  let memberInfoInvoker: HTMLButtonElement | undefined;
   let memberList: HTMLDivElement | undefined;
   let localNameButton: HTMLButtonElement | undefined;
-  let memberInfoGeneration = 0;
   const localSpeaking = () => props.state.audio.speaking && !props.state.audio.captureMuted;
   const remoteSpeaking = (remotePeer: RemotePeer) => !remotePeer.muted && props.state.audio.speakingPeerIds.includes(remotePeer.peerId);
   const localName = () => props.state.nickname || props.state.room?.peerId.slice(0, 14) || "佚名";
@@ -130,66 +127,49 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
     playbackMuted ? "扬声器已静音" : "",
     screenSharing ? "分享屏幕" : "",
   ].filter(Boolean).join(" · ");
-  const localStatus = () => memberStatus(props.state.audio.captureMuted, props.state.audio.playbackMuted, Boolean(props.state.room?.screenSharing)) || "在线";
   const remoteStatus = (remotePeer: RemotePeer) => remotePeer.connected ? memberStatus(remotePeer.muted, remotePeer.playbackMuted, remotePeer.screenSharing) || "在线" : "恢复连接中";
   const remoteTransport = (remotePeer: RemotePeer) => !remotePeer.connected ? "恢复连接中" : remotePeer.transport === "bridge" ? "桥接" : "直连";
   const selectedRemote = () => props.remotePeers.find((peer) => peer.peerId === selectedMember());
-  const memberInfoIsOpen = () => nativePopoverSupported ? nativePopoverOpen(memberInfoCard) : memberInfoOpen();
 
-  function focusMemberInfoClose(generation: number) {
-    queueMicrotask(() => {
-      if (generation === memberInfoGeneration && memberInfoIsOpen()) {
-        memberInfoCloseButton?.focus({ preventScroll: true });
-      }
-    });
-  }
-
-  function restoreMemberFocus(invoker: HTMLButtonElement | undefined, generation: number) {
-    queueMicrotask(() => {
-      if (generation !== memberInfoGeneration || memberInfoIsOpen()) return;
-      const active = document.activeElement;
-      if (active && active !== document.body && active.isConnected && !memberInfoCard?.contains(active)) return;
-      if (invoker?.isConnected) invoker.focus({ preventScroll: true });
-      else if (localNameButton?.isConnected) localNameButton.focus({ preventScroll: true });
-      else props.focusFallback();
-    });
-  }
-
-  function finishMemberInfoClose(generation: number) {
-    setMemberInfoOpen(false);
-    queueMicrotask(() => {
-      if (generation !== memberInfoGeneration || memberInfoIsOpen()) return;
-      const invoker = memberInfoInvoker;
-      memberInfoInvoker = undefined;
-      setSelectedMember("");
-      restoreMemberFocus(invoker, generation);
-    });
+  function positionMemberInfo(invoker: HTMLButtonElement) {
+    if (!memberInfoCard || !memberInfoOpen()) return;
+    const gap = 6;
+    const margin = 8;
+    const invokerBounds = invoker.getBoundingClientRect();
+    const cardBounds = memberInfoCard.getBoundingClientRect();
+    const left = Math.max(margin, Math.min(invokerBounds.left, window.innerWidth - cardBounds.width - margin));
+    const below = invokerBounds.bottom + gap;
+    const top = below + cardBounds.height <= window.innerHeight - margin
+      ? below
+      : Math.max(margin, invokerBounds.top - cardBounds.height - gap);
+    memberInfoCard.style.left = `${left}px`;
+    memberInfoCard.style.top = `${top}px`;
   }
 
   function openMemberInfo(memberID: string, invoker: HTMLButtonElement) {
-    const generation = ++memberInfoGeneration;
-    memberInfoInvoker = invoker;
-    setSelectedMember(memberID);
-    if (nativePopoverSupported) {
-      if (!nativePopoverOpen(memberInfoCard)) memberInfoCard?.showPopover();
-    } else {
-      document.dispatchEvent(new Event(closePopoversEvent));
-      setMemberInfoOpen(true);
+    if (memberInfoOpen() && selectedMember() === memberID) {
+      hideMemberInfo();
+      return;
     }
-    focusMemberInfoClose(generation);
+    if (!memberInfoOpen()) document.dispatchEvent(new Event(closePopoversEvent));
+    setSelectedMember(memberID);
+    if (nativePopoverSupported && !memberInfoOpen()) memberInfoCard?.showPopover();
+    setMemberInfoOpen(true);
+    queueMicrotask(() => positionMemberInfo(invoker));
   }
 
   function hideMemberInfo() {
-    if (!memberInfoIsOpen()) return;
+    if (!memberInfoOpen()) return;
     if (nativePopoverSupported) memberInfoCard?.hidePopover();
-    else finishMemberInfoClose(memberInfoGeneration);
+    setMemberInfoOpen(false);
+    setSelectedMember("");
   }
 
   createEffect(() => {
     const selected = selectedMember();
     if (!selected || selected === "local" || props.remotePeers.some((peer) => peer.peerId === selected)) return;
-    if (memberInfoIsOpen()) hideMemberInfo();
-    else finishMemberInfoClose(memberInfoGeneration);
+    if (memberInfoOpen()) hideMemberInfo();
+    else setSelectedMember("");
   });
 
   createEffect(() => {
@@ -207,27 +187,33 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
   onMount(() => {
     const close = () => hideMemberInfo();
     const dismissOnEscape = (event: KeyboardEvent) => {
-      if (nativePopoverSupported || event.key !== "Escape" || !memberInfoIsOpen()) return;
+      if (event.key !== "Escape" || !memberInfoOpen()) return;
       event.preventDefault();
       event.stopImmediatePropagation();
       hideMemberInfo();
     };
-    const dismissOutside = (event: PointerEvent) => {
-      if (nativePopoverSupported || !memberInfoIsOpen() || !memberInfoCard || !(event.target instanceof Node)) return;
-      if (!memberInfoCard.contains(event.target)) hideMemberInfo();
+    const dismissOutside = (event: MouseEvent) => {
+      if (!memberInfoOpen() || !memberInfoCard || !(event.target instanceof Node)) return;
+      if (memberInfoCard.contains(event.target)) return;
+      if (event.target instanceof Element && event.target.closest(".member-name-trigger")) return;
+      hideMemberInfo();
     };
     document.addEventListener(closePopoversEvent, close);
     document.addEventListener("keydown", dismissOnEscape);
-    document.addEventListener("pointerdown", dismissOutside);
+    // Unlike pointerdown, click also covers buttons activated from the keyboard.
+    document.addEventListener("click", dismissOutside);
+    window.addEventListener("resize", close);
+    memberList?.addEventListener("scroll", close);
     onCleanup(() => {
       document.removeEventListener(closePopoversEvent, close);
       document.removeEventListener("keydown", dismissOnEscape);
-      document.removeEventListener("pointerdown", dismissOutside);
+      document.removeEventListener("click", dismissOutside);
+      window.removeEventListener("resize", close);
+      memberList?.removeEventListener("scroll", close);
     });
   });
 
   onCleanup(() => {
-    ++memberInfoGeneration;
     const active = document.activeElement;
     const focusIsLeaving = Boolean(active && (memberList?.contains(active) || memberInfoCard?.contains(active)));
     if (nativePopoverOpen(memberInfoCard)) memberInfoCard?.hidePopover();
@@ -246,7 +232,7 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
                 type="button"
                 aria-label={`查看 ${localName()} 的详细信息`}
                 aria-controls={memberInfoPopoverID}
-                aria-haspopup="dialog"
+                aria-describedby={memberInfoOpen() && selectedMember() === "local" ? memberInfoPopoverID : undefined}
                 aria-expanded={memberInfoOpen() && selectedMember() === "local"}
                 onClick={(event) => openMemberInfo("local", event.currentTarget)}
               >{localName()}</button>
@@ -277,7 +263,7 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
                     type="button"
                     aria-label={`查看 ${remoteName(peer())} 的详细信息`}
                     aria-controls={memberInfoPopoverID}
-                    aria-haspopup="dialog"
+                    aria-describedby={memberInfoOpen() && selectedMember() === peerID ? memberInfoPopoverID : undefined}
                     aria-expanded={memberInfoOpen() && selectedMember() === peerID}
                     onFocus={() => setFocusedMember(peerID)}
                     onBlur={(event) => {
@@ -315,31 +301,8 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
         id={memberInfoPopoverID}
         class="floating-card member-info-card"
         classList={{ "fallback-popover": !nativePopoverSupported, "fallback-open": memberInfoOpen() }}
-        popover={nativePopoverSupported ? "auto" : undefined}
-        role="dialog"
-        aria-labelledby="member-info-title"
-        onToggle={(event) => {
-          if (!nativePopoverSupported) return;
-          if (event.newState === "open" || nativePopoverOpen(memberInfoCard)) {
-            setMemberInfoOpen(true);
-            focusMemberInfoClose(memberInfoGeneration);
-          } else {
-            finishMemberInfoClose(memberInfoGeneration);
-          }
-        }}
+        popover={nativePopoverSupported ? "manual" : undefined}
       >
-        <header>
-          <div>
-            <small>PEER INFO</small>
-            <strong id="member-info-title">{selectedMember() === "local" ? props.state.nickname || "本机" : selectedRemote() ? remoteName(selectedRemote()!) : "成员已离开"}</strong>
-          </div>
-          <button
-            ref={memberInfoCloseButton}
-            type="button"
-            autofocus
-            onClick={hideMemberInfo}
-          >关闭</button>
-        </header>
         <Show when={selectedMember() === "local"} fallback={selectedRemote() && (
           <div class="member-info-grid">
             <span><small>昵称</small><b>{remoteName(selectedRemote()!)}</b></span>
@@ -352,8 +315,6 @@ export function RoomMemberList(props: { state: AppState; remotePeers: RemotePeer
           <div class="member-info-grid">
             <span><small>昵称</small><b>{props.state.nickname || "本机"}</b></span>
             <span><small>本机端点</small><code>{props.state.diagnostics.listenAddress || "尚未打开"}</code></span>
-            <span><small>房间状态</small><b>{props.state.room?.phase || "未知"}</b></span>
-            <span><small>音频状态</small><b>{localStatus()}</b></span>
           </div>
         </Show>
       </aside>

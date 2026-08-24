@@ -51,7 +51,7 @@ function closeOpenPopovers() {
 
 function humanStatus(state: AppState): FriendlyStatus {
   if (!state.room) return {};
-  if (state.room.phase === "gathering") {
+  if (!state.diagnostics.listenAddress) {
     return {
       title: "正在准备连接",
       detail: "Bork 正在打开通信端口并检查网络环境。",

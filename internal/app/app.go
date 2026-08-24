@@ -640,7 +640,6 @@ func (a *App) snapshot() AppSnapshot {
 		state.Room = &RoomState{
 			Name:          peerSnapshot.Name,
 			PeerID:        room.client.PeerID(),
-			Phase:         peerSnapshot.Phase,
 			ScreenSharing: peerSnapshot.ScreenSharing,
 			RemotePeers:   make([]RemotePeer, 0, len(peerSnapshot.RemotePeers)),
 			Transfers:     projectTransfers(peerSnapshot.Transfers, peerSnapshot.RemotePeers),

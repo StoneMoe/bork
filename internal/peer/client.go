@@ -45,7 +45,6 @@ type roomNetworkFactory func() roomNetwork
 
 type ClientSnapshot struct {
 	Name          string
-	Phase         string
 	ScreenSharing bool
 	RemotePeers   []RemotePeerSnapshot
 	Transfers     []FileTransferSnapshot
@@ -141,7 +140,7 @@ func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, 
 		roomInvite:            roomInvite,
 		logger:                logger,
 		networkFactory:        networkFactory,
-		snapshot:              ClientSnapshot{Name: roomInvite.DisplayName, Phase: "gathering", RemotePeers: []RemotePeerSnapshot{}},
+		snapshot:              ClientSnapshot{Name: roomInvite.DisplayName, RemotePeers: []RemotePeerSnapshot{}},
 		roomTag:               roomInvite.RoomTag(),
 		admissionKey:          roomInvite.AdmissionKey(),
 		discoveredAddresses:   make(map[netip.AddrPort]discoveredAddress),
@@ -407,18 +406,6 @@ func (c *Client) applyNetworkSnapshot(snapshot networking.RoomSnapshot) {
 	}
 }
 
-func (c *Client) phase() string {
-	for _, peer := range c.remotePeers {
-		if peer.activeSession != nil && peer.activeSession.authenticated {
-			return "connected"
-		}
-	}
-	if c.networkSnapshot.Endpoint.ListenAddress != "" {
-		return "discovering"
-	}
-	return "gathering"
-}
-
 func (c *Client) publishStateChange() {
 	c.snapshotMu.Lock()
 	c.refreshSnapshotLocked()
@@ -432,7 +419,6 @@ func (c *Client) publishStateChange() {
 func (c *Client) refreshSnapshotLocked() {
 	c.snapshot = ClientSnapshot{
 		Name:          c.roomInvite.DisplayName,
-		Phase:         c.phase(),
 		ScreenSharing: c.localScreenState.active,
 		RemotePeers:   c.remotePeerSnapshots(),
 		Transfers:     c.fileTransferSnapshots(),

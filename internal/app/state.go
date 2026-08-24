@@ -34,7 +34,6 @@ type RemotePeer struct {
 type RoomState struct {
 	Name          string         `json:"name"`
 	PeerID        string         `json:"peerId"`
-	Phase         string         `json:"phase"`
 	ScreenSharing bool           `json:"screenSharing"`
 	RemotePeers   []RemotePeer   `json:"remotePeers"`
 	Transfers     []FileTransfer `json:"transfers"`
