@@ -1,4 +1,5 @@
 import type { app, endpoint, tracker } from "@wailsjs/go/models";
+import type { IssueContext } from "./issues";
 
 export type AppState = app.AppSnapshot;
 export type Candidate = endpoint.Candidate;
@@ -9,7 +10,7 @@ export type TrackerStatus = tracker.ProviderStatus;
 export interface ActionProps {
   busy: boolean;
   ready: boolean;
-  runAction: (action: () => Promise<void>) => Promise<boolean>;
+  runAction: (action: () => Promise<void>, issue?: IssueContext) => Promise<boolean>;
 }
 
 export interface PushToTalkPreference {

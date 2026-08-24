@@ -4,6 +4,7 @@ import type { screenshare } from "@wailsjs/go/models";
 import { EventsOn } from "@wailsjs/runtime/runtime";
 import { RoomControlRow, RoomMemberList } from "./RoomControls";
 import { nativePopoverOpen, nativePopoverSupported } from "./popover";
+import type { IssueInput } from "./issues";
 import type { ActionProps, AppState, FriendlyStatus, PushToTalkPreference } from "./types";
 
 const screenVideoCodecs = ["avc1.42E01F", "avc1.4D401F"] as const;
@@ -75,7 +76,7 @@ interface RoomProps extends ActionProps {
   pushToTalk: PushToTalkPreference;
   configurePushToTalk: (enabled: boolean, code: string) => Promise<boolean>;
   screenFullscreen: boolean;
-  reportError: (message: string) => void;
+  reportIssue: (issue: IssueInput) => void;
   registerLeaveAction: (action: (() => Promise<void>) | undefined) => void;
   toggleScreenFullscreen: () => void;
   exitScreenFullscreen: () => void;
@@ -382,7 +383,7 @@ export default function Room(props: RoomProps) {
 
   function reportScreenError(cause: unknown) {
     const message = cause instanceof Error ? cause.message : String(cause || "屏幕分享失败");
-    props.reportError(message.replace(/^Error:\s*/, ""));
+    props.reportIssue({ type: "screen", message });
   }
 
   async function openScreenSourcePicker() {
@@ -648,7 +649,7 @@ export default function Room(props: RoomProps) {
   async function leaveRoom() {
     props.exitScreenFullscreen();
     await stopScreenShare(false);
-    await props.runAction(Backend.LeaveRoom);
+    await props.runAction(Backend.LeaveRoom, { type: "room", title: "离开房间失败" });
   }
 
   return (
@@ -688,12 +689,6 @@ export default function Room(props: RoomProps) {
                 </div>
               </Show>
             </div>
-            <Show when={props.state.audio.error}>
-              <p class="voice-error">{props.state.audio.error}</p>
-            </Show>
-            <Show when={!props.state.audio.available && !props.state.audio.error}>
-              <p class="voice-error">没有可用的麦克风或扬声器。</p>
-            </Show>
             <RoomControlRow
               state={props.state}
               remotePeers={remotePeers()}

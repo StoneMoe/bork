@@ -36,7 +36,6 @@ type Device struct {
 }
 
 type Status struct {
-	Available                   bool     `json:"available"`
 	Running                     bool     `json:"running"`
 	CaptureMuted                bool     `json:"captureMuted"`
 	PlaybackMuted               bool     `json:"playbackMuted"`
@@ -54,6 +53,10 @@ type Status struct {
 	CaptureDevices              []Device `json:"captureDevices"`
 	PlaybackDevices             []Device `json:"playbackDevices"`
 	Error                       string   `json:"error,omitempty"`
+}
+
+func (s Status) DevicesAvailable() bool {
+	return len(s.CaptureDevices) > 0 && len(s.PlaybackDevices) > 0
 }
 
 func defaultStatus() Status {

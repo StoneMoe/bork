@@ -22,6 +22,9 @@ export function RoomControlRow(props: RoomControlRowProps) {
   const [fileShareOpen, setFileShareOpen] = createSignal(false);
   let fileShareButton: HTMLButtonElement | undefined;
   const incomingFile = () => props.state.room?.transfers.some((transfer) => transfer.direction === "incoming" && transfer.status === "offered");
+  const audioControlsDisabled = () => props.busy || !props.ready
+    || props.state.audio.captureDevices.length === 0
+    || props.state.audio.playbackDevices.length === 0;
 
   return (
     <>
@@ -76,21 +79,21 @@ export function RoomControlRow(props: RoomControlRowProps) {
             level={props.state.audio.captureLevel}
             clipped={props.state.audio.captureClipped}
             pushToTalk={props.pushToTalk.enabled}
-            disabled={props.busy || !props.ready || !props.state.audio.available}
+            disabled={audioControlsDisabled()}
             setMuted={(muted) => {
               if (props.pushToTalk.enabled) void props.configurePushToTalk(false, props.pushToTalk.code);
-              else void props.runAction(() => Backend.SetCaptureMuted(muted));
+              else void props.runAction(() => Backend.SetCaptureMuted(muted), { type: "audio" });
             }}
-            setGain={(gain) => props.runAction(() => Backend.SetCaptureGain(gain))}
+            setGain={(gain) => props.runAction(() => Backend.SetCaptureGain(gain), { type: "audio" })}
           />
           <AudioControl
             kind="playback"
             label="扬声器"
             muted={props.state.audio.playbackMuted}
             gain={props.state.audio.playbackGain}
-            disabled={props.busy || !props.ready || !props.state.audio.available}
-            setMuted={(muted) => props.runAction(() => Backend.SetPlaybackMuted(muted))}
-            setGain={(gain) => props.runAction(() => Backend.SetPlaybackGain(gain))}
+            disabled={audioControlsDisabled()}
+            setMuted={(muted) => props.runAction(() => Backend.SetPlaybackMuted(muted), { type: "audio" })}
+            setGain={(gain) => props.runAction(() => Backend.SetPlaybackGain(gain), { type: "audio" })}
           />
         </div>
       </div>
@@ -369,6 +372,7 @@ function FileSharePopover(props: {
   focusFallback: () => void;
 }) {
   const [focusedRecipient, setFocusedRecipient] = createSignal("");
+  const [actionError, setActionError] = createSignal("");
   let fileShareCard: HTMLElement | undefined;
   let fileShareCloseButton: HTMLButtonElement | undefined;
   const remoteName = (peer: RemotePeer) => peer.nickname || peer.peerId.slice(0, 14);
@@ -386,6 +390,7 @@ function FileSharePopover(props: {
 
   function closeFileShare() {
     if (!fileShareIsOpen()) return;
+    setActionError("");
     if (nativePopoverSupported) fileShareCard?.hidePopover();
     else props.setOpen(false);
     restoreFileShareFocus();
@@ -395,6 +400,11 @@ function FileSharePopover(props: {
     queueMicrotask(() => {
       if (fileShareIsOpen()) fileShareCloseButton?.focus({ preventScroll: true });
     });
+  }
+
+  function runFileAction(action: () => Promise<void>) {
+    setActionError("");
+    return props.runAction(action, { onError: setActionError });
   }
 
   createEffect(() => {
@@ -457,7 +467,10 @@ function FileSharePopover(props: {
         const open = event.newState === "open" || nativePopoverOpen(fileShareCard);
         props.setOpen(open);
         if (open) focusFileShareClose();
-        else setFocusedRecipient("");
+        else {
+          setFocusedRecipient("");
+          setActionError("");
+        }
       }}
     >
       <header>
@@ -485,7 +498,7 @@ function FileSharePopover(props: {
                 })}
                 onClick={async (event) => {
                   const button = event.currentTarget;
-                  await props.runAction(async () => { await Backend.OfferFile(peerID); });
+                  await runFileAction(async () => { await Backend.OfferFile(peerID); });
                   queueMicrotask(() => {
                     const active = document.activeElement;
                     if (active === button) {
@@ -511,10 +524,13 @@ function FileSharePopover(props: {
           }}</For>
         </Show>
       </div>
+      <Show when={actionError()}>
+        <p class="file-action-error" role="alert">{actionError()}</p>
+      </Show>
       <TransferPanel
         state={props.state}
         busy={props.busy}
-        runAction={props.runAction}
+        runAction={runFileAction}
         focusFallback={() => {
           if (fileShareCloseButton?.isConnected) fileShareCloseButton.focus({ preventScroll: true });
           else props.focusFallback();
@@ -524,7 +540,7 @@ function FileSharePopover(props: {
   );
 }
 
-function TransferPanel(props: { state: AppState; busy: boolean; runAction: ActionProps["runAction"]; focusFallback: () => void }) {
+function TransferPanel(props: { state: AppState; busy: boolean; runAction: (action: () => Promise<void>) => Promise<boolean>; focusFallback: () => void }) {
   const transfers = () => props.state.room?.transfers ?? [];
   const localName = () => props.state.nickname || "本机";
   const peerName = (transfer: FileTransfer) => transfer.peerNickname || transfer.peerId.slice(0, 14);

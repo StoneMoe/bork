@@ -2,13 +2,13 @@ import { createSignal, onCleanup, onMount } from "solid-js";
 import { GetSnapshot } from "@wailsjs/go/app/App";
 import { app } from "@wailsjs/go/models";
 import { EventsOn } from "@wailsjs/runtime/runtime";
+import type { IssueInput } from "./issues";
 import type { AppState } from "./types";
 
 const emptyState = new app.AppSnapshot({
   version: "dev",
   nickname: "",
   audio: {
-    available: false,
     running: false,
     captureMuted: false,
     playbackMuted: false,
@@ -37,13 +37,12 @@ const emptyState = new app.AppSnapshot({
   },
 });
 
-export function createRemoteState(reportError: (message: string) => void) {
+export function createRemoteState(reportIssue: (issue: IssueInput) => void) {
   const [state, setState] = createSignal<AppState>(emptyState);
   const [ready, setReady] = createSignal(false);
   let disposed = false;
   let requested = false;
   let pulling: Promise<void> | undefined;
-  let lastErrorId = 0;
 
   function refresh(): Promise<void> {
     requested = true;
@@ -56,12 +55,13 @@ export function createRemoteState(reportError: (message: string) => void) {
           if (disposed) return;
           setState(next);
           setReady(true);
-          if (next.error && next.error.id > lastErrorId) {
-            lastErrorId = next.error.id;
-            reportError(next.error.message);
-          }
         } catch (cause) {
-          if (!disposed) reportError(cause instanceof Error ? cause.message : String(cause));
+          if (!disposed) {
+            reportIssue({
+              type: "general",
+              message: cause instanceof Error ? cause.message : String(cause),
+            });
+          }
         }
       }
     })().finally(() => {
@@ -72,13 +72,15 @@ export function createRemoteState(reportError: (message: string) => void) {
   }
 
   onMount(() => {
-    const removeListener = EventsOn("bork:state-changed", () => {
+    const removeStateListener = EventsOn("bork:state-changed", () => {
       void refresh();
     });
+    const removeIssueListener = EventsOn("bork:issue", reportIssue);
     void refresh();
     onCleanup(() => {
       disposed = true;
-      removeListener();
+      removeStateListener();
+      removeIssueListener();
     });
   });
 

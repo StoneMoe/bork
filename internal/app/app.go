@@ -53,8 +53,6 @@ type App struct {
 	stopAudioWatcher    context.CancelFunc
 	audioWatcherDone    chan struct{}
 	lastDiagnostics     Diagnostics
-	lastError           *AppError
-	nextErrorID         uint64
 	nextScreenCaptureID uint32
 	pushToTalk          *globalkey.Listener
 	pushToTalkEnabled   bool
@@ -197,7 +195,7 @@ func (a *App) publishRoomChange(change roomStateChange) {
 		a.lastDiagnostics = diagnostics
 		a.stateMu.Unlock()
 		if change.err != nil {
-			a.recordError(change.err)
+			a.emitIssue(IssueTypeRoom, IssueLevelError, change.err)
 		}
 		a.stopPushToTalkLocked()
 		room := a.detachActiveRoom()
@@ -384,7 +382,7 @@ func (a *App) runScreenVideo(room *roomSession, run *screenVideoRun) {
 		_ = room.client.StopScreenShare()
 		a.emit(ctx, screenPreviewEndedEvent, run.id)
 		if runErr != nil && a.isActiveRoom(room) {
-			a.recordError(errors.New("屏幕分享已停止: " + runErr.Error()))
+			a.emitIssue(IssueTypeScreen, IssueLevelError, errors.New("屏幕分享已停止: "+runErr.Error()))
 			a.markStateChanged()
 		}
 	}()
@@ -435,7 +433,7 @@ func (a *App) startScreenAudioLocked(room *roomSession) {
 		if !errors.Is(err, screenshare.ErrUnsupported) {
 			message += ": " + err.Error()
 		}
-		a.recordError(errors.New(message))
+		a.emitIssue(IssueTypeScreen, IssueLevelWarning, errors.New(message))
 		a.markStateChanged()
 		return
 	}
@@ -458,7 +456,7 @@ func (a *App) runScreenAudio(room *roomSession, run *screenAudioRun) {
 		}
 		room.screenAudio = nil
 		if runErr != nil && a.isActiveRoom(room) {
-			a.recordError(errors.New("屏幕声音已停止，画面仍在共享: " + runErr.Error()))
+			a.emitIssue(IssueTypeScreen, IssueLevelWarning, errors.New("屏幕声音已停止，画面仍在共享: "+runErr.Error()))
 			a.markStateChanged()
 		}
 	}()
@@ -520,7 +518,7 @@ func (a *App) reconcileAudioLocked(room *roomSession) {
 		return
 	}
 	status := audioEngine.Status()
-	if status.Running || !status.Available {
+	if status.Running || !status.DevicesAvailable() {
 		return
 	}
 	if err := audioEngine.Start(room.media); err != nil {
@@ -567,7 +565,7 @@ func (a *App) handlePushToTalkError(event globalkey.ListenerError) {
 	}
 	muted := true
 	_ = a.setMutedLocked(&muted, nil, false)
-	a.recordError(event)
+	a.emitIssue(IssueTypeAudio, IssueLevelError, event)
 	a.markStateChanged()
 }
 
@@ -585,7 +583,7 @@ func (a *App) applyPushToTalk(pressed bool) {
 	}
 	muted := !pressed
 	if err := a.setMutedLocked(&muted, nil, false); err != nil {
-		a.recordError(err)
+		a.emitIssue(IssueTypeAudio, IssueLevelError, err)
 		a.markStateChanged()
 	}
 }
@@ -624,11 +622,6 @@ func (a *App) snapshot() AppSnapshot {
 	if room == nil {
 		diagnostics = cloneDiagnostics(a.lastDiagnostics)
 	}
-	var lastError *AppError
-	if a.lastError != nil {
-		value := *a.lastError
-		lastError = &value
-	}
 	a.stateMu.RUnlock()
 
 	state := AppSnapshot{
@@ -636,7 +629,6 @@ func (a *App) snapshot() AppSnapshot {
 		Nickname:    nickname,
 		Audio:       emptyAudioStatus(),
 		Diagnostics: diagnostics,
-		Error:       lastError,
 	}
 	if audioEngine != nil {
 		state.Audio = audioEngine.Status()
@@ -661,20 +653,11 @@ func (a *App) snapshot() AppSnapshot {
 	return state
 }
 
-func (a *App) recordError(err error) {
+func (a *App) emitIssue(issueType AppIssueType, level AppIssueLevel, err error) {
 	if err == nil {
 		return
 	}
-	a.stateMu.Lock()
-	a.nextErrorID++
-	a.lastError = &AppError{ID: a.nextErrorID, Message: err.Error()}
-	a.stateMu.Unlock()
-}
-
-func (a *App) clearError() {
-	a.stateMu.Lock()
-	a.lastError = nil
-	a.stateMu.Unlock()
+	a.emit(a.appContext, issueEvent, AppIssue{Type: issueType, Level: level, Message: err.Error()})
 }
 
 func (a *App) beforeClose(context.Context) bool {

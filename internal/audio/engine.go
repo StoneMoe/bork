@@ -137,7 +137,7 @@ func (e *Engine) RefreshDevices() error {
 		return nil
 	}
 	e.mu.RLock()
-	available := e.state.Available
+	available := e.state.DevicesAvailable()
 	e.mu.RUnlock()
 	if !selectionChanged && available {
 		return nil
@@ -160,16 +160,14 @@ func (e *Engine) refreshDevicesLocked() (bool, error) {
 	nextCaptureID := availableDeviceID(capture, previousCaptureID)
 	nextPlaybackID := availableDeviceID(playback, previousPlaybackID)
 	selectionChanged := previousCaptureID != nextCaptureID || previousPlaybackID != nextPlaybackID
-	available := len(capture) > 0 && len(playback) > 0
 	unchanged := e.state.CaptureDeviceID == nextCaptureID && e.state.PlaybackDeviceID == nextPlaybackID &&
-		e.state.Available == available && slices.Equal(e.state.CaptureDevices, capture) && slices.Equal(e.state.PlaybackDevices, playback)
+		slices.Equal(e.state.CaptureDevices, capture) && slices.Equal(e.state.PlaybackDevices, playback)
 	if unchanged {
 		e.mu.Unlock()
 		return false, nil
 	}
 	e.state.CaptureDevices = capture
 	e.state.PlaybackDevices = playback
-	e.state.Available = available
 	e.state.CaptureDeviceID = nextCaptureID
 	e.state.PlaybackDeviceID = nextPlaybackID
 	e.mu.Unlock()
@@ -422,7 +420,7 @@ func (e *Engine) startLocked(mediaPort media.AudioPort) error {
 		e.mu.RUnlock()
 		return nil
 	}
-	if !e.state.Available {
+	if !e.state.DevicesAvailable() {
 		e.mu.RUnlock()
 		return errors.New("capture and playback devices are required")
 	}
@@ -809,7 +807,7 @@ func (e *Engine) rebuildRunLocked(run *engineRun) error {
 	mediaPort := run.port
 	e.stopRunLocked(run)
 	e.mu.RLock()
-	available := e.state.Available
+	available := e.state.DevicesAvailable()
 	e.mu.RUnlock()
 	if !available {
 		return nil

@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import * as Backend from "@wailsjs/go/app/App";
 import {
   ClipboardSetText,
@@ -12,9 +12,11 @@ import {
 } from "@wailsjs/runtime/runtime";
 import Room from "./Room";
 import Settings from "./Settings";
+import { appendIssue, collectStateIssues } from "./issues";
 import { closePopoversEvent, nativePopoverOpen, nativePopoverSupported } from "./popover";
 import { parseRoomHistory, roomHistoryStorageKey, withRecentRoom } from "./room-history";
 import { createRemoteState } from "./sync";
+import type { IssueContext, IssueInput, IssueRecord } from "./issues";
 import type { RoomHistoryEntry } from "./room-history";
 import type { ActionProps, AppState, FriendlyStatus, PushToTalkPreference } from "./types";
 
@@ -26,6 +28,7 @@ const remoteLoudnessNormalizationDisabledStorageKey = "bork.audio.remoteLoudness
 const pushToTalkEnabledStorageKey = "bork.audio.pushToTalk.enabled";
 const pushToTalkKeyStorageKey = "bork.audio.pushToTalk.key";
 const defaultPushToTalkKey = "Backquote";
+
 function hasNativeWindowBridge() {
   const host = window as typeof window & {
     chrome?: { webview?: { postMessage?: unknown } };
@@ -68,11 +71,12 @@ export default function App() {
   const [nicknameStorageReady, setNicknameStorageReady] = createSignal(false);
   const [audioPreferencesStorageReady, setAudioPreferencesStorageReady] = createSignal(false);
   const [pushToTalk, setPushToTalk] = createSignal(readPushToTalkPreference());
-  const [pushToTalkStorageReady, setPushToTalkStorageReady] = createSignal(false);
   const customWindowControls = hasNativeWindowBridge();
   const [windowMaximised, setWindowMaximised] = createSignal(false);
   const [screenFullscreen, setScreenFullscreen] = createSignal(false);
-  const [error, setError] = createSignal("");
+  const [reportedIssues, setReportedIssues] = createSignal<IssueRecord[]>([]);
+  const [lastAnnouncement, setLastAnnouncement] = createSignal("");
+  const [attentionOpen, setAttentionOpen] = createSignal(false);
   const [roomHistory, setRoomHistory] = createSignal(readRoomHistory());
   let leaveRoomAction: (() => Promise<void>) | undefined;
   let nicknameRestoreStarted = false;
@@ -80,17 +84,48 @@ export default function App() {
   let pushToTalkRestoreStarted = false;
   let copyTimer: number | undefined;
   let windowStateGeneration = 0;
+  let nextIssueID = 0;
   let screenFullscreenOwned = false;
   let mainView: HTMLElement | undefined;
+  let attentionButton: HTMLButtonElement | undefined;
   let settingsButton: HTMLButtonElement | undefined;
-  const remote = createRemoteState(setError);
+  const remote = createRemoteState(reportIssue);
   const state = remote.state;
-  const operational = remote.ready;
-  const ready = createMemo(() => operational() && pushToTalkStorageReady());
+  // Keep actions disabled until the first backend snapshot replaces the placeholder state.
+  const ready = remote.ready;
   const inRoom = createMemo(() => Boolean(state().room));
   const friendly = createMemo(() => humanStatus(state()));
+  const stateIssues = createMemo(() => collectStateIssues(state()));
+  // New events go first so an older persistent warning cannot hide them below
+  // the popover's initial viewport.
+  const attentionItems = createMemo(() => [...reportedIssues(), ...stateIssues()]);
+  createEffect(() => {
+    // If an action also changed a persistent status, keep the status as the
+    // single source. Otherwise the event could return after status recovery.
+    const persistent = new Set(stateIssues().map((issue) => `${issue.type}\n${issue.message}`));
+    setReportedIssues((current) => {
+      const next = current.filter((issue) => !persistent.has(`${issue.type}\n${issue.message}`));
+      return next.length === current.length ? current : next;
+    });
+  });
+  createEffect(() => {
+    if (attentionItems().length === 0) setAttentionOpen(false);
+  });
   let previousRoomState = inRoom();
   onCleanup(() => window.clearTimeout(copyTimer));
+
+  function reportIssue(input: IssueInput) {
+    const message = input.message.replace(/^Error:\s*/, "").trim();
+    if (!message) return;
+    setReportedIssues((current) => appendIssue(current, { ...input, message }, `event:${++nextIssueID}`));
+    // Clear first so an identical repeated error is announced again.
+    setLastAnnouncement("");
+    queueMicrotask(() => setLastAnnouncement(message));
+  }
+
+  function dismissIssue(id: string) {
+    setReportedIssues((current) => current.filter((issue) => issue.id !== id));
+  }
 
   function requestScreenFullscreen(fullscreen: boolean) {
     screenFullscreenOwned = fullscreen;
@@ -162,7 +197,7 @@ export default function App() {
     if (!settingsOpen()) queueMicrotask(() => mainView?.focus({ preventScroll: true }));
   });
   createEffect(() => {
-    if (!operational() || nicknameRestoreStarted) return;
+    if (!ready() || nicknameRestoreStarted) return;
     nicknameRestoreStarted = true;
     let stored = "";
     try {
@@ -191,21 +226,23 @@ export default function App() {
     } catch { /* storage unavailable */ }
   });
   createEffect(() => {
-    if (!operational() || !nicknameStorageReady() || busy() || pushToTalkRestoreStarted) return;
+    if (!ready() || !nicknameStorageReady() || busy() || pushToTalkRestoreStarted) return;
     pushToTalkRestoreStarted = true;
     const preference = pushToTalk();
-    void runAction(() => Backend.ConfigurePushToTalk(preference.enabled, preference.code)).then((restored) => {
+    void runAction(
+      () => Backend.ConfigurePushToTalk(preference.enabled, preference.code),
+      { type: "audio", title: "按键说话设置失败" },
+    ).then((restored) => {
       if (!restored) {
         // A temporary backend failure must not discard the user's chosen key.
         const disabled = { enabled: false, code: preference.code };
         setPushToTalk(disabled);
         writePushToTalkPreference(disabled);
       }
-      setPushToTalkStorageReady(true);
     });
   });
   createEffect(() => {
-    if (!operational() || !nicknameStorageReady() || busy() || audioPreferencesRestoreStarted) return;
+    if (!ready() || !nicknameStorageReady() || busy() || audioPreferencesRestoreStarted) return;
     audioPreferencesRestoreStarted = true;
     let echoCancellation = true;
     let noiseSuppression = true;
@@ -229,7 +266,7 @@ export default function App() {
       if (restoreEchoCancellation) await Backend.SetEchoCancellation(echoCancellation);
       if (restoreNoiseSuppression) await Backend.SetNoiseSuppression(noiseSuppression);
       if (restoreRemoteLoudnessNormalization) await Backend.SetRemoteLoudnessNormalization(remoteLoudnessNormalization);
-    }).then((restored) => {
+    }, { type: "audio", title: "音频设置恢复失败" }).then((restored) => {
       if (restored) setAudioPreferencesStorageReady(true);
       else audioPreferencesRestoreStarted = false;
     });
@@ -248,23 +285,34 @@ export default function App() {
 
   async function configurePushToTalk(enabled: boolean, code: string) {
     const next = { enabled, code };
-    if (!await runAction(() => Backend.ConfigurePushToTalk(enabled, code))) return false;
+    if (!await runAction(
+      () => Backend.ConfigurePushToTalk(enabled, code),
+      { type: "audio", title: "按键说话设置失败" },
+    )) return false;
     setPushToTalk(next);
     writePushToTalkPreference(next);
     return true;
   }
 
-  async function runAction(action: () => Promise<void>) {
-    if (!operational() || busy()) return false;
+  async function runAction(action: () => Promise<void>, issue?: IssueContext) {
+    if (!ready() || busy()) return false;
     setBusy(true);
-    setError("");
     try {
       await action();
       await remote.refresh();
       return true;
     } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause || "未知错误");
-      setError(message.replace(/^Error:\s*/, ""));
+      const message = (cause instanceof Error ? cause.message : String(cause || "未知错误"))
+        .replace(/^Error:\s*/, "").trim();
+      if (issue?.onError) {
+        issue.onError(message);
+      } else {
+        reportIssue({
+          type: issue?.type ?? "general",
+          title: issue?.title,
+          message,
+        });
+      }
       return false;
     } finally {
       setBusy(false);
@@ -292,7 +340,7 @@ export default function App() {
       const invite = await Backend.GetInvite();
       if (!invite) throw new Error("当前没有房间邀请");
       if (!await ClipboardSetText(invite)) throw new Error("无法写入系统剪贴板");
-    });
+    }, { type: "room", title: "复制房间邀请失败" });
     if (!copied) return;
     setInviteCopied(true);
     window.clearTimeout(copyTimer);
@@ -347,6 +395,62 @@ export default function App() {
           </div>
         </div>
         <div class="topbar-actions">
+          <Show when={attentionItems().length > 0}>
+            <div
+              class="attention-center"
+              classList={{ "is-open": attentionOpen() }}
+              onFocusOut={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setAttentionOpen(false);
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "Escape") return;
+                event.preventDefault();
+                setAttentionOpen(false);
+                attentionButton?.focus();
+              }}
+            >
+              <button
+                ref={attentionButton}
+                class="topbar-icon-button attention-button"
+                classList={{ "has-error": attentionItems().some((item) => item.level === "error") }}
+                type="button"
+                aria-label={`查看 ${attentionItems().length} 条需要关注的信息`}
+                aria-controls="attention-popover"
+                aria-describedby="attention-popover"
+                aria-expanded={attentionOpen()}
+                title="警告和错误"
+                onClick={() => setAttentionOpen((open) => !open)}
+              >
+                <WarningIcon />
+              </button>
+              <section id="attention-popover" class="attention-popover" aria-label="需要关注的信息">
+                <header><strong>需要关注</strong><span>{attentionItems().length}</span></header>
+                <ul>
+                  <Index each={attentionItems()}>{(item) => (
+                    <li class="attention-item" classList={{ [item().level]: true }}>
+                      <div>
+                        <strong>{item().title}</strong>
+                        <p>{item().message}</p>
+                      </div>
+                      <Show when={item().id}>{(id) => (
+                        <button
+                          type="button"
+                          aria-label={`关闭：${item().title}`}
+                          onClick={() => {
+                            dismissIssue(id());
+                            queueMicrotask(() => {
+                              const target = attentionButton?.isConnected ? attentionButton : settingsButton;
+                              target?.focus({ preventScroll: true });
+                            });
+                          }}
+                        ><CloseIcon /></button>
+                      )}</Show>
+                    </li>
+                  )}</Index>
+                </ul>
+              </section>
+            </div>
+          </Show>
           <button ref={settingsButton} class="topbar-icon-button settings-button" type="button" disabled={!ready()} aria-label="打开设置" title="设置" onClick={openSettings}>
             <SettingsIcon />
           </button>
@@ -367,6 +471,7 @@ export default function App() {
           </Show>
         </div>
         <span class="visually-hidden" role="status" aria-live="polite">{inviteCopied() ? "房间邀请已复制" : ""}</span>
+        <span class="visually-hidden" role="alert">{lastAnnouncement()}</span>
       </header>
 
       <section ref={mainView} class="main-view" tabindex="-1">
@@ -391,7 +496,7 @@ export default function App() {
             runAction={runAction}
             pushToTalk={pushToTalk()}
             configurePushToTalk={configurePushToTalk}
-            reportError={setError}
+            reportIssue={reportIssue}
             registerLeaveAction={(action) => { leaveRoomAction = action; }}
             toggleScreenFullscreen={toggleScreenFullscreen}
             exitScreenFullscreen={exitScreenFullscreen}
@@ -408,16 +513,11 @@ export default function App() {
           runAction={runAction}
           pushToTalk={pushToTalk()}
           configurePushToTalk={configurePushToTalk}
+          issue={reportedIssues()[0]}
+          dismissIssue={dismissIssue}
         />
       </Show>
 
-      <Show when={error()}>
-        <div class="error" role="alert">
-          <strong>出现问题</strong>
-          <span>{error()}</span>
-          <button type="button" aria-label="关闭" onClick={() => setError("")}>关闭</button>
-        </div>
-      </Show>
     </main>
   );
 }
@@ -436,6 +536,10 @@ function CheckIcon() {
 
 function SettingsIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6" /></svg>;
+}
+
+function WarningIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4.5 20 19H4zM12 9v4.5M12 16.5h.01" /></svg>;
 }
 
 function MinimiseIcon() {
@@ -491,12 +595,18 @@ function Lobby(props: LobbyProps) {
 
   async function createRoom(event: SubmitEvent) {
     event.preventDefault();
-    if (await props.runAction(() => Backend.CreateRoom(roomName().trim()))) setRoomName("");
+    if (await props.runAction(
+      () => Backend.CreateRoom(roomName().trim()),
+      { type: "room", title: "创建房间失败" },
+    )) setRoomName("");
   }
 
   async function joinRoom(event: SubmitEvent) {
     event.preventDefault();
-    if (await props.runAction(() => Backend.JoinRoom(invite().trim()))) setInvite("");
+    if (await props.runAction(
+      () => Backend.JoinRoom(invite().trim()),
+      { type: "room", title: "加入房间失败" },
+    )) setInvite("");
   }
 
   return (
@@ -586,7 +696,10 @@ function Lobby(props: LobbyProps) {
                       type="button"
                       disabled={props.busy || !props.ready}
                       title={`重新加入 ${room.name} · ${new Date(room.visitedAt).toLocaleString("zh-CN")}`}
-                      onClick={() => void props.runAction(() => Backend.JoinRoom(room.invite))}
+                      onClick={() => void props.runAction(
+                        () => Backend.JoinRoom(room.invite),
+                        { type: "room", title: "重新加入房间失败" },
+                      )}
                     >
                       <HistoryIcon />
                       <span>{room.name}</span>

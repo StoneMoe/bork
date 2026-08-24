@@ -223,8 +223,6 @@
 .screen-sharer-select:focus-visible { outline: 1px solid rgba(145, 167, 232, 0.72); outline-offset: 3px; }
 .screen-preview canvas.ready { animation: ui-fade 160ms ease-out; }
 
-.voice-error { margin: 12px 0 0; color: var(--danger); font-size: 12px; line-height: 1.5; text-align: right; }
-
 @media (max-width: 640px) {
   .room-peers { padding: 20px 14px 14px; }
   .room-member-area { max-height: min(52%, 360px); }

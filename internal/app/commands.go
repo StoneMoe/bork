@@ -212,10 +212,9 @@ func (a *App) createRoom(roomInvite invite.Invite) error {
 	if err := a.activateRoom(client); err != nil {
 		return err
 	}
-	a.clearError()
 	if a.pushToTalkEnabled {
 		if err := a.pushToTalk.Start(a.pushToTalkKey); err != nil {
-			a.recordError(err)
+			a.emitIssue(IssueTypeAudio, IssueLevelError, err)
 		}
 	}
 	a.markStateChanged()
@@ -242,7 +241,6 @@ func (a *App) LeaveRoom() error {
 	}
 	a.stateMu.Lock()
 	a.lastDiagnostics = emptyDiagnostics()
-	a.lastError = nil
 	a.stateMu.Unlock()
 	a.markStateChanged()
 	a.commandMu.Unlock()
@@ -422,7 +420,7 @@ func (a *App) configurePushToTalkLocked(audioEngine *audio.Engine, enabled bool,
 	a.pushToTalkEnabled = enabled
 	a.pushToTalkKey = code
 	if err := a.setMutedLocked(&muted, nil, false); err != nil {
-		a.recordError(err)
+		a.emitIssue(IssueTypeAudio, IssueLevelError, err)
 	}
 	return nil
 }
@@ -447,7 +445,7 @@ func (a *App) restoreMutedAfterPushToTalkFailure(previousMuted bool) {
 	// keeps an existing PTT setup closed until its key is pressed again.
 	muted := previousMuted || a.pushToTalkEnabled
 	if err := a.setMutedLocked(&muted, nil, false); err != nil {
-		a.recordError(err)
+		a.emitIssue(IssueTypeAudio, IssueLevelError, err)
 	}
 }
 

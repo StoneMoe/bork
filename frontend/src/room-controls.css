@@ -172,6 +172,7 @@
 .file-recipient-list small { color: var(--text-faint); font: 9px/1.2 var(--font-mono); }
 .file-recipient-list b { flex: 0 0 auto; color: var(--accent); font-size: 9px; }
 .file-recipient-empty { grid-column: 1 / -1; margin: 0; padding: 12px 2px; color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.file-action-error { margin: 0; padding: 0 13px 10px; color: var(--danger); font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
 .file-share-card .transfer-panel { border-bottom: 0; border-top: 1px solid rgba(var(--contrast-rgb), 0.055); padding: 0 11px; }
 
 .floating-card {

@@ -82,6 +82,68 @@
 .copy-invite-button.copied:hover:not(:disabled),
 .copy-invite-button.copied:focus-visible { color: var(--success); }
 
+.attention-center { position: relative; display: grid; place-items: center; --wails-draggable: no-drag; }
+.attention-button,
+.attention-button:hover:not(:disabled),
+.attention-button:focus-visible { color: var(--warning); }
+.attention-button.has-error,
+.attention-button.has-error:hover:not(:disabled),
+.attention-button.has-error:focus-visible { color: var(--danger); }
+.attention-center:hover::after,
+.attention-center.is-open::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  right: 0;
+  width: min(360px, calc(100vw - 28px));
+  height: 6px;
+}
+.attention-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 4;
+  width: min(360px, calc(100vw - 28px));
+  max-height: min(320px, calc(100dvh - 90px));
+  overflow-y: auto;
+  border: 1px solid rgba(var(--warning-rgb), 0.26);
+  border-radius: 9px;
+  padding: 12px;
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+  color: var(--text-default);
+  background: var(--surface-raised);
+  box-shadow: 0 8px 22px rgba(var(--shadow-rgb), 0.18);
+  transform: translateY(-3px);
+  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms;
+}
+.attention-center:hover .attention-popover,
+.attention-center.is-open .attention-popover { visibility: visible; opacity: 1; pointer-events: auto; transform: translateY(0); }
+.attention-popover > header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.attention-popover > header strong { color: var(--text-strong); font-size: 12px; }
+.attention-popover > header span { color: var(--text-faint); font: 10px/1 var(--font-mono); }
+.attention-popover ul { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
+.attention-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  border: 1px solid rgba(var(--contrast-rgb), 0.08);
+  border-radius: 7px;
+  padding: 9px 10px;
+  background: var(--surface-input);
+}
+.attention-item > div { min-width: 0; }
+.attention-item strong { display: block; color: var(--warning); font-size: 11px; }
+.attention-item.error strong { color: var(--danger-strong); }
+.attention-item p { margin: 4px 0 0; color: var(--text-muted); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; user-select: text; }
+.attention-item > button { width: 26px; height: 26px; display: grid; place-items: center; border: 0; border-radius: 6px; padding: 0; color: var(--danger-strong); cursor: pointer; background: transparent; }
+.attention-item > button:hover,
+.attention-item > button:focus-visible { color: var(--danger-hover); background: rgba(var(--danger-rgb), 0.1); }
+.attention-item > button svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; }
+
 .window-controls {
   height: 36px;
   display: flex;
@@ -361,33 +423,6 @@
 .room-history-remove:hover,
 .room-history-remove:focus-visible { color: var(--danger); background: rgba(var(--danger-rgb), 0.1); opacity: 1; }
 .room-history-remove svg { width: 10px; height: 10px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; }
-
-.error {
-  position: absolute;
-  right: 28px;
-  bottom: 28px;
-  z-index: 30;
-  width: min(460px, calc(100% - 56px));
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  gap: 12px;
-  align-items: center;
-  padding: 13px 14px;
-  border: 1px solid rgba(var(--danger-rgb), 0.34);
-  border-left: 3px solid var(--danger);
-  color: var(--danger-text);
-  background: var(--danger-surface);
-  box-shadow: 0 16px 50px rgba(var(--shadow-rgb), 0.35);
-  font-size: 13px;
-  line-height: 1.45;
-  animation: ui-enter 160ms ease-out;
-}
-
-.error strong,
-.error button { color: var(--danger-strong); font: 700 11px/1 var(--font-ui); }
-.error button { min-height: 30px; border: 0; border-radius: 6px; padding: 0 8px; cursor: pointer; background: transparent; }
-.error button:hover,
-.error button:focus-visible { color: var(--danger-hover); background: rgba(var(--danger-rgb), 0.12); }
 
 @media (max-width: 760px) {
   .lobby-view { grid-template-columns: 1fr; gap: 18px; align-content: start; justify-items: center; padding: 26px 16px 32px; overflow-y: auto; }

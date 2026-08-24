@@ -10,6 +10,7 @@ import (
 
 const (
 	stateChangedEvent       = "bork:state-changed"
+	issueEvent              = "bork:issue"
 	screenVideoChunkEvent   = "bork:screen-video-chunk"
 	screenPreviewChunkEvent = "bork:screen-preview-chunk"
 	screenPreviewEndedEvent = "bork:screen-preview-ended"
@@ -79,9 +80,25 @@ type ScreenPreviewChunkEvent struct {
 	Bytes     []byte `json:"bytes"`
 }
 
-type AppError struct {
-	ID      uint64 `json:"id"`
-	Message string `json:"message"`
+type AppIssueType string
+
+const (
+	IssueTypeRoom   AppIssueType = "room"
+	IssueTypeAudio  AppIssueType = "audio"
+	IssueTypeScreen AppIssueType = "screen"
+)
+
+type AppIssueLevel string
+
+const (
+	IssueLevelWarning AppIssueLevel = "warning"
+	IssueLevelError   AppIssueLevel = "error"
+)
+
+type AppIssue struct {
+	Type    AppIssueType  `json:"type"`
+	Level   AppIssueLevel `json:"level"`
+	Message string        `json:"message"`
 }
 
 type AppSnapshot struct {
@@ -90,7 +107,6 @@ type AppSnapshot struct {
 	Room        *RoomState   `json:"room,omitempty"`
 	Audio       audio.Status `json:"audio"`
 	Diagnostics Diagnostics  `json:"diagnostics"`
-	Error       *AppError    `json:"error,omitempty"`
 }
 
 type Diagnostics struct {

@@ -2,6 +2,7 @@ import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-j
 import * as Backend from "@wailsjs/go/app/App";
 import { MicrophoneIcon, SpeakerIcon } from "./RoomControls";
 import Select, { type SelectOption } from "./Select";
+import type { IssueRecord } from "./issues";
 import type { ActionProps, AppState, Candidate, PushToTalkPreference, TrackerStatus } from "./types";
 
 type ThemePreference = "system" | "dark" | "light";
@@ -11,6 +12,8 @@ interface SettingsProps extends ActionProps {
   close: () => void;
   pushToTalk: PushToTalkPreference;
   configurePushToTalk: (enabled: boolean, code: string) => Promise<boolean>;
+  issue?: IssueRecord;
+  dismissIssue: (id: string) => void;
 }
 
 const themeStorageKey = "bork.theme";
@@ -77,8 +80,6 @@ export default function Settings(props: SettingsProps) {
   });
   const connectivity = () => diagnostics().connectivity;
   const discoveryHints = () => connectivity()?.discoveryHints || [];
-  const diagnosticErrors = () => [diagnostics().networkError, diagnostics().discoveryError, diagnostics().portMappingError]
-    .filter((message): message is string => Boolean(message));
   const [nickname, setNickname] = createSignal(props.state.nickname);
   const [capturingPushToTalkKey, setCapturingPushToTalkKey] = createSignal(false);
   const [now, setNow] = createSignal(Date.now());
@@ -118,6 +119,17 @@ export default function Settings(props: SettingsProps) {
       if (next === "system") localStorage.removeItem(themeStorageKey);
       else localStorage.setItem(themeStorageKey, next);
     } catch { /* storage unavailable */ }
+  }
+
+  function dismissLatestIssue() {
+    const issue = props.issue;
+    if (!issue?.id) return;
+    props.dismissIssue(issue.id);
+    queueMicrotask(() => {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && active !== document.body && active.isConnected) return;
+      tabButtons[activeTab()]?.focus({ preventScroll: true });
+    });
   }
 
   function moveTab(event: KeyboardEvent, index: number) {
@@ -195,6 +207,17 @@ export default function Settings(props: SettingsProps) {
             >{tab.label}</button>
           )}</For>
         </nav>
+        <Show when={props.issue}>{(issue) => (
+          <div class="settings-issue attention-item" classList={{ [issue().level]: true }}>
+            <div>
+              <strong>{issue().title}</strong>
+              <p>{issue().message}</p>
+            </div>
+            <button type="button" aria-label={`关闭：${issue().title}`} onClick={dismissLatestIssue}>
+              <SettingsCloseIcon />
+            </button>
+          </div>
+        )}</Show>
         <div class="settings-content" tabindex="0">
           <section
           id="settings-panel-audio"
@@ -214,7 +237,10 @@ export default function Settings(props: SettingsProps) {
               options={audioDeviceOptions(audio().playbackDevices)}
               labelledBy="playback-device-label"
               disabled={props.busy || !props.ready}
-              onChange={(value) => void props.runAction(() => Backend.SetAudioDevices(audio().captureDeviceId, value))}
+              onChange={(value) => void props.runAction(
+                () => Backend.SetAudioDevices(audio().captureDeviceId, value),
+                { type: "audio" },
+              )}
             />
           </div>
           <div class="audio-device-field audio-device-row">
@@ -228,9 +254,18 @@ export default function Settings(props: SettingsProps) {
               options={audioDeviceOptions(audio().captureDevices)}
               labelledBy="capture-device-label"
               disabled={props.busy || !props.ready}
-              onChange={(value) => void props.runAction(() => Backend.SetAudioDevices(value, audio().playbackDeviceId))}
+              onChange={(value) => void props.runAction(
+                () => Backend.SetAudioDevices(value, audio().playbackDeviceId),
+                { type: "audio" },
+              )}
             />
           </div>
+          <Show when={
+            props.state.audio.captureDevices.length === 0
+            || props.state.audio.playbackDevices.length === 0
+          }>
+            <p class="empty-diagnostic audio-device-empty">没有可用的麦克风或扬声器。</p>
+          </Show>
           <div class="audio-toggles">
             <label class="setting-row audio-toggle">
               <span>
@@ -285,7 +320,7 @@ export default function Settings(props: SettingsProps) {
                 onChange={async (event) => {
                   const input = event.currentTarget;
                   const checked = input.checked;
-                  if (!await props.runAction(() => Backend.SetEchoCancellation(checked))) input.checked = !checked;
+                  if (!await props.runAction(() => Backend.SetEchoCancellation(checked), { type: "audio" })) input.checked = !checked;
                 }}
               />
             </label>
@@ -301,7 +336,7 @@ export default function Settings(props: SettingsProps) {
                 onChange={async (event) => {
                   const input = event.currentTarget;
                   const checked = input.checked;
-                  if (!await props.runAction(() => Backend.SetNoiseSuppression(checked))) input.checked = !checked;
+                  if (!await props.runAction(() => Backend.SetNoiseSuppression(checked), { type: "audio" })) input.checked = !checked;
                 }}
               />
             </label>
@@ -317,17 +352,11 @@ export default function Settings(props: SettingsProps) {
                 onChange={async (event) => {
                   const input = event.currentTarget;
                   const checked = input.checked;
-                  if (!await props.runAction(() => Backend.SetRemoteLoudnessNormalization(checked))) input.checked = !checked;
+                  if (!await props.runAction(() => Backend.SetRemoteLoudnessNormalization(checked), { type: "audio" })) input.checked = !checked;
                 }}
               />
             </label>
           </div>
-          <Show when={props.state.audio.error}>
-            <p class="diagnostic-error">{props.state.audio.error}</p>
-          </Show>
-          <Show when={!props.state.audio.available && !props.state.audio.error}>
-            <p class="empty-diagnostic">没有可用的麦克风或扬声器。</p>
-          </Show>
           </section>
           <section
           id="settings-panel-device"
@@ -479,17 +508,15 @@ export default function Settings(props: SettingsProps) {
               </div>
             </Show>
           </div>
-          <Show when={diagnosticErrors().length > 0}>
-            <div class="diagnostic-section">
-              <div class="diagnostic-heading"><span>错误</span><b>{diagnosticErrors().length}</b></div>
-              <For each={diagnosticErrors()}>{(message) => <p class="diagnostic-error">{message}</p>}</For>
-            </div>
-          </Show>
           </section>
         </div>
       </aside>
     </div>
   );
+}
+
+function SettingsCloseIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>;
 }
 
 function formatRelativeTime(value: string, now: number): string {
