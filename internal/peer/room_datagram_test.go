@@ -37,18 +37,18 @@ func TestRoomDatagramRefreshesOnlyAuthenticatedDirectSource(t *testing.T) {
 	oldActivity := time.Date(2026, time.August, 17, 10, 0, 0, 0, time.UTC)
 	senderSession := &PeeringSession{
 		authenticated:             true,
-		lastAuthenticatedPacketAt: oldActivity, audioStreamID: streamID,
+		lastAuthenticatedPacketAt: oldActivity, voiceStreamID: streamID,
 	}
 	forwarderSession := &PeeringSession{
 		path: forwarderPath, authenticated: true,
 		lastAuthenticatedPacketAt: oldActivity,
 	}
-	receiver.remotePeers[sender.PeerID()] = &RemotePeer{identity: sender.Identity, activeSession: senderSession}
-	receiver.remotePeers[forwarder.PeerID()] = &RemotePeer{identity: forwarder.Identity, activeSession: forwarderSession}
+	receiver.remotePeers[sender.PeerID] = &RemotePeer{peerID: sender.PeerID, activeSession: senderSession}
+	receiver.remotePeers[forwarder.PeerID] = &RemotePeer{peerID: forwarder.PeerID, activeSession: forwarderSession}
 
 	header := protocol.RoomDatagramHeader{
-		Class: protocol.TrafficAudio, SenderID: rawPeerIdentity(sender.Identity),
-		StreamID: streamID, Sequence: 1,
+		Class: protocol.TrafficVoice, SenderID: sender.PeerID,
+		StreamID: streamID, PacketSequence: 1,
 	}
 	packet, err := protocol.MarshalRoomDatagram(
 		receiver.roomTag, header, 1, []byte{1}, receiver.roomDatagramProtector, sender,
@@ -85,7 +85,7 @@ func TestRoomDatagramRefreshesOnlyAuthenticatedDirectSource(t *testing.T) {
 	}
 
 	forwarderSession.authenticated = false
-	header.Sequence++
+	header.PacketSequence++
 	packet, err = protocol.MarshalRoomDatagram(
 		receiver.roomTag, header, 2, []byte{2}, receiver.roomDatagramProtector, sender,
 	)
@@ -123,13 +123,13 @@ func TestScreenAudioRequiresActiveScreenStream(t *testing.T) {
 		path: path, authenticated: true,
 		remoteScreenState: screenState{active: true, streamID: streamID},
 	}
-	receiver.remotePeers[sender.PeerID()] = &RemotePeer{identity: sender.Identity, activeSession: session}
+	receiver.remotePeers[sender.PeerID] = &RemotePeer{peerID: sender.PeerID, activeSession: session}
 	flow := media.NewFlow()
-	flow.SetScreenAudioSource(sender.PeerID())
+	flow.SetScreenAudioSource(sender.PeerID)
 
 	header := protocol.RoomDatagramHeader{
-		Class: protocol.TrafficScreenAudio, SenderID: rawPeerIdentity(sender.Identity),
-		StreamID: streamID, Sequence: 1,
+		Class: protocol.TrafficScreenAudio, SenderID: sender.PeerID,
+		StreamID: streamID, PacketSequence: 1,
 	}
 	payload := []byte{1, 2, 3}
 	packet, err := protocol.MarshalRoomDatagram(receiver.roomTag, header, 480, payload, receiver.roomDatagramProtector, sender)
@@ -143,7 +143,7 @@ func TestScreenAudioRequiresActiveScreenStream(t *testing.T) {
 	}
 
 	session.remoteScreenState = screenState{}
-	header.Sequence++
+	header.PacketSequence++
 	packet, err = protocol.MarshalRoomDatagram(receiver.roomTag, header, 960, payload, receiver.roomDatagramProtector, sender)
 	if err != nil {
 		t.Fatal(err)

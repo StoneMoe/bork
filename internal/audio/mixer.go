@@ -1,11 +1,13 @@
 package audio
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
 	"slices"
 
+	"bork/internal/identity"
 	"bork/internal/media"
 
 	"github.com/thesyncim/gopus"
@@ -34,23 +36,23 @@ type jitterStream struct {
 }
 
 type mixerStreamKey struct {
-	peerID string
+	peerID identity.PeerID
 	kind   media.AudioStreamKind
 }
 
 type mixer struct {
 	streams               map[mixerStreamKey]*jitterStream
 	maxFrameBytes         int
-	speakingPeerIDs       []string
+	speakingPeerIDs       []identity.PeerID
 	loudnessNormalization bool
-	screenAudioSourceID   string
+	screenAudioSourceID   identity.PeerID
 }
 
 func newMixer(maxFrameBytes int) *mixer {
 	return &mixer{
 		streams:               make(map[mixerStreamKey]*jitterStream),
 		maxFrameBytes:         maxFrameBytes,
-		speakingPeerIDs:       []string{},
+		speakingPeerIDs:       []identity.PeerID{},
 		loudnessNormalization: true,
 	}
 }
@@ -134,7 +136,7 @@ func (m *mixer) Add(frame media.ReceivedFrame) error {
 	return nil
 }
 
-func (m *mixer) setScreenAudioSource(sourceID string) {
+func (m *mixer) setScreenAudioSource(sourceID identity.PeerID) {
 	if m.screenAudioSourceID == sourceID {
 		return
 	}
@@ -254,7 +256,7 @@ func (m *mixer) NextInto(destination []float32) (bool, error) {
 	return true, mixErr
 }
 
-func (m *mixer) SpeakingPeerIDs() []string {
+func (m *mixer) SpeakingPeerIDs() []identity.PeerID {
 	return m.speakingPeerIDs
 }
 
@@ -265,7 +267,9 @@ func (m *mixer) refreshSpeakingPeerIDs() {
 			m.speakingPeerIDs = append(m.speakingPeerIDs, key.peerID)
 		}
 	}
-	slices.Sort(m.speakingPeerIDs)
+	slices.SortFunc(m.speakingPeerIDs, func(first, second identity.PeerID) int {
+		return bytes.Compare(first[:], second[:])
+	})
 }
 
 func contiguousStart(frames map[uint32]jitterFrame) (uint32, bool) {

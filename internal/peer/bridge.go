@@ -1,12 +1,10 @@
 package peer
 
 import (
-	"bytes"
 	"context"
-	"crypto/ed25519"
 	"errors"
 	"net/netip"
-	"sort"
+	"slices"
 	"time"
 
 	"bork/internal/identity"
@@ -20,25 +18,19 @@ const (
 )
 
 type topologyPeer struct {
-	identity  identity.Identity
 	lastSeen  time.Time
-	neighbors map[string]time.Time
+	neighbors map[identity.PeerID]time.Time
 }
 
-func (c *Client) recordTopologyClaims(sender identity.Identity, entries []topologyEntry, now time.Time) {
-	senderID := sender.PeerID()
+func (c *Client) recordTopologyClaims(sender identity.PeerID, entries []topologyEntry, now time.Time) {
 	senderPeer := c.rememberTopologyPeer(sender, now)
-	claims := make(map[string]time.Time, len(entries))
+	claims := make(map[identity.PeerID]time.Time, len(entries))
 	for _, entry := range entries {
-		peerIdentity, err := identity.FromPublicKey(ed25519.PublicKey(entry.peerID[:]))
-		if err != nil {
+		peerID := entry.peerID
+		if c.rememberTopologyPeer(peerID, now) == nil {
 			continue
 		}
-		peerID := peerIdentity.PeerID()
-		if c.rememberTopologyPeer(peerIdentity, now) == nil {
-			continue
-		}
-		if peerID != senderID && peerID != c.localIdentity.PeerID() {
+		if peerID != sender && peerID != c.localIdentity.PeerID {
 			claims[peerID] = now.Add(topologyClaimTTL)
 		}
 	}
@@ -62,8 +54,8 @@ func (c *Client) recordTopologyClaims(sender identity.Identity, entries []topolo
 	}
 }
 
-func (c *Client) bridgePathTo(targetID string, now time.Time) (Path, bool) {
-	if targetID == "" || targetID == c.localIdentity.PeerID() {
+func (c *Client) bridgePathTo(targetID identity.PeerID, now time.Time) (Path, bool) {
+	if targetID.IsZero() || targetID == c.localIdentity.PeerID {
 		return Path{}, false
 	}
 	if target := c.remotePeers[targetID]; target != nil && target.activeSession != nil && target.activeSession.authenticated && target.activeSession.path.IsDirect() {
@@ -74,7 +66,7 @@ func (c *Client) bridgePathTo(targetID string, now time.Time) (Path, bool) {
 		return Path{}, false
 	}
 
-	intermediaries := make([]string, 0, len(c.remotePeers))
+	intermediaries := make([]identity.PeerID, 0, len(c.remotePeers))
 	for peerID, remote := range c.remotePeers {
 		if remote.activeSession == nil || !remote.activeSession.authenticated || !remote.activeSession.path.IsDirect() {
 			continue
@@ -91,54 +83,65 @@ func (c *Client) bridgePathTo(targetID string, now time.Time) (Path, bool) {
 	if len(intermediaries) == 0 {
 		return Path{}, false
 	}
-	sort.Strings(intermediaries)
+	slices.SortFunc(intermediaries, comparePeerIDs)
 	intermediary := c.remotePeers[intermediaries[0]]
 	path, err := NewBridgePath(
 		intermediary.activeSession.path.Address(),
-		rawPeerIdentity(intermediary.identity),
-		rawPeerIdentity(targetPeer.identity),
+		intermediary.peerID,
+		targetID,
 	)
 	return path, err == nil
 }
 
-func (c *Client) sendBridgeHellos(now time.Time) {
-	peerIDs := make([]string, 0, len(c.topology))
+func (c *Client) probeBridgePaths(now time.Time) {
+	peerIDs := make([]identity.PeerID, 0, len(c.topology))
 	for peerID := range c.topology {
 		peerIDs = append(peerIDs, peerID)
 	}
-	sort.Strings(peerIDs)
+	slices.SortFunc(peerIDs, comparePeerIDs)
 	for _, peerID := range peerIDs {
 		path, ok := c.bridgePathTo(peerID, now)
 		if !ok || c.sessionUsesPath(peerID, path) {
 			continue
 		}
-		if remote := c.remotePeers[peerID]; remote != nil && remote.activeSession != nil {
-			c.rememberCandidatePath(remote.activeSession, path, now)
+		remote := c.remotePeers[peerID]
+		if remote == nil {
+			c.sendHelloProbeOnPath(path)
+			continue
 		}
-		c.sendHelloOnPath(path)
+		peerSess := remote.pendingSession
+		if peerSess == nil {
+			peerSess = remote.activeSession
+		}
+		if peerSess == nil {
+			c.sendHelloProbeOnPath(path)
+			continue
+		}
+		c.rememberCandidatePath(peerSess, path, now)
+		c.sendSessionHelloOnPath(peerSess, path)
 	}
 }
 
-func (c *Client) sendControlOnPath(path Path, inner []byte) error {
+func (c *Client) sendPeerPacketOnPath(path Path, inner []byte) error {
 	return c.sendPacketOnPath(path, inner, false)
 }
 
-func (c *Client) sendPacketOnPath(path Path, inner []byte, background bool) error {
+func (c *Client) sendPacketOnPath(path Path, inner []byte, lowPriority bool) error {
 	if c.roomNetwork == nil || !path.IsValid() {
 		return errors.New("network path is unavailable")
 	}
 	if path.IsDirect() {
-		if background {
-			return c.roomNetwork.EnqueueBackground(inner, path.Address())
+		if lowPriority {
+			return c.roomNetwork.EnqueueLowPriority(inner, path.Address())
 		}
 		return c.roomNetwork.EnqueueControl(inner, path.Address())
 	}
-	packet, destination, err := c.bridgePacket(path, inner, background)
+	packet, destination, err := c.bridgePacket(path, inner, lowPriority)
 	if err != nil {
 		return err
 	}
-	if background {
-		return c.roomNetwork.EnqueueBackground(packet, destination)
+	if lowPriority {
+		return c.roomNetwork.EnqueueLowPriority(packet, destination)
 	}
 	return c.roomNetwork.EnqueueControl(packet, destination)
 }
@@ -157,25 +160,21 @@ func (c *Client) writeControlOnPath(ctx context.Context, path Path, inner []byte
 	return c.roomNetwork.WriteControl(ctx, packet, destination)
 }
 
-func (c *Client) bridgePacket(path Path, inner []byte, background bool) ([]byte, netip.AddrPort, error) {
-	origin := rawPeerIdentity(c.localIdentity.Identity)
-	if origin == ([32]byte{}) || path.Target() == ([32]byte{}) || path.Target() == origin || path.Intermediary() == origin {
+func (c *Client) bridgePacket(path Path, inner []byte, lowPriority bool) ([]byte, netip.AddrPort, error) {
+	origin := c.localIdentity.PeerID
+	if origin.IsZero() || path.Target().IsZero() || path.Target() == origin || path.Intermediary() == origin {
 		return nil, netip.AddrPort{}, errors.New("bridge path endpoints are invalid")
 	}
-	intermediaryIdentity, err := identityFromRaw(path.Intermediary())
-	if err != nil {
-		return nil, netip.AddrPort{}, err
-	}
-	intermediary := c.remotePeers[intermediaryIdentity.PeerID()]
+	intermediary := c.remotePeers[path.Intermediary()]
 	if intermediary == nil || intermediary.activeSession == nil || !intermediary.activeSession.authenticated || !intermediary.activeSession.path.IsDirect() {
 		return nil, netip.AddrPort{}, errors.New("bridge intermediary is unavailable")
 	}
 	adjacent := intermediary.activeSession
-	sequence, err := adjacent.control.nextSendSequence()
+	sequence, err := adjacent.packetFlow.nextSendSequence()
 	if err != nil {
 		return nil, netip.AddrPort{}, err
 	}
-	packet, err := protocol.MarshalBridge(c.roomTag, adjacent.sessionID, sequence, origin, path.Target(), background, inner, adjacent.ciphers.ControlSend)
+	packet, err := protocol.MarshalBridge(c.roomTag, adjacent.sessionID, sequence, origin, path.Target(), lowPriority, inner, adjacent.ciphers.ControlSend)
 	if err != nil {
 		return nil, netip.AddrPort{}, err
 	}
@@ -188,23 +187,23 @@ func (c *Client) handleBridgePacket(packet endpoint.Datagram) {
 		return
 	}
 	header, err := protocol.ParseSessionHeader(packet.Data)
-	if err != nil || header.RoomTag != c.roomTag || header.Type != protocol.PacketBridgeControl {
+	if err != nil || header.RoomTag != c.roomTag || header.Type != protocol.PacketBridge {
 		return
 	}
 	previous, adjacent, isPendingSession := c.sessionForHeader(header, outerPath)
-	if adjacent == nil || isPendingSession || !adjacent.authenticated || !adjacent.path.IsDirect() || !adjacent.acceptsDataPath(outerPath) || !adjacent.control.mayReceive(header.Sequence) {
+	if adjacent == nil || isPendingSession || !adjacent.authenticated || !adjacent.path.IsDirect() || !adjacent.acceptsDataPath(outerPath) || !adjacent.packetFlow.mayReceive(header.PacketSequence) {
 		return
 	}
 	decoded, err := protocol.ParseBridge(packet.Data, c.roomTag, adjacent.sessionID, adjacent.ciphers.ControlRecv)
-	if err != nil || !adjacent.control.commitReceived(header.Sequence) {
+	if err != nil || !adjacent.packetFlow.commitReceived(header.PacketSequence) {
 		return
 	}
 	now := time.Now()
 	adjacent.lastAuthenticatedPacketAt = now
 	c.rememberAuthenticatedPath(outerPath, now)
 
-	localID := rawPeerIdentity(c.localIdentity.Identity)
-	previousID := rawPeerIdentity(previous.identity)
+	localID := c.localIdentity.PeerID
+	previousID := previous.peerID
 	if decoded.Target == localID {
 		path, pathErr := NewBridgePath(packet.From, previousID, decoded.Origin)
 		if pathErr == nil {
@@ -218,7 +217,7 @@ func (c *Client) handleBridgePacket(packet endpoint.Datagram) {
 	c.forwardBridgePacket(decoded)
 }
 
-func (c *Client) handleBridgedInner(inner []byte, path Path, origin [32]byte) {
+func (c *Client) handleBridgedInner(inner []byte, path Path, origin identity.PeerID) {
 	packetType, roomTag, err := protocol.ParsePrefix(inner)
 	if err != nil || roomTag != c.roomTag {
 		return
@@ -226,7 +225,7 @@ func (c *Client) handleBridgedInner(inner []byte, path Path, origin [32]byte) {
 	switch packetType {
 	case protocol.PacketHello:
 		hello, err := protocol.ParseHello(inner, c.roomTag, c.admissionKey)
-		if err == nil && bytes.Equal(hello.IdentityKey, origin[:]) {
+		if err == nil && hello.PeerID == origin {
 			c.handleHelloOnPath(inner, path)
 		}
 	case protocol.PacketPing, protocol.PacketPong:
@@ -239,30 +238,26 @@ func (c *Client) handleBridgedInner(inner []byte, path Path, origin [32]byte) {
 }
 
 func (c *Client) forwardBridgePacket(decoded protocol.BridgePacket) {
-	targetIdentity, err := identityFromRaw(decoded.Target)
-	if err != nil {
-		return
-	}
-	target := c.remotePeers[targetIdentity.PeerID()]
+	target := c.remotePeers[decoded.Target]
 	if target == nil || target.activeSession == nil || !target.activeSession.authenticated || !target.activeSession.path.IsDirect() || c.roomNetwork == nil {
 		return
 	}
 	adjacent := target.activeSession
-	sequence, err := adjacent.control.nextSendSequence()
+	sequence, err := adjacent.packetFlow.nextSendSequence()
 	if err != nil {
 		return
 	}
-	packet, err := protocol.MarshalBridge(c.roomTag, adjacent.sessionID, sequence, decoded.Origin, decoded.Target, decoded.Background, decoded.Inner, adjacent.ciphers.ControlSend)
+	packet, err := protocol.MarshalBridge(c.roomTag, adjacent.sessionID, sequence, decoded.Origin, decoded.Target, decoded.LowPriority, decoded.Inner, adjacent.ciphers.ControlSend)
 	if err == nil {
-		if decoded.Background {
-			_ = c.roomNetwork.EnqueueBackground(packet, adjacent.path.Address())
+		if decoded.LowPriority {
+			_ = c.roomNetwork.EnqueueLowPriority(packet, adjacent.path.Address())
 		} else {
 			_ = c.roomNetwork.EnqueueControl(packet, adjacent.path.Address())
 		}
 	}
 }
 
-func (c *Client) sessionUsesPath(peerID string, path Path) bool {
+func (c *Client) sessionUsesPath(peerID identity.PeerID, path Path) bool {
 	remote := c.remotePeers[peerID]
 	if remote == nil {
 		return false
@@ -303,16 +298,15 @@ func (c *Client) expireTopology(now time.Time) {
 	}
 }
 
-func (c *Client) rememberTopologyPeer(peerIdentity identity.Identity, now time.Time) *topologyPeer {
-	peerID := peerIdentity.PeerID()
-	if peerID == "" || peerID == c.localIdentity.PeerID() {
+func (c *Client) rememberTopologyPeer(peerID identity.PeerID, now time.Time) *topologyPeer {
+	if peerID.IsZero() || peerID == c.localIdentity.PeerID {
 		return nil
 	}
 	if peer, exists := c.topology[peerID]; exists {
 		peer.lastSeen = now
 		return peer
 	}
-	peer := &topologyPeer{identity: peerIdentity, lastSeen: now, neighbors: make(map[string]time.Time)}
+	peer := &topologyPeer{lastSeen: now, neighbors: make(map[identity.PeerID]time.Time)}
 	c.topology[peerID] = peer
 	return peer
 }

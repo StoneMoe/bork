@@ -8,33 +8,35 @@ import (
 	"encoding/binary"
 	"errors"
 
+	"bork/internal/identity"
+
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
 type TrafficClass byte
 
 const (
-	TrafficAudio TrafficClass = iota + 1
-	TrafficInteractive
-	// TrafficScreenAudio uses the interactive endpoint lane so microphone
+	TrafficVoice TrafficClass = iota + 1
+	TrafficScreenVideo
+	// TrafficScreenAudio uses the screen endpoint lane so microphone
 	// packets always keep their higher scheduling priority.
 	TrafficScreenAudio
 )
 
 type RoomDatagramHeader struct {
-	Class    TrafficClass
-	SenderID [32]byte
-	StreamID [16]byte
-	Sequence uint64
+	Class          TrafficClass
+	SenderID       identity.PeerID
+	StreamID       [16]byte
+	PacketSequence uint64
 }
 
 type RoomDatagram struct {
-	Timestamp uint32
-	Payload   []byte
+	MediaSequence uint32
+	Payload       []byte
 }
 
 func validTrafficClass(class TrafficClass) bool {
-	return class >= TrafficAudio && class <= TrafficScreenAudio
+	return class >= TrafficVoice && class <= TrafficScreenAudio
 }
 
 func NewRoomDatagramCipher(roomDatagramKey [32]byte) cipher.AEAD {
@@ -53,8 +55,8 @@ func ParseRoomDatagramHeader(packet []byte, expectedRoomTag [16]byte) (RoomDatag
 	header := RoomDatagramHeader{Class: TrafficClass(packet[prefixSize])}
 	copy(header.SenderID[:], packet[prefixSize+1:prefixSize+1+32])
 	copy(header.StreamID[:], packet[prefixSize+1+32:prefixSize+1+32+16])
-	header.Sequence = binary.BigEndian.Uint64(packet[roomDatagramHeaderSize-8 : roomDatagramHeaderSize])
-	if !validTrafficClass(header.Class) || header.SenderID == ([32]byte{}) || header.StreamID == ([16]byte{}) || header.Sequence == 0 {
+	header.PacketSequence = binary.BigEndian.Uint64(packet[roomDatagramHeaderSize-8 : roomDatagramHeaderSize])
+	if !validTrafficClass(header.Class) || header.SenderID.IsZero() || header.StreamID == ([16]byte{}) || header.PacketSequence == 0 {
 		return RoomDatagramHeader{}, errors.New("room datagram header is invalid")
 	}
 	return header, nil
@@ -64,8 +66,8 @@ func roomDatagramNonce(packet []byte) []byte {
 	return packet[roomDatagramHeaderSize-chacha20poly1305.NonceSizeX : roomDatagramHeaderSize]
 }
 
-func MarshalRoomDatagram(roomTag [16]byte, header RoomDatagramHeader, timestamp uint32, payload []byte, protector cipher.AEAD, signer crypto.Signer) ([]byte, error) {
-	if !validTrafficClass(header.Class) || header.SenderID == ([32]byte{}) || header.StreamID == ([16]byte{}) || header.Sequence == 0 {
+func MarshalRoomDatagram(roomTag [16]byte, header RoomDatagramHeader, mediaSequence uint32, payload []byte, protector cipher.AEAD, signer crypto.Signer) ([]byte, error) {
+	if !validTrafficClass(header.Class) || header.SenderID.IsZero() || header.StreamID == ([16]byte{}) || header.PacketSequence == 0 {
 		return nil, errors.New("room datagram header is invalid")
 	}
 	if len(payload) == 0 || len(payload) > MaxRoomDatagramPayload {
@@ -79,15 +81,15 @@ func MarshalRoomDatagram(roomTag [16]byte, header RoomDatagramHeader, timestamp 
 	}
 	publicKey, ok := signer.Public().(ed25519.PublicKey)
 	if !ok || len(publicKey) != ed25519.PublicKeySize || !bytes.Equal(publicKey, header.SenderID[:]) {
-		return nil, errors.New("room datagram signer does not match sender identity")
+		return nil, errors.New("room datagram signer does not match sender peer ID")
 	}
 	packet := make([]byte, 0, roomDatagramHeaderSize+4+len(payload)+aeadTagSize+roomDatagramSignatureSize)
 	packet = appendPrefix(packet, PacketRoomDatagram, roomTag)
 	packet = append(packet, byte(header.Class))
 	packet = append(packet, header.SenderID[:]...)
 	packet = append(packet, header.StreamID[:]...)
-	packet = appendUint64(packet, header.Sequence)
-	packet = binary.BigEndian.AppendUint32(packet, timestamp)
+	packet = appendUint64(packet, header.PacketSequence)
+	packet = binary.BigEndian.AppendUint32(packet, mediaSequence)
 	packet = append(packet, payload...)
 	body := packet[roomDatagramHeaderSize:]
 	sealed := protector.Seal(body[:0], roomDatagramNonce(packet), body, packet[:roomDatagramHeaderSize])
@@ -123,7 +125,7 @@ func ParseRoomDatagram(packet []byte, expectedRoomTag [16]byte, expected RoomDat
 		return RoomDatagram{}, errors.New("room datagram authentication failed")
 	}
 	return RoomDatagram{
-		Timestamp: binary.BigEndian.Uint32(opened[:4]),
-		Payload:   opened[4:],
+		MediaSequence: binary.BigEndian.Uint32(opened[:4]),
+		Payload:       opened[4:],
 	}, nil
 }

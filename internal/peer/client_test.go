@@ -1,18 +1,18 @@
 package peer
 
 import (
-	"bytes"
 	"log/slog"
 	"net/netip"
 	"testing"
 	"time"
 
+	"bork/internal/identity"
 	"bork/internal/invite"
 	"bork/internal/networking"
 	"bork/internal/networking/discovery"
 )
 
-func TestNewClientUsesEphemeralRoomIdentity(t *testing.T) {
+func TestNewClientUsesEphemeralRoomPeerID(t *testing.T) {
 	roomInvite, err := invite.New("test room")
 	if err != nil {
 		t.Fatal(err)
@@ -26,18 +26,7 @@ func TestNewClientUsesEphemeralRoomIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	if first.PeerID() == second.PeerID() {
-		t.Fatal("room clients reused an Ed25519 identity")
-	}
-
-	if err := first.rotateHelloEpoch(); err != nil {
-		t.Fatal(err)
-	}
-	identityKey := append([]byte(nil), first.localHello.IdentityKey...)
-	if err := first.rotateHelloEpoch(); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(identityKey, first.localHello.IdentityKey) {
-		t.Fatal("client changed its Ed25519 identity within one room membership")
+		t.Fatal("room clients reused a peer ID")
 	}
 }
 
@@ -45,11 +34,15 @@ func TestExpireRemotePeersDropsStaleSessionRecord(t *testing.T) {
 	now := time.Now()
 	stale := now.Add(-remotePeerTimeout - time.Second)
 	freshPending := &PeeringSession{lastAuthenticatedPacketAt: now}
-	client := &Client{remotePeers: map[string]*RemotePeer{
-		"gone": {
+	goneID := identity.PeerID{1}
+	pendingID := identity.PeerID{2}
+	client := &Client{remotePeers: map[identity.PeerID]*RemotePeer{
+		goneID: {
+			peerID:        goneID,
 			activeSession: &PeeringSession{everAuthenticated: true, lastAuthenticatedPacketAt: stale},
 		},
-		"pending": {
+		pendingID: {
+			peerID:         pendingID,
 			activeSession:  &PeeringSession{everAuthenticated: true, lastAuthenticatedPacketAt: stale},
 			pendingSession: freshPending,
 		},
@@ -57,10 +50,10 @@ func TestExpireRemotePeersDropsStaleSessionRecord(t *testing.T) {
 
 	client.expireRemotePeers()
 
-	if _, exists := client.remotePeers["gone"]; exists {
+	if _, exists := client.remotePeers[goneID]; exists {
 		t.Fatal("stale remote session record was retained")
 	}
-	peer := client.remotePeers["pending"]
+	peer := client.remotePeers[pendingID]
 	if peer == nil || peer.activeSession != nil || peer.pendingSession != freshPending {
 		t.Fatal("fresh pending session was not preserved")
 	}
@@ -79,8 +72,8 @@ func TestExpireRemotePeersKeepsVisiblePeerWhileReconnecting(t *testing.T) {
 	}
 	client := &Client{
 		logger: slog.New(slog.DiscardHandler),
-		remotePeers: map[string]*RemotePeer{
-			"recovering": {activeSession: session},
+		remotePeers: map[identity.PeerID]*RemotePeer{
+			{1}: {peerID: identity.PeerID{1}, activeSession: session},
 		},
 	}
 

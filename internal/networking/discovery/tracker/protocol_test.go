@@ -5,6 +5,8 @@ import (
 	"net/url"
 	"strconv"
 	"testing"
+
+	"bork/internal/identity"
 )
 
 func TestValidateProviderURLRejectsUDP(t *testing.T) {
@@ -18,7 +20,7 @@ func TestTrackerRegistrationIdentityIsSharedAcrossAddresses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	announcer := Announcer{infoHash: [20]byte{1}, identityKey: [32]byte{2}}
+	announcer := Announcer{infoHash: [20]byte{1}, peerID: identity.PeerID{2}}
 	ipv4 := announcer.registration(configured, AnnounceCandidate{
 		Address: netip.MustParseAddr("1.1.1.1"), Port: 6881,
 	})

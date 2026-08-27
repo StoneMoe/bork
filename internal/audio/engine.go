@@ -13,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	"bork/internal/identity"
 	"bork/internal/media"
 
 	"github.com/gen2brain/malgo"
@@ -756,10 +757,10 @@ func (e *Engine) encodeLoop(ctx context.Context, run *engineRun, queue *pcmFrame
 					continue
 				}
 				run.port.SubmitSend(media.SendFrame{
-					Timestamp:  timestamp,
-					Payload:    payload,
-					Deadline:   time.Now().Add(voiceSendBudget),
-					Generation: generation,
+					Timestamp:      timestamp,
+					Payload:        payload,
+					Deadline:       time.Now().Add(voiceSendBudget),
+					SendGeneration: generation,
 				})
 			}
 		}
@@ -911,7 +912,7 @@ func (e *Engine) stopRunLocked(run *engineRun) {
 	e.state.Speaking = false
 	e.state.CaptureLevel = 0
 	e.state.CaptureClipped = false
-	e.state.SpeakingPeerIDs = []string{}
+	e.state.SpeakingPeerIDs = []identity.PeerID{}
 	e.mu.Unlock()
 	run.port.Reset()
 	run.cancel()
@@ -944,7 +945,7 @@ func (e *Engine) fail(err error) error {
 	e.mu.Lock()
 	e.state.Error = err.Error()
 	e.state.Speaking = false
-	e.state.SpeakingPeerIDs = []string{}
+	e.state.SpeakingPeerIDs = []identity.PeerID{}
 	e.mu.Unlock()
 	e.publish()
 	return err
@@ -993,7 +994,7 @@ func (e *Engine) setCaptureMeter(run *engineRun, generation uint64, level float6
 	e.publish()
 }
 
-func (e *Engine) setSpeakingPeerIDs(run *engineRun, peerIDs []string) {
+func (e *Engine) setSpeakingPeerIDs(run *engineRun, peerIDs []identity.PeerID) {
 	e.mu.Lock()
 	if !run.active.Load() || slices.Equal(e.state.SpeakingPeerIDs, peerIDs) {
 		e.mu.Unlock()
@@ -1019,7 +1020,7 @@ func notifyPlayback(wake chan<- struct{}) {
 }
 
 func cloneStatus(state Status) Status {
-	state.SpeakingPeerIDs = append([]string{}, state.SpeakingPeerIDs...)
+	state.SpeakingPeerIDs = append([]identity.PeerID{}, state.SpeakingPeerIDs...)
 	state.CaptureDevices = append([]Device{}, state.CaptureDevices...)
 	state.PlaybackDevices = append([]Device{}, state.PlaybackDevices...)
 	return state

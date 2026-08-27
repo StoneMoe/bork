@@ -25,10 +25,10 @@ const (
 	maxSTUNServerResults      = 8
 	maxPendingSTUN            = maxSTUNServerResults * 2
 	maxPeerDatagrams          = 256
-	maxAudioBatches           = 64
-	maxInteractiveBatches     = 32
-	maxAudioWriteTime         = 20 * time.Millisecond
-	maxInteractiveWriteTime   = 50 * time.Millisecond
+	maxVoiceBatches           = 64
+	maxScreenBatches          = 32
+	maxVoiceWriteTime         = 20 * time.Millisecond
+	maxScreenWriteTime        = 50 * time.Millisecond
 	maxNonAudioWriteTime      = 2 * time.Millisecond
 	controlWriteTimeout       = time.Second
 )
@@ -46,8 +46,8 @@ const (
 	packetControl
 	packetReliable
 	packetBridge
-	packetAudio
-	packetInteractive
+	packetVoice
+	packetScreen
 )
 
 type RealtimeDatagram struct {
@@ -56,11 +56,11 @@ type RealtimeDatagram struct {
 }
 
 type RealtimeBatch struct {
-	Class      protocol.TrafficClass
-	Datagrams  []RealtimeDatagram
-	Deadline   time.Time
-	Generation uint64
-	writeUntil time.Time
+	Class          protocol.TrafficClass
+	Datagrams      []RealtimeDatagram
+	Deadline       time.Time
+	SendGeneration uint64
+	writeUntil     time.Time
 }
 
 type queuedWrite struct {
@@ -95,18 +95,18 @@ type Endpoint struct {
 	started  bool
 	closed   bool
 
-	snapshotChanges    chan struct{}
-	controlPackets     chan Datagram
-	reliablePackets    chan Datagram
-	bridgePackets      chan Datagram
-	audioPackets       chan Datagram
-	interactivePackets chan Datagram
-	audioBatches       chan RealtimeBatch
-	interactiveBatches chan RealtimeBatch
-	controlWrites      chan queuedWrite
-	backgroundWrites   chan queuedWrite
-	realtimeMu         sync.Mutex
-	realtimeGeneration uint64
+	snapshotChanges       chan struct{}
+	controlPackets        chan Datagram
+	reliablePackets       chan Datagram
+	bridgePackets         chan Datagram
+	voicePackets          chan Datagram
+	screenPackets         chan Datagram
+	voiceBatches          chan RealtimeBatch
+	screenBatches         chan RealtimeBatch
+	controlWrites         chan queuedWrite
+	lowPriorityWrites     chan queuedWrite
+	realtimeMu            sync.Mutex
+	currentSendGeneration uint64
 }
 
 func New(options Options, roomTag [16]byte, logger *slog.Logger) *Endpoint {
@@ -114,20 +114,20 @@ func New(options Options, roomTag [16]byte, logger *slog.Logger) *Endpoint {
 		logger = slog.Default()
 	}
 	return &Endpoint{
-		options:            normalizeOptions(options),
-		roomTag:            roomTag,
-		logger:             logger,
-		pending:            make(map[stunTransaction]pendingSTUN),
-		snapshotChanges:    make(chan struct{}, 1),
-		controlPackets:     make(chan Datagram, maxPeerDatagrams),
-		reliablePackets:    make(chan Datagram, maxPeerDatagrams),
-		bridgePackets:      make(chan Datagram, maxPeerDatagrams),
-		audioPackets:       make(chan Datagram, maxPeerDatagrams),
-		interactivePackets: make(chan Datagram, maxPeerDatagrams),
-		audioBatches:       make(chan RealtimeBatch, maxAudioBatches),
-		interactiveBatches: make(chan RealtimeBatch, maxInteractiveBatches),
-		controlWrites:      make(chan queuedWrite, 256),
-		backgroundWrites:   make(chan queuedWrite, 32),
+		options:           normalizeOptions(options),
+		roomTag:           roomTag,
+		logger:            logger,
+		pending:           make(map[stunTransaction]pendingSTUN),
+		snapshotChanges:   make(chan struct{}, 1),
+		controlPackets:    make(chan Datagram, maxPeerDatagrams),
+		reliablePackets:   make(chan Datagram, maxPeerDatagrams),
+		bridgePackets:     make(chan Datagram, maxPeerDatagrams),
+		voicePackets:      make(chan Datagram, maxPeerDatagrams),
+		screenPackets:     make(chan Datagram, maxPeerDatagrams),
+		voiceBatches:      make(chan RealtimeBatch, maxVoiceBatches),
+		screenBatches:     make(chan RealtimeBatch, maxScreenBatches),
+		controlWrites:     make(chan queuedWrite, 256),
+		lowPriorityWrites: make(chan queuedWrite, 32),
 	}
 }
 
@@ -143,16 +143,16 @@ func (e *Endpoint) classifyRoomPacket(packet []byte) packetClass {
 			return packetDrop
 		}
 		switch header.Class {
-		case protocol.TrafficAudio:
-			return packetAudio
-		case protocol.TrafficInteractive, protocol.TrafficScreenAudio:
-			return packetInteractive
+		case protocol.TrafficVoice:
+			return packetVoice
+		case protocol.TrafficScreenVideo, protocol.TrafficScreenAudio:
+			return packetScreen
 		}
 	case protocol.PacketHello, protocol.PacketPing, protocol.PacketPong, protocol.PacketLeave:
 		return packetControl
 	case protocol.PacketReliable:
 		return packetReliable
-	case protocol.PacketBridgeControl:
+	case protocol.PacketBridge:
 		return packetBridge
 	}
 	return packetDrop
@@ -168,11 +168,11 @@ func (e *Endpoint) Snapshot() Snapshot {
 	return e.snapshot.Clone()
 }
 
-func (e *Endpoint) ControlPackets() <-chan Datagram     { return e.controlPackets }
-func (e *Endpoint) ReliablePackets() <-chan Datagram    { return e.reliablePackets }
-func (e *Endpoint) BridgePackets() <-chan Datagram      { return e.bridgePackets }
-func (e *Endpoint) AudioPackets() <-chan Datagram       { return e.audioPackets }
-func (e *Endpoint) InteractivePackets() <-chan Datagram { return e.interactivePackets }
+func (e *Endpoint) ControlPackets() <-chan Datagram  { return e.controlPackets }
+func (e *Endpoint) ReliablePackets() <-chan Datagram { return e.reliablePackets }
+func (e *Endpoint) BridgePackets() <-chan Datagram   { return e.bridgePackets }
+func (e *Endpoint) VoicePackets() <-chan Datagram    { return e.voicePackets }
+func (e *Endpoint) ScreenPackets() <-chan Datagram   { return e.screenPackets }
 
 // EnqueueControl validates and admits a control datagram. It does not wait for
 // the kernel write because peer control paths must not inherit socket latency.
@@ -198,9 +198,9 @@ func (e *Endpoint) WriteControl(ctx context.Context, data []byte, destination ne
 	return e.queueWrite(ctx, e.controlWrites, data, destination)
 }
 
-// EnqueueBackground admits low-priority peer data without blocking its owner.
-func (e *Endpoint) EnqueueBackground(data []byte, destination netip.AddrPort) error {
-	return e.enqueuePeerDatagram(data, destination, e.backgroundWrites, "background")
+// EnqueueLowPriority admits low-priority peer data without blocking its owner.
+func (e *Endpoint) EnqueueLowPriority(data []byte, destination netip.AddrPort) error {
+	return e.enqueuePeerDatagram(data, destination, e.lowPriorityWrites, "low-priority")
 }
 
 func (e *Endpoint) enqueuePeerDatagram(data []byte, destination netip.AddrPort, queue chan<- queuedWrite, lane string) error {
@@ -239,10 +239,10 @@ func (e *Endpoint) SendRealtimeBatch(batch RealtimeBatch) error {
 	}
 	var batches chan RealtimeBatch
 	switch batch.Class {
-	case protocol.TrafficAudio:
-		batches = e.audioBatches
-	case protocol.TrafficInteractive, protocol.TrafficScreenAudio:
-		batches = e.interactiveBatches
+	case protocol.TrafficVoice:
+		batches = e.voiceBatches
+	case protocol.TrafficScreenVideo, protocol.TrafficScreenAudio:
+		batches = e.screenBatches
 	default:
 		return errors.New("realtime batch traffic class is invalid")
 	}
@@ -266,27 +266,27 @@ func (e *Endpoint) SendRealtimeBatch(batch RealtimeBatch) error {
 	}
 	e.realtimeMu.Lock()
 	defer e.realtimeMu.Unlock()
-	if batch.Generation != 0 && batch.Generation != e.realtimeGeneration {
-		return errors.New("realtime batch generation is stale")
+	if batch.SendGeneration != 0 && batch.SendGeneration != e.currentSendGeneration {
+		return errors.New("realtime batch send generation is stale")
 	}
 	enqueueFresh(batches, batch)
 	return nil
 }
 
-func (e *Endpoint) InvalidateRealtime(generation uint64) {
+func (e *Endpoint) SetRealtimeSendGeneration(sendGeneration uint64) {
 	e.realtimeMu.Lock()
-	e.realtimeGeneration = generation
-	retainRealtimeGeneration(e.audioBatches, generation)
-	retainRealtimeGeneration(e.interactiveBatches, generation)
+	e.currentSendGeneration = sendGeneration
+	retainRealtimeSendGeneration(e.voiceBatches, sendGeneration)
+	retainRealtimeSendGeneration(e.screenBatches, sendGeneration)
 	e.realtimeMu.Unlock()
 }
 
-func retainRealtimeGeneration(batches chan RealtimeBatch, generation uint64) {
+func retainRealtimeSendGeneration(batches chan RealtimeBatch, sendGeneration uint64) {
 	retained := make([]RealtimeBatch, 0, len(batches))
 	for {
 		select {
 		case batch := <-batches:
-			if batch.Generation == 0 || batch.Generation == generation {
+			if batch.SendGeneration == 0 || batch.SendGeneration == sendGeneration {
 				retained = append(retained, batch)
 			}
 		default:
@@ -375,8 +375,8 @@ func (e *Endpoint) Run(ctx context.Context) error {
 	close(e.controlPackets)
 	close(e.reliablePackets)
 	close(e.bridgePackets)
-	close(e.audioPackets)
-	close(e.interactivePackets)
+	close(e.voicePackets)
+	close(e.screenPackets)
 	return runErr
 }
 
@@ -438,10 +438,10 @@ func (e *Endpoint) readLoop(conn *net.UDPConn) error {
 			enqueueFresh(e.reliablePackets, packet)
 		case packetBridge:
 			enqueueFresh(e.bridgePackets, packet)
-		case packetAudio:
-			enqueueFresh(e.audioPackets, packet)
-		case packetInteractive:
-			enqueueFresh(e.interactivePackets, packet)
+		case packetVoice:
+			enqueueFresh(e.voicePackets, packet)
+		case packetScreen:
+			enqueueFresh(e.screenPackets, packet)
 		}
 	}
 }
@@ -454,18 +454,18 @@ func (e *Endpoint) writeLoop(ctx context.Context, conn *net.UDPConn) error {
 			drainErr = ctx.Err()
 		}
 		drainQueuedWrites(e.controlWrites, drainErr)
-		drainQueuedWrites(e.backgroundWrites, drainErr)
+		drainQueuedWrites(e.lowPriorityWrites, drainErr)
 	}()
 
 	const (
-		audioLane = iota
+		voiceLane = iota
 		controlLane
-		interactiveLane
-		backgroundLane
+		screenLane
+		lowPriorityLane
 		laneCount
 	)
 	weights := [laneCount]int{8, 2, 2, 1}
-	lane, remaining := audioLane, weights[audioLane]
+	lane, remaining := voiceLane, weights[voiceLane]
 	var pendingRealtime [laneCount]RealtimeBatch
 	advance := func() {
 		lane = (lane + 1) % laneCount
@@ -483,14 +483,14 @@ func (e *Endpoint) writeLoop(ctx context.Context, conn *net.UDPConn) error {
 		for checked := 0; checked < laneCount && !ready; checked++ {
 			selected = lane
 			switch lane {
-			case audioLane:
-				if len(pendingRealtime[audioLane].Datagrams) > 0 {
-					batch = pendingRealtime[audioLane]
-					pendingRealtime[audioLane] = RealtimeBatch{}
+			case voiceLane:
+				if len(pendingRealtime[voiceLane].Datagrams) > 0 {
+					batch = pendingRealtime[voiceLane]
+					pendingRealtime[voiceLane] = RealtimeBatch{}
 					ready = true
 				} else {
 					select {
-					case batch = <-e.audioBatches:
+					case batch = <-e.voiceBatches:
 						ready = true
 					default:
 					}
@@ -501,21 +501,21 @@ func (e *Endpoint) writeLoop(ctx context.Context, conn *net.UDPConn) error {
 					ready = true
 				default:
 				}
-			case interactiveLane:
-				if len(pendingRealtime[interactiveLane].Datagrams) > 0 {
-					batch = pendingRealtime[interactiveLane]
-					pendingRealtime[interactiveLane] = RealtimeBatch{}
+			case screenLane:
+				if len(pendingRealtime[screenLane].Datagrams) > 0 {
+					batch = pendingRealtime[screenLane]
+					pendingRealtime[screenLane] = RealtimeBatch{}
 					ready = true
 				} else {
 					select {
-					case batch = <-e.interactiveBatches:
+					case batch = <-e.screenBatches:
 						ready = true
 					default:
 					}
 				}
-			case backgroundLane:
+			case lowPriorityLane:
 				select {
-				case request = <-e.backgroundWrites:
+				case request = <-e.lowPriorityWrites:
 					ready = true
 				default:
 				}
@@ -534,14 +534,14 @@ func (e *Endpoint) writeLoop(ctx context.Context, conn *net.UDPConn) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case batch = <-e.audioBatches:
-				selected = audioLane
+			case batch = <-e.voiceBatches:
+				selected = voiceLane
 			case request = <-e.controlWrites:
 				selected = controlLane
-			case batch = <-e.interactiveBatches:
-				selected = interactiveLane
-			case request = <-e.backgroundWrites:
-				selected = backgroundLane
+			case batch = <-e.screenBatches:
+				selected = screenLane
+			case request = <-e.lowPriorityWrites:
+				selected = lowPriorityLane
 			}
 			lane, remaining = selected, weights[selected]-1
 			if remaining == 0 {
@@ -550,7 +550,7 @@ func (e *Endpoint) writeLoop(ctx context.Context, conn *net.UDPConn) error {
 		}
 
 		var err error
-		if selected == audioLane || selected == interactiveLane {
+		if selected == voiceLane || selected == screenLane {
 			batch, err = e.writeRealtimeDatagram(ctx, conn, batch)
 			if len(batch.Datagrams) > 0 {
 				pendingRealtime[selected] = batch
@@ -579,10 +579,10 @@ func (e *Endpoint) writeRealtimeDatagram(ctx context.Context, conn *net.UDPConn,
 	}
 	var writeBudget time.Duration
 	switch batch.Class {
-	case protocol.TrafficAudio:
-		writeBudget = maxAudioWriteTime
-	case protocol.TrafficInteractive, protocol.TrafficScreenAudio:
-		writeBudget = min(maxInteractiveWriteTime, maxNonAudioWriteTime)
+	case protocol.TrafficVoice:
+		writeBudget = maxVoiceWriteTime
+	case protocol.TrafficScreenVideo, protocol.TrafficScreenAudio:
+		writeBudget = min(maxScreenWriteTime, maxNonAudioWriteTime)
 	default:
 		return RealtimeBatch{}, nil
 	}
@@ -590,7 +590,7 @@ func (e *Endpoint) writeRealtimeDatagram(ctx context.Context, conn *net.UDPConn,
 	e.realtimeMu.Lock()
 	defer e.realtimeMu.Unlock()
 	now := time.Now()
-	if (batch.Generation != 0 && batch.Generation != e.realtimeGeneration) || (!batch.Deadline.IsZero() && now.After(batch.Deadline)) {
+	if (batch.SendGeneration != 0 && batch.SendGeneration != e.currentSendGeneration) || (!batch.Deadline.IsZero() && now.After(batch.Deadline)) {
 		return RealtimeBatch{}, nil
 	}
 	if batch.writeUntil.IsZero() {

@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"bork/internal/identity"
 	"bork/internal/networking/discovery"
 )
 
@@ -45,11 +46,11 @@ type provider struct {
 // Registration identities are shared by every address announced to the same
 // provider during a room session.
 type Announcer struct {
-	providers   []provider
-	infoHash    [20]byte
-	identityKey [32]byte
-	httpClient  *http.Client
-	logger      *slog.Logger
+	providers  []provider
+	infoHash   [20]byte
+	peerID     identity.PeerID
+	httpClient *http.Client
+	logger     *slog.Logger
 
 	lookupNetIP func(context.Context, string, string) ([]netip.Addr, error)
 
@@ -90,16 +91,16 @@ func ValidateProviderURL(raw string) error {
 	return err
 }
 
-func newAnnouncerFromProviders(providers []provider, infoHash [20]byte, identityKey [32]byte, candidate AnnounceCandidate, logger *slog.Logger) *Announcer {
+func newAnnouncerFromProviders(providers []provider, infoHash [20]byte, peerID identity.PeerID, candidate AnnounceCandidate, logger *slog.Logger) *Announcer {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Announcer{
-		providers:   providers,
-		infoHash:    infoHash,
-		identityKey: identityKey,
-		httpClient:  newHTTPClient(),
-		logger:      logger,
+		providers:  providers,
+		infoHash:   infoHash,
+		peerID:     peerID,
+		httpClient: newHTTPClient(),
+		logger:     logger,
 		lookupNetIP: func(ctx context.Context, network, host string) ([]netip.Addr, error) {
 			return net.DefaultResolver.LookupNetIP(ctx, network, host)
 		},
@@ -148,7 +149,7 @@ func (candidate AnnounceCandidate) String() string {
 
 func (a *Announcer) registration(configured provider, candidate AnnounceCandidate) trackerRegistration {
 	info := "bork/tracker-registration/v2\x00" + configured.scope
-	material, err := hkdf.Key(sha256.New, a.identityKey[:], a.infoHash[:], info, 24)
+	material, err := hkdf.Key(sha256.New, a.peerID[:], a.infoHash[:], info, 24)
 	if err != nil {
 		panic("derive tracker registration: " + err.Error())
 	}

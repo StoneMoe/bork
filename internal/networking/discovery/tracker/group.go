@@ -9,16 +9,17 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"bork/internal/identity"
 	"bork/internal/networking/discovery"
 )
 
 const MaxAnnounceCandidates = 4
 
 type Group struct {
-	providers   []provider
-	infoHash    [20]byte
-	identityKey [32]byte
-	logger      *slog.Logger
+	providers []provider
+	infoHash  [20]byte
+	peerID    identity.PeerID
+	logger    *slog.Logger
 
 	mu         sync.RWMutex
 	candidates []AnnounceCandidate
@@ -29,19 +30,19 @@ type Group struct {
 	running    atomic.Bool
 }
 
-func New(providerURLs []string, infoHash [20]byte, identityKey [32]byte, logger *slog.Logger) (*Group, error) {
+func New(providerURLs []string, infoHash [20]byte, peerID identity.PeerID, logger *slog.Logger) (*Group, error) {
 	providers, err := parseProviders(providerURLs)
 	if err != nil {
 		return nil, err
 	}
-	if len(providers) > 0 && identityKey == [32]byte{} {
-		return nil, errors.New("tracker identity key is required")
+	if len(providers) > 0 && peerID.IsZero() {
+		return nil, errors.New("tracker peer ID is required")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Group{
-		providers: providers, infoHash: infoHash, identityKey: identityKey,
+		providers: providers, infoHash: infoHash, peerID: peerID,
 		logger: logger, updates: make(chan struct{}, 1), changes: make(chan struct{}, 1),
 	}, nil
 }
@@ -125,7 +126,7 @@ func (g *Group) runCandidates(ctx context.Context, candidates []AnnounceCandidat
 	results := make(chan error, len(candidates))
 	var workers sync.WaitGroup
 	for _, candidate := range candidates {
-		child := newAnnouncerFromProviders(g.providers, g.infoHash, g.identityKey, candidate, g.logger)
+		child := newAnnouncerFromProviders(g.providers, g.infoHash, g.peerID, candidate, g.logger)
 		children[candidate] = child
 		workers.Add(2)
 		go func() {

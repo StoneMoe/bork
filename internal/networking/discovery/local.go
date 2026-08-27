@@ -15,16 +15,16 @@ const (
 	localMulticastAddress  = "239.255.66.75:49736"
 	localAnnouncementMagic = "BORKLOC1"
 	localAnnounceInterval  = 500 * time.Millisecond
-	localMaxPeerHint       = 64
+	localMaxAnnouncementID = 64
 	localMaxAddress        = 96
 	localMaxKnownPeers     = 128
 	localReceiveBufferSize = 64 * 1024
 )
 
 type localAnnouncement struct {
-	roomTag  [16]byte
-	peerHint string
-	address  netip.AddrPort
+	roomTag        [16]byte
+	announcementID string
+	address        netip.AddrPort
 }
 
 type localDatagram struct {
@@ -57,11 +57,11 @@ func (l *localDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddres
 	if err != nil {
 		return err
 	}
-	peerHint, err := newPeerHint()
+	announcementID, err := newAnnouncementID()
 	if err != nil {
 		return err
 	}
-	announcement, err := marshalLocalAnnouncement(roomTag, peerHint, address, network.addresses)
+	announcement, err := marshalLocalAnnouncement(roomTag, announcementID, address, network.addresses)
 	if err != nil {
 		return err
 	}
@@ -131,10 +131,10 @@ func (l *localDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddres
 				continue
 			}
 			announced, err := parseLocalAnnouncement(datagram.data, network.addresses)
-			if err != nil || announced.roomTag != roomTag || announced.peerHint == peerHint {
+			if err != nil || announced.roomTag != roomTag || announced.announcementID == announcementID {
 				continue
 			}
-			signature := announced.peerHint + "\x00" + announced.address.String()
+			signature := announced.announcementID + "\x00" + announced.address.String()
 			now := time.Now()
 			if known.seen(signature, now) {
 				continue
@@ -239,9 +239,9 @@ func snapshotLocalNetwork() (localNetworkSnapshot, error) {
 	return snapshot, nil
 }
 
-func marshalLocalAnnouncement(roomTag [16]byte, peerHint string, address netip.AddrPort, localAddresses localAddressSet) ([]byte, error) {
-	if !validPeerHint(peerHint) {
-		return nil, errors.New("local discovery peer hint is invalid")
+func marshalLocalAnnouncement(roomTag [16]byte, announcementID string, address netip.AddrPort, localAddresses localAddressSet) ([]byte, error) {
+	if !validAnnouncementID(announcementID) {
+		return nil, errors.New("local discovery announcement ID is invalid")
 	}
 	if !isLocalAddress(address, localAddresses) {
 		return nil, errors.New("local discovery address is not reachable from this host")
@@ -250,11 +250,11 @@ func marshalLocalAnnouncement(roomTag [16]byte, peerHint string, address netip.A
 	if len(encodedAddress) == 0 || len(encodedAddress) > localMaxAddress {
 		return nil, errors.New("local discovery address is too long")
 	}
-	packet := make([]byte, 0, len(localAnnouncementMagic)+16+2+len(peerHint)+len(encodedAddress))
+	packet := make([]byte, 0, len(localAnnouncementMagic)+16+2+len(announcementID)+len(encodedAddress))
 	packet = append(packet, localAnnouncementMagic...)
 	packet = append(packet, roomTag[:]...)
-	packet = append(packet, byte(len(peerHint)), byte(len(encodedAddress)))
-	packet = append(packet, peerHint...)
+	packet = append(packet, byte(len(announcementID)), byte(len(encodedAddress)))
+	packet = append(packet, announcementID...)
 	packet = append(packet, encodedAddress...)
 	return packet, nil
 }
@@ -268,17 +268,17 @@ func parseLocalAnnouncement(packet []byte, localAddresses localAddressSet) (loca
 	offset := len(localAnnouncementMagic)
 	copy(announcement.roomTag[:], packet[offset:offset+16])
 	offset += 16
-	peerLength := int(packet[offset])
+	announcementIDLength := int(packet[offset])
 	addressLength := int(packet[offset+1])
 	offset += 2
-	if peerLength < 1 || peerLength > localMaxPeerHint || addressLength < 1 || addressLength > localMaxAddress || len(packet) != offset+peerLength+addressLength {
+	if announcementIDLength < 1 || announcementIDLength > localMaxAnnouncementID || addressLength < 1 || addressLength > localMaxAddress || len(packet) != offset+announcementIDLength+addressLength {
 		return localAnnouncement{}, errors.New("local discovery packet length is invalid")
 	}
-	announcement.peerHint = string(packet[offset : offset+peerLength])
-	if !validPeerHint(announcement.peerHint) {
-		return localAnnouncement{}, errors.New("local discovery peer hint is invalid")
+	announcement.announcementID = string(packet[offset : offset+announcementIDLength])
+	if !validAnnouncementID(announcement.announcementID) {
+		return localAnnouncement{}, errors.New("local discovery announcement ID is invalid")
 	}
-	offset += peerLength
+	offset += announcementIDLength
 	address, err := netip.ParseAddrPort(string(packet[offset:]))
 	if err != nil || !isLocalAddress(address, localAddresses) {
 		return localAnnouncement{}, errors.New("local discovery address is invalid")
@@ -287,12 +287,12 @@ func parseLocalAnnouncement(packet []byte, localAddresses localAddressSet) (loca
 	return announcement, nil
 }
 
-func validPeerHint(peerHint string) bool {
-	if len(peerHint) == 0 || len(peerHint) > localMaxPeerHint {
+func validAnnouncementID(announcementID string) bool {
+	if len(announcementID) == 0 || len(announcementID) > localMaxAnnouncementID {
 		return false
 	}
-	for index := range len(peerHint) {
-		if peerHint[index] < 0x21 || peerHint[index] > 0x7e {
+	for index := range len(announcementID) {
+		if announcementID[index] < 0x21 || announcementID[index] > 0x7e {
 			return false
 		}
 	}
@@ -300,7 +300,7 @@ func validPeerHint(peerHint string) bool {
 }
 
 func localAnnouncementSize() int {
-	return len(localAnnouncementMagic) + 16 + 2 + localMaxPeerHint + localMaxAddress
+	return len(localAnnouncementMagic) + 16 + 2 + localMaxAnnouncementID + localMaxAddress
 }
 
 func loopbackAddress(listenAddress netip.AddrPort, localAddresses localAddressSet) (netip.AddrPort, error) {

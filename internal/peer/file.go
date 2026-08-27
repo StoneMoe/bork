@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"bork/internal/identity"
 )
 
 const (
@@ -35,12 +37,12 @@ const (
 	fileControlAccept
 	fileControlReject
 	fileControlCancel
-	fileControlACK
+	fileControlDataAck
 )
 
 type FileTransferSnapshot struct {
 	ID          string
-	PeerID      string
+	PeerID      identity.PeerID
 	Direction   string
 	Name        string
 	Path        string
@@ -62,7 +64,7 @@ const (
 
 type fileCommand struct {
 	kind       fileCommandKind
-	peerID     string
+	peerID     identity.PeerID
 	path       string
 	transferID string
 	result     chan fileCommandResult
@@ -95,7 +97,7 @@ type fileWorkResult struct {
 
 type fileTransfer struct {
 	id          [16]byte
-	peerID      string
+	peerID      identity.PeerID
 	sessionID   [16]byte
 	direction   string
 	name        string
@@ -113,7 +115,7 @@ type fileTransfer struct {
 	cancelWork  context.CancelFunc
 }
 
-func (c *Client) OfferFile(peerID, path string) (string, error) {
+func (c *Client) OfferFile(peerID identity.PeerID, path string) (string, error) {
 	return c.requestFileCommand(fileCommand{kind: fileCommandOffer, peerID: peerID, path: path, result: make(chan fileCommandResult, 1)})
 }
 
@@ -171,7 +173,7 @@ func (c *Client) handleFileCommand(command fileCommand) {
 	command.result <- result
 }
 
-func (c *Client) startFileOffer(peerID, path string) (string, error) {
+func (c *Client) startFileOffer(peerID identity.PeerID, path string) (string, error) {
 	peer := c.remotePeers[peerID]
 	if peer == nil || peer.activeSession == nil || !peer.activeSession.authenticated {
 		return "", errors.New("recipient is not authenticated")
@@ -370,7 +372,7 @@ func (c *Client) handleFileWorkResult(result fileWorkResult) {
 			})
 			return
 		}
-		if err := c.queueFileControl(transfer, fileControlACK, transfer.transferred); err != nil {
+		if err := c.queueFileControl(transfer, fileControlDataAck, transfer.transferred); err != nil {
 			c.finishFileTransfer(transfer, "failed", err.Error())
 		}
 	case fileWorkFinish:
@@ -378,7 +380,7 @@ func (c *Client) handleFileWorkResult(result fileWorkResult) {
 		if transfer.status != "transferring" {
 			return
 		}
-		if err := c.queueFileControl(transfer, fileControlACK, transfer.transferred); err != nil {
+		if err := c.queueFileControl(transfer, fileControlDataAck, transfer.transferred); err != nil {
 			c.finishFileTransfer(transfer, "failed", err.Error())
 			return
 		}
@@ -401,7 +403,7 @@ func (c *Client) handleFileMessage(sender *RemotePeer, message deliveredReliable
 			return
 		}
 		transfer := c.fileTransfers[id]
-		if transfer == nil || transfer.peerID != sender.identity.PeerID() || transfer.sessionID != sender.activeSession.sessionID || fileTerminal(transfer.status) {
+		if transfer == nil || transfer.peerID != sender.peerID || transfer.sessionID != sender.activeSession.sessionID || fileTerminal(transfer.status) {
 			return
 		}
 		switch kind {
@@ -419,7 +421,7 @@ func (c *Client) handleFileMessage(sender *RemotePeer, message deliveredReliable
 			}
 		case fileControlCancel:
 			c.finishFileTransfer(transfer, "canceled", "canceled by peer")
-		case fileControlACK:
+		case fileControlDataAck:
 			if transfer.direction == "outgoing" && transfer.status == "waiting" && value >= transfer.transferred && value <= transfer.size && value-transfer.transferred <= fileChunkSize && (value > transfer.transferred || transfer.size == 0) {
 				sender.activeSession.reliable.discardOutboundChannel(reliableChannelFileData)
 				transfer.transferred, transfer.updatedAt = value, time.Now()
@@ -439,7 +441,7 @@ func (c *Client) handleFileMessage(sender *RemotePeer, message deliveredReliable
 	}
 	id, offset, data, err := decodeFileData(message.payload)
 	transfer := c.fileTransfers[id]
-	if err != nil || transfer == nil || transfer.direction != "incoming" || transfer.status != "transferring" || transfer.working || transfer.peerID != sender.identity.PeerID() || transfer.sessionID != sender.activeSession.sessionID || offset != transfer.transferred || uint64(len(data)) > transfer.size-transfer.transferred {
+	if err != nil || transfer == nil || transfer.direction != "incoming" || transfer.status != "transferring" || transfer.working || transfer.peerID != sender.peerID || transfer.sessionID != sender.activeSession.sessionID || offset != transfer.transferred || uint64(len(data)) > transfer.size-transfer.transferred {
 		return
 	}
 	transfer.working = true
@@ -461,7 +463,7 @@ func (c *Client) receiveFileOffer(sender *RemotePeer, id [16]byte, offer decoded
 		return
 	}
 	workContext, cancelWork := context.WithCancel(c.fileContext)
-	transfer := &fileTransfer{id: id, peerID: sender.identity.PeerID(), sessionID: sender.activeSession.sessionID, direction: "incoming", name: offer.name, status: "offered", size: offer.size, digest: offer.digest, updatedAt: time.Now(), workContext: workContext, cancelWork: cancelWork}
+	transfer := &fileTransfer{id: id, peerID: sender.peerID, sessionID: sender.activeSession.sessionID, direction: "incoming", name: offer.name, status: "offered", size: offer.size, digest: offer.digest, updatedAt: time.Now(), workContext: workContext, cancelWork: cancelWork}
 	c.fileTransfers[id] = transfer
 	c.pruneFileTransfers()
 	c.publishStateChange()
@@ -492,7 +494,7 @@ func (c *Client) queueFileControl(transfer *fileTransfer, kind byte, value uint6
 	payload := make([]byte, 18)
 	payload[0], payload[1] = fileProtocolVersion, kind
 	copy(payload[2:18], transfer.id[:])
-	if kind == fileControlACK {
+	if kind == fileControlDataAck {
 		payload = append(payload, make([]byte, 8)...)
 		binary.BigEndian.PutUint64(payload[18:], value)
 	}
@@ -546,9 +548,9 @@ func decodeFileControl(payload []byte) (byte, [16]byte, uint64, decodedFileOffer
 		}
 		return kind, id, 0, offer, nil
 	}
-	if kind == fileControlACK {
+	if kind == fileControlDataAck {
 		if len(payload) != 26 {
-			return 0, id, 0, decodedFileOffer{}, errors.New("file ACK length is invalid")
+			return 0, id, 0, decodedFileOffer{}, errors.New("file data acknowledgment length is invalid")
 		}
 		return kind, id, binary.BigEndian.Uint64(payload[18:26]), decodedFileOffer{}, nil
 	}
@@ -605,7 +607,7 @@ func (c *Client) fileTransferByString(encoded string) *fileTransfer {
 	return c.fileTransfers[id]
 }
 
-func (c *Client) activeFileTransfer(peerID, direction string) *fileTransfer {
+func (c *Client) activeFileTransfer(peerID identity.PeerID, direction string) *fileTransfer {
 	for _, transfer := range c.fileTransfers {
 		if transfer.peerID == peerID && transfer.direction == direction && !fileTerminal(transfer.status) {
 			return transfer
@@ -614,7 +616,7 @@ func (c *Client) activeFileTransfer(peerID, direction string) *fileTransfer {
 	return nil
 }
 
-func (c *Client) activeAcceptedFileTransfer(peerID string) *fileTransfer {
+func (c *Client) activeAcceptedFileTransfer(peerID identity.PeerID) *fileTransfer {
 	for _, transfer := range c.fileTransfers {
 		if transfer.peerID == peerID && transfer.direction == "incoming" && transfer.status != "offered" && !fileTerminal(transfer.status) {
 			return transfer

@@ -61,14 +61,14 @@ func (m *mdnsDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddress
 	}
 	port := listenAddress.Port()
 	roomTagText := hex.EncodeToString(roomTag[:])
-	peerHint, err := newPeerHint()
+	announcementID, err := newAnnouncementID()
 	if err != nil {
 		return err
 	}
-	server, err := m.register("bork-"+peerHint, mdnsService, mdnsDomain, int(port), []string{
+	server, err := m.register("bork-"+announcementID, mdnsService, mdnsDomain, int(port), []string{
 		"v=1",
 		"room=" + roomTagText,
-		"hint=" + peerHint,
+		"hint=" + announcementID,
 	}, interfaces)
 	if err != nil {
 		return fmt.Errorf("register mDNS service: %w", err)
@@ -105,7 +105,7 @@ func (m *mdnsDiscovery) Run(ctx context.Context, roomTag [16]byte, listenAddress
 			continue
 		}
 		activeBrowses++
-		go consumeMDNSEntries(browseCtx, family.name, entries, browseDone, roomTagText, peerHint, listenIP.Is4(), hints)
+		go consumeMDNSEntries(browseCtx, family.name, entries, browseDone, roomTagText, announcementID, listenIP.Is4(), hints)
 	}
 	if activeBrowses == 0 {
 		if ctx.Err() != nil {
@@ -169,7 +169,7 @@ func consumeMDNSEntries(
 	entries <-chan *zeroconf.ServiceEntry,
 	done chan<- string,
 	roomTagText string,
-	peerHint string,
+	localAnnouncementID string,
 	ipv4Only bool,
 	hints chan<- Hint,
 ) {
@@ -178,8 +178,8 @@ func consumeMDNSEntries(
 		if ctx.Err() != nil || entry == nil {
 			continue
 		}
-		entryRoomTag, entryPeerHint := parseText(entry.Text)
-		if entryRoomTag != roomTagText || entryPeerHint == "" || entryPeerHint == peerHint || entry.Port < 1 || entry.Port > 65535 {
+		entryRoomTag, entryAnnouncementID := parseText(entry.Text)
+		if entryRoomTag != roomTagText || entryAnnouncementID == "" || entryAnnouncementID == localAnnouncementID || entry.Port < 1 || entry.Port > 65535 {
 			continue
 		}
 		for _, ip := range append(append([]net.IP(nil), entry.AddrIPv4...), entry.AddrIPv6...) {
@@ -206,7 +206,7 @@ func drainMDNSEntries(entries <-chan *zeroconf.ServiceEntry) {
 	}
 }
 
-func parseText(records []string) (roomTag, peerHint string) {
+func parseText(records []string) (roomTag, announcementID string) {
 	for _, record := range records {
 		key, value, ok := strings.Cut(record, "=")
 		if !ok {
@@ -216,10 +216,10 @@ func parseText(records []string) (roomTag, peerHint string) {
 		case "room":
 			roomTag = value
 		case "hint":
-			peerHint = value
+			announcementID = value
 		}
 	}
-	return roomTag, peerHint
+	return roomTag, announcementID
 }
 
 func usableDiscoveryAddress(address netip.Addr) bool {

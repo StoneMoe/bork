@@ -42,12 +42,12 @@ func (w sequenceWindow) mayAccept(sequence uint64) bool {
 	return w.accept(sequence)
 }
 
-type controlFlow struct {
+type sessionPacketFlow struct {
 	sendSequence  uint64
 	receiveWindow sequenceWindow
 }
 
-func (f *controlFlow) nextSendSequence() (uint64, error) {
+func (f *sessionPacketFlow) nextSendSequence() (uint64, error) {
 	if f.sendSequence == math.MaxUint64 {
 		return 0, errSequenceExhausted
 	}
@@ -55,10 +55,10 @@ func (f *controlFlow) nextSendSequence() (uint64, error) {
 	return f.sendSequence, nil
 }
 
-func (f *controlFlow) mayReceive(sequence uint64) bool {
+func (f *sessionPacketFlow) mayReceive(sequence uint64) bool {
 	return f.receiveWindow.mayAccept(sequence)
 }
 
-func (f *controlFlow) commitReceived(sequence uint64) bool {
+func (f *sessionPacketFlow) commitReceived(sequence uint64) bool {
 	return f.receiveWindow.accept(sequence)
 }

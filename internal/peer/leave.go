@@ -26,7 +26,7 @@ func (c *Client) sendLeaves() {
 }
 
 func (c *Client) sendLeave(ctx context.Context, remotePeer *RemotePeer, peerSess *PeeringSession) {
-	sequence, err := peerSess.control.nextSendSequence()
+	sequence, err := peerSess.packetFlow.nextSendSequence()
 	if err == nil {
 		var packet []byte
 		packet, err = protocol.MarshalControl(protocol.PacketLeave, c.roomTag, peerSess.sessionID, sequence, 0, peerSess.ciphers.ControlSend)
@@ -35,7 +35,7 @@ func (c *Client) sendLeave(ctx context.Context, remotePeer *RemotePeer, peerSess
 		}
 	}
 	if err != nil {
-		c.logger.Debug("send leave notification", "peer", remotePeer.identity.PeerID(), "error", err)
+		c.logger.Debug("send leave notification", "peer", remotePeer.peerID, "error", err)
 	}
 }
 
@@ -52,10 +52,10 @@ func (c *Client) handleLeavePacketOnPath(data []byte, path Path) {
 	if err != nil || decoded.Type != protocol.PacketLeave {
 		return
 	}
-	if !peerSess.control.commitReceived(header.Sequence) {
+	if !peerSess.packetFlow.commitReceived(header.PacketSequence) {
 		return
 	}
-	delete(c.remotePeers, remotePeer.identity.PeerID())
+	delete(c.remotePeers, remotePeer.peerID)
 	c.markPeerGraphDirty(peerSess.path.IsDirect())
 	c.publishStateChange()
 	c.logger.Info("remote peer left", "count", c.authenticatedRemotePeerCount())
@@ -69,7 +69,7 @@ func (c *Client) leaveSessionForHeader(header protocol.SessionHeader, path Path)
 	if !peerSess.everAuthenticated || !peerSess.path.SameRoute(path) {
 		return nil, nil
 	}
-	if !peerSess.control.mayReceive(header.Sequence) {
+	if !peerSess.packetFlow.mayReceive(header.PacketSequence) {
 		return nil, nil
 	}
 	return remotePeer, peerSess

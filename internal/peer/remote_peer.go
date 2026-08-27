@@ -1,15 +1,19 @@
 package peer
 
-import "bork/internal/identity"
+import (
+	"bytes"
+
+	"bork/internal/identity"
+)
 
 type RemotePeer struct {
-	identity       identity.Identity
+	peerID         identity.PeerID
 	activeSession  *PeeringSession
 	pendingSession *PeeringSession
 }
 
 type RemotePeerSnapshot struct {
-	PeerID           string
+	PeerID           identity.PeerID
 	Address          string
 	SessionID        string
 	RTTMillis        int64
@@ -21,4 +25,8 @@ type RemotePeerSnapshot struct {
 	ScreenSharing    bool
 	ScreenGeneration uint64
 	ScreenStreamID   string
+}
+
+func comparePeerIDs(left, right identity.PeerID) int {
+	return bytes.Compare(left[:], right[:])
 }

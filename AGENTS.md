@@ -22,7 +22,7 @@
 | `internal/app` | 管理生命周期、命令和 UI 快照 |
 | `internal/audio` | 采集、处理、编码、混音和播放音频 |
 | `internal/screenshare` | 枚举、采集、色调映射并编码本机屏幕与系统声音 |
-| `internal/networking` | 管理发现、RoomUDP、端口映射和房间网络 |
+| `internal/networking` | 管理发现、单一房间 UDP 端点、端口映射和房间网络 |
 | `internal/peer` | 管理 Session、拓扑、可靠传输和扇出 |
 | `internal/protocol` | 定义线协议编解码、数据包限制和密码学 |
 | `frontend` | SolidJS 桌面界面 |
@@ -64,7 +64,7 @@ network:
 - 空的 `stun_servers` 列表会禁用公共 STUN 服务。
 - 空的 `tracker_urls` 列表会禁用公共 Tracker 服务。
 - 将 `port_mapping` 设为 `false` 会禁用网关端口映射。
-- 默认 Tracker 可看到派生的 tracker hash、派生的 tracker peer ID、候选地址和源地址，但无法获取 `RoomSeed`、房间状态或媒体明文；tracker peer ID 会随每次入房使用的临时节点密钥变化。
+- 默认 Tracker 可看到派生的 tracker hash、派生的 20 字节 tracker `peer_id`、候选地址和源地址，但无法获取 `RoomSeed`、房间状态或媒体明文；tracker `peer_id` 由本次入房的 `PeerID` 派生。
 
 ### 构建与验证
 
@@ -111,6 +111,20 @@ make typecheck-frontend
 - 基础网络层始终使用单个 UDP 端点。
 - 避免 IP 分片以保持传输效率。
 - 语音业务始终优先，低延迟语音是首要目标。
+
+### 协议名词
+
+| 名词 | 含义 |
+| --- | --- |
+| `PeerID` | 一次入房期间使用的临时 Ed25519 公钥，也是 Go 内部表示成员身份的唯一类型；字段可按上下文叫 `peerId`、`senderId`、`origin` 或 `target`，但 Go 类型统一为 `identity.PeerID`。 |
+| `HandshakeID` | 一次 Session 握手的 16 字节关联值，由 PeerID 较小的一方生成，双方的 Session Hello 使用同一个值。 |
+| `SessionID` | 由一对 Session Hello transcript 和 X25519 共享秘密派生的点对点会话标识。 |
+| `StreamID` | 一路 Room Datagram 媒体流的标识。 |
+| `PacketSequence` | Session 包或 Room Datagram 的包级序号，用于 nonce 和重放检查。 |
+| `FragmentSequence` | Reliable 分片的确认序号。 |
+| `MessageSequence` | Reliable 消息重组和有序交付序号。 |
+| `MediaSequence` | 媒体载荷自己的序号；语音使用采样位置，屏幕视频使用 chunk 序号。 |
+| `Generation` | 全量状态的修订号；本机发送队列失效标记单独叫 `SendGeneration`。 |
 
 ### 发现与 NAT 穿透
 
@@ -180,20 +194,21 @@ Speaker -- F1+-- L2
 - 完成基于 `RoomSeed` 的准入和 Session 认证后，Peer 即为可信房间成员。协议不提供持有者之间的权限隔离、成员身份确认或恶意成员防护。
 - Bork 假设所有 `RoomSeed` 持有者遵循协议、如实报告状态，且不会故意冒充其他临时节点、污染重放窗口或滥用转发和资源。
 - `RoomTag`、发现提示和准入前收到的数据包仍是不可信的路由输入。
-- 必须执行准入 MAC、transcript、路径、临时节点签名和重放检查，以拒绝不知道 `RoomSeed` 的外部人员以及捕获、重复的数据包。
+- 必须执行准入 MAC、transcript、路径、PeerID 签名和重放检查，以拒绝不知道 `RoomSeed` 的外部人员以及捕获、重复的数据包。
 - 准入后的校验、超时和资源限制用于保护线协议正确性、防止实现错误和意外过载，而不是构建恶意成员沙箱。
 - 成员自行报告的昵称、采集静音和播放静音状态视为可信房间状态；Bork 不为这些字段定义名称唯一性、权限或管理语义。
 
-### 加密与临时节点密钥
+### 加密与临时身份密钥
 
 - 任何 `RoomSeed` 持有者都能派生与所有房间成员相同的 `RoomDatagramKey`，并解密 Room Datagram。
-- 每次创建或加入房间时生成新的内存临时 Ed25519 密钥；离开房间后从客户端状态中丢弃。Bork 不创建 `identity.key`，不提供账户、设备身份或跨房间、离开后重入的节点连续性；同一次入房内的 Session 重握手和路径切换继续使用同一 NodeID。
-- 临时 Ed25519 公钥是本次入房期间的 NodeID，用于 Session transcript、拓扑、桥接寻址、Room Datagram 签名和重放状态分区。它不代表独立安全主体，权限仅来自 `RoomSeed`。
-- Room Datagram 签名将原始数据包绑定到本次入房的临时 NodeID，使 Forwarder 能在不解密的情况下验证并转发原包；该签名不构成 `RoomSeed` 持有者之间的信任边界。
+- 每次创建或加入房间时生成新的内存临时 Ed25519 密钥；离开房间后从客户端状态中丢弃。Bork 不创建 `identity.key`，不提供账户、设备身份或跨房间、离开后重入的身份连续性；同一次入房内的 Session 重握手和路径切换继续使用同一 PeerID。
+- 临时 Ed25519 公钥是本次入房期间的 PeerID，用于 Session transcript、拓扑、桥接寻址、Room Datagram 签名和重放状态分区。它不代表独立安全主体，权限仅来自 `RoomSeed`。
+- 发现阶段使用带准入 MAC 和 PeerID 签名的 Hello probe；probe 不参与 Session transcript。每个 Session 独占一对 Session Hello、HandshakeID 和 X25519 临时密钥，同一 Session 的路径切换继续复用这对 Session Hello。
+- Room Datagram 签名将原始数据包绑定到本次入房的临时 PeerID，使 Forwarder 能在不解密的情况下验证并转发原包；该签名不构成 `RoomSeed` 持有者之间的信任边界。
 - 群组数据在互联网上保持加密，互联网观察者无法读取媒体。
 - 每个 Session 使用临时 X25519 密钥派生点对点控制加密密钥。
 - 对于桥接流量，Bridge 会解密其相邻 Session 的外层数据包。
-- `HELLO` 内层数据包未加密，因此 Bridge 可以读取。
+- Hello probe 和 Session Hello 内层数据包未加密，因此 Bridge 可以读取。
 - Bridge 无法解密端到端内层 Ping、Pong 或 Reliable 载荷。
 - Room Datagram 不具备前向保密、成员撤销或旧密文的入侵后保护。不得将当前 `RoomDatagramKey` 描述为具备前向保密的群组 E2EE。
 

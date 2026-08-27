@@ -3,10 +3,7 @@ package peer
 import (
 	"context"
 	"crypto/cipher"
-	"crypto/ecdh"
-	"crypto/rand"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/netip"
 	"slices"
@@ -32,13 +29,13 @@ type roomNetwork interface {
 	ControlPackets() <-chan endpoint.Datagram
 	ReliablePackets() <-chan endpoint.Datagram
 	BridgePackets() <-chan endpoint.Datagram
-	AudioPackets() <-chan endpoint.Datagram
-	InteractivePackets() <-chan endpoint.Datagram
+	VoicePackets() <-chan endpoint.Datagram
+	ScreenPackets() <-chan endpoint.Datagram
 	EnqueueControl([]byte, netip.AddrPort) error
 	WriteControl(context.Context, []byte, netip.AddrPort) error
-	EnqueueBackground([]byte, netip.AddrPort) error
+	EnqueueLowPriority([]byte, netip.AddrPort) error
 	SendRealtimeBatch(endpoint.RealtimeBatch) error
-	InvalidateRealtime(uint64)
+	SetRealtimeSendGeneration(uint64)
 }
 
 type roomNetworkFactory func() roomNetwork
@@ -85,27 +82,24 @@ type Client struct {
 	networkSnapshot            networking.RoomSnapshot
 	roomTag                    [16]byte
 	admissionKey               [32]byte
-	ephemeralPrivateKey        *ecdh.PrivateKey
-	localHello                 protocol.HelloPacket
-	helloPacket                []byte
+	helloProbePacket           []byte
 	discoveredAddresses        map[netip.AddrPort]discoveredAddress
-	remotePeers                map[string]*RemotePeer
+	remotePeers                map[identity.PeerID]*RemotePeer
 	topologyGeneration         uint64
-	topology                   map[string]*topologyPeer
-	roomDatagramSenderID       [32]byte
-	audioStreamID              [16]byte
+	topology                   map[identity.PeerID]*topologyPeer
+	voiceStreamID              [16]byte
 	roomDatagramProtector      cipher.AEAD
-	audioSendSequence          uint64
-	audioStreamPendingTopology bool
+	voicePacketSequence        uint64
+	voiceStreamPendingTopology bool
 	roomDatagramReceivers      map[roomDatagramStreamKey]*roomDatagramReceiveState
 	screenVideoReceivers       map[roomDatagramStreamKey]*screenVideoReceiveState
 	screenVideoRetainedBytes   int
 	fanout                     outboundFanout
 	fanoutDirty                bool
-	reliablePeerCursor         string
+	reliablePeerCursor         identity.PeerID
 	localMemberState           memberState
 	localScreenState           screenState
-	screenMediaSendSequence    uint64
+	screenPacketSequence       uint64
 	screenVideoChunkID         uint32
 	fileTransfers              map[[16]byte]*fileTransfer
 
@@ -125,9 +119,7 @@ func NewClient(roomInvite invite.Invite, networkOptions networking.Options, logg
 		localIdentity,
 		roomInvite,
 		func() roomNetwork {
-			var trackerIdentity [32]byte
-			copy(trackerIdentity[:], localIdentity.PublicKey())
-			return networking.NewRoomNetwork(roomInvite.RoomTag(), roomInvite.TrackerHash(), trackerIdentity, networkOptions, logger)
+			return networking.NewRoomNetwork(roomInvite.RoomTag(), roomInvite.TrackerHash(), localIdentity.PeerID, networkOptions, logger)
 		},
 		logger,
 	), nil
@@ -144,8 +136,8 @@ func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, 
 		roomTag:               roomInvite.RoomTag(),
 		admissionKey:          roomInvite.AdmissionKey(),
 		discoveredAddresses:   make(map[netip.AddrPort]discoveredAddress),
-		remotePeers:           make(map[string]*RemotePeer),
-		topology:              make(map[string]*topologyPeer),
+		remotePeers:           make(map[identity.PeerID]*RemotePeer),
+		topology:              make(map[identity.PeerID]*topologyPeer),
 		stateChanges:          make(chan struct{}, 1),
 		memberStateUpdates:    make(chan struct{}, 1),
 		screenCommands:        make(chan screenCommand),
@@ -163,7 +155,6 @@ func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, 
 		fileTransfers:         make(map[[16]byte]*fileTransfer),
 		fanoutDirty:           true,
 	}
-	copy(client.roomDatagramSenderID[:], localIdentity.PublicKey())
 	return client
 }
 
@@ -178,10 +169,10 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 		return errors.New("peer client has already been started")
 	}
 	defer close(c.loopDone)
-	if err := c.rotateHelloEpoch(); err != nil {
+	if err := c.initHelloProbe(); err != nil {
 		return err
 	}
-	c.initAudioStream()
+	c.initVoiceStream()
 	c.applyDesiredMemberState()
 
 	ctx, cancel := context.WithCancel(parent)
@@ -198,7 +189,7 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	c.roomNetwork = roomNetwork
 	close(c.loopReady)
 	if mediaPort != nil {
-		mediaPort.SetSendInvalidator(roomNetwork.InvalidateRealtime)
+		mediaPort.SetSendInvalidator(roomNetwork.SetRealtimeSendGeneration)
 		defer mediaPort.SetSendInvalidator(nil)
 	}
 	defer func() {
@@ -212,9 +203,9 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	controlPackets := roomNetwork.ControlPackets()
 	reliablePackets := roomNetwork.ReliablePackets()
 	bridgePackets := roomNetwork.BridgePackets()
-	audioPackets := roomNetwork.AudioPackets()
-	interactivePackets := roomNetwork.InteractivePackets()
-	helloTicker := time.NewTicker(helloInterval)
+	voicePackets := roomNetwork.VoicePackets()
+	screenPackets := roomNetwork.ScreenPackets()
+	probeTicker := time.NewTicker(discoveryProbeInterval)
 	pingTicker := time.NewTicker(pingInterval)
 	cleanupTicker := time.NewTicker(cleanupInterval)
 	reliableTicker := time.NewTicker(reliableInterval)
@@ -222,7 +213,7 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	if mediaPort != nil {
 		sendReady = mediaPort.SendReady()
 	}
-	defer helloTicker.Stop()
+	defer probeTicker.Stop()
 	defer pingTicker.Stop()
 	defer cleanupTicker.Stop()
 	defer reliableTicker.Stop()
@@ -232,16 +223,16 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 		for realtimeEvents < maxRealtimeEventsPerTurn {
 			handled := false
 			select {
-			case packet, ok := <-audioPackets:
+			case packet, ok := <-voicePackets:
 				if !ok {
-					audioPackets = nil
+					voicePackets = nil
 				} else {
 					c.handlePacket(packet, mediaPort)
 					realtimeEvents++
 				}
 				handled = true
 			case <-sendReady:
-				mediaPort.ConsumeSend(c.sendAudioFrame)
+				mediaPort.ConsumeSend(c.sendVoiceFrame)
 				realtimeEvents++
 				handled = true
 			default:
@@ -300,23 +291,23 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 				continue
 			}
 			c.handlePacket(packet, mediaPort)
-		case packet, ok := <-audioPackets:
+		case packet, ok := <-voicePackets:
 			if !ok {
-				audioPackets = nil
+				voicePackets = nil
 				continue
 			}
 			c.handlePacket(packet, mediaPort)
-		case packet, ok := <-interactivePackets:
+		case packet, ok := <-screenPackets:
 			if !ok {
-				interactivePackets = nil
+				screenPackets = nil
 				continue
 			}
 			c.handlePacket(packet, mediaPort)
 		case <-sendReady:
-			mediaPort.ConsumeSend(c.sendAudioFrame)
-		case now := <-helloTicker.C:
-			c.sendHellos(now)
-			c.sendBridgeHellos(now)
+			mediaPort.ConsumeSend(c.sendVoiceFrame)
+		case now := <-probeTicker.C:
+			c.sendDiscoveryProbes(now)
+			c.probeBridgePaths(now)
 			c.queueTopologySnapshots(now, false)
 		case <-pingTicker.C:
 			c.sendPings()
@@ -347,28 +338,12 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	}
 }
 
-func (c *Client) rotateHelloEpoch() error {
-	privateKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+func (c *Client) initHelloProbe() error {
+	packet, err := protocol.MarshalHelloProbe(c.roomTag, c.admissionKey, c.localIdentity)
 	if err != nil {
-		return fmt.Errorf("generate X25519 key: %w", err)
+		return err
 	}
-	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return fmt.Errorf("generate handshake nonce: %w", err)
-	}
-	var publicKey [32]byte
-	copy(publicKey[:], privateKey.PublicKey().Bytes())
-	helloPacket, err := protocol.MarshalHello(c.roomTag, c.admissionKey, c.localIdentity, nonce, publicKey)
-	if err != nil {
-		return fmt.Errorf("marshal local hello: %w", err)
-	}
-	localHello, err := protocol.ParseHello(helloPacket, c.roomTag, c.admissionKey)
-	if err != nil {
-		return fmt.Errorf("parse local hello: %w", err)
-	}
-	c.ephemeralPrivateKey = privateKey
-	c.helloPacket = helloPacket
-	c.localHello = localHello
+	c.helloProbePacket = packet
 	return nil
 }
 
@@ -390,7 +365,7 @@ func (c *Client) StateSnapshot() (ClientSnapshot, networking.RoomSnapshot) {
 
 func (c *Client) EncodedInvite() string { return c.roomInvite.Encode() }
 
-func (c *Client) PeerID() string { return c.localIdentity.PeerID() }
+func (c *Client) PeerID() identity.PeerID { return c.localIdentity.PeerID }
 
 func (c *Client) applyNetworkSnapshot(snapshot networking.RoomSnapshot) {
 	if !slices.Equal(c.networkSnapshot.Endpoint.Candidates, snapshot.Endpoint.Candidates) {

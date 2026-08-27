@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"bork/internal/identity"
 	"bork/internal/networking/discovery"
 	"bork/internal/networking/discovery/tracker"
 	"bork/internal/networking/endpoint"
@@ -50,13 +51,13 @@ type roomEndpoint interface {
 	ControlPackets() <-chan endpoint.Datagram
 	ReliablePackets() <-chan endpoint.Datagram
 	BridgePackets() <-chan endpoint.Datagram
-	AudioPackets() <-chan endpoint.Datagram
-	InteractivePackets() <-chan endpoint.Datagram
+	VoicePackets() <-chan endpoint.Datagram
+	ScreenPackets() <-chan endpoint.Datagram
 	EnqueueControl([]byte, netip.AddrPort) error
 	WriteControl(context.Context, []byte, netip.AddrPort) error
-	EnqueueBackground([]byte, netip.AddrPort) error
+	EnqueueLowPriority([]byte, netip.AddrPort) error
 	SendRealtimeBatch(endpoint.RealtimeBatch) error
-	InvalidateRealtime(uint64)
+	SetRealtimeSendGeneration(uint64)
 }
 
 type roomTracker interface {
@@ -209,14 +210,14 @@ func (m *portMappingLanes) stop() error {
 	return nil
 }
 
-func NewRoomNetwork(roomTag [16]byte, trackerHash [20]byte, trackerIdentity [32]byte, options Options, logger *slog.Logger) *RoomNetwork {
+func NewRoomNetwork(roomTag [16]byte, trackerHash [20]byte, peerID identity.PeerID, options Options, logger *slog.Logger) *RoomNetwork {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	endpointUDP := endpoint.New(options.Endpoint, roomTag, logger)
 	network := newRoomNetwork(roomTag, endpointUDP, discovery.DefaultServices(), logger)
 	if len(options.TrackerURLs) > 0 {
-		network.tracker, network.initializationErr = tracker.New(options.TrackerURLs, trackerHash, trackerIdentity, logger)
+		network.tracker, network.initializationErr = tracker.New(options.TrackerURLs, trackerHash, peerID, logger)
 	}
 	if options.EnablePortMapping {
 		network.portMapper = portmap.NewGateway(logger)
@@ -621,10 +622,8 @@ func (n *RoomNetwork) ReliablePackets() <-chan endpoint.Datagram {
 	return n.endpoint.ReliablePackets()
 }
 func (n *RoomNetwork) BridgePackets() <-chan endpoint.Datagram { return n.endpoint.BridgePackets() }
-func (n *RoomNetwork) AudioPackets() <-chan endpoint.Datagram  { return n.endpoint.AudioPackets() }
-func (n *RoomNetwork) InteractivePackets() <-chan endpoint.Datagram {
-	return n.endpoint.InteractivePackets()
-}
+func (n *RoomNetwork) VoicePackets() <-chan endpoint.Datagram  { return n.endpoint.VoicePackets() }
+func (n *RoomNetwork) ScreenPackets() <-chan endpoint.Datagram { return n.endpoint.ScreenPackets() }
 
 // EnqueueControl reports validation and queue admission, not the UDP write result.
 func (n *RoomNetwork) EnqueueControl(data []byte, destination netip.AddrPort) error {
@@ -635,8 +634,8 @@ func (n *RoomNetwork) WriteControl(ctx context.Context, data []byte, destination
 	return n.endpoint.WriteControl(ctx, data, destination)
 }
 
-func (n *RoomNetwork) EnqueueBackground(data []byte, destination netip.AddrPort) error {
-	return n.endpoint.EnqueueBackground(data, destination)
+func (n *RoomNetwork) EnqueueLowPriority(data []byte, destination netip.AddrPort) error {
+	return n.endpoint.EnqueueLowPriority(data, destination)
 }
 
 // SendRealtimeBatch transfers ownership of a complete realtime fan-out group.
@@ -644,8 +643,8 @@ func (n *RoomNetwork) SendRealtimeBatch(batch endpoint.RealtimeBatch) error {
 	return n.endpoint.SendRealtimeBatch(batch)
 }
 
-func (n *RoomNetwork) InvalidateRealtime(generation uint64) {
-	n.endpoint.InvalidateRealtime(generation)
+func (n *RoomNetwork) SetRealtimeSendGeneration(sendGeneration uint64) {
+	n.endpoint.SetRealtimeSendGeneration(sendGeneration)
 }
 
 func (n *RoomNetwork) updateSnapshot(update func(*RoomSnapshot)) {

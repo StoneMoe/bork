@@ -2,6 +2,7 @@ package app
 
 import (
 	"bork/internal/audio"
+	"bork/internal/identity"
 	"bork/internal/networking"
 	"bork/internal/networking/discovery/tracker"
 	"bork/internal/networking/endpoint"
@@ -17,59 +18,59 @@ const (
 )
 
 type RemotePeer struct {
-	PeerID           string `json:"peerId"`
-	Nickname         string `json:"nickname"`
-	Muted            bool   `json:"muted"`
-	PlaybackMuted    bool   `json:"playbackMuted"`
-	Address          string `json:"address"`
-	SessionID        string `json:"sessionId"`
-	RTTMillis        int64  `json:"rttMillis"`
-	Transport        string `json:"transport"`
-	Connected        bool   `json:"connected"`
-	ScreenSharing    bool   `json:"screenSharing"`
-	ScreenGeneration uint64 `json:"screenGeneration"`
-	ScreenStreamID   string `json:"screenStreamId"`
+	PeerID           identity.PeerID `json:"peerId" ts_type:"string"`
+	Nickname         string          `json:"nickname"`
+	Muted            bool            `json:"muted"`
+	PlaybackMuted    bool            `json:"playbackMuted"`
+	Address          string          `json:"address"`
+	SessionID        string          `json:"sessionId"`
+	RTTMillis        int64           `json:"rttMillis"`
+	Transport        string          `json:"transport"`
+	Connected        bool            `json:"connected"`
+	ScreenSharing    bool            `json:"screenSharing"`
+	ScreenGeneration uint64          `json:"screenGeneration"`
+	ScreenStreamID   string          `json:"screenStreamId"`
 }
 
 type RoomState struct {
-	Name          string         `json:"name"`
-	PeerID        string         `json:"peerId"`
-	ScreenSharing bool           `json:"screenSharing"`
-	RemotePeers   []RemotePeer   `json:"remotePeers"`
-	Transfers     []FileTransfer `json:"transfers"`
+	Name          string          `json:"name"`
+	PeerID        identity.PeerID `json:"peerId" ts_type:"string"`
+	ScreenSharing bool            `json:"screenSharing"`
+	RemotePeers   []RemotePeer    `json:"remotePeers"`
+	Transfers     []FileTransfer  `json:"transfers"`
 }
 
 type FileTransfer struct {
-	ID           string `json:"id"`
-	PeerID       string `json:"peerId"`
-	PeerNickname string `json:"peerNickname"`
-	Direction    string `json:"direction"`
-	Name         string `json:"name"`
-	Size         uint64 `json:"size"`
-	Transferred  uint64 `json:"transferred"`
-	Status       string `json:"status"`
-	SHA256       string `json:"sha256"`
-	Error        string `json:"error,omitempty"`
-	SavedPath    string `json:"savedPath,omitempty"`
+	ID           string          `json:"id"`
+	PeerID       identity.PeerID `json:"peerId" ts_type:"string"`
+	PeerNickname string          `json:"peerNickname"`
+	Direction    string          `json:"direction"`
+	Name         string          `json:"name"`
+	Size         uint64          `json:"size"`
+	Transferred  uint64          `json:"transferred"`
+	Status       string          `json:"status"`
+	SHA256       string          `json:"sha256"`
+	Error        string          `json:"error,omitempty"`
+	SavedPath    string          `json:"savedPath,omitempty"`
 }
 
 // Width and Height are the fixed coded size. DisplayWidth and DisplayHeight
 // describe the centered visible area after the captured window changes size.
 type ScreenVideoChunkEvent struct {
-	PeerID        string `json:"peerId"`
-	SessionID     string `json:"sessionId"`
-	Generation    uint64 `json:"generation"`
-	StreamID      string `json:"streamId"`
-	ChunkID       uint32 `json:"chunkId"`
-	Codec         string `json:"codec"`
-	Width         uint16 `json:"width"`
-	Height        uint16 `json:"height"`
-	DisplayWidth  uint16 `json:"displayWidth"`
-	DisplayHeight uint16 `json:"displayHeight"`
-	Timestamp     uint64 `json:"timestamp"`
-	Duration      uint32 `json:"duration"`
-	KeyFrame      bool   `json:"keyFrame"`
-	Bytes         []byte `json:"bytes"`
+	PeerID        identity.PeerID `json:"peerId" ts_type:"string"`
+	SessionID     string          `json:"sessionId"`
+	Generation    uint64          `json:"generation"`
+	StreamID      string          `json:"streamId"`
+	ChunkID       uint32          `json:"chunkId"`
+	Codec         string          `json:"codec"`
+	Width         uint16          `json:"width"`
+	Height        uint16          `json:"height"`
+	DisplayWidth  uint16          `json:"displayWidth"`
+	DisplayHeight uint16          `json:"displayHeight"`
+	Timestamp     uint64          `json:"timestamp"`
+	Duration      uint32          `json:"duration"`
+	KeyFrame      bool            `json:"keyFrame"`
+	Bytes         []byte          `json:"bytes"`
 }
 
 // ScreenPreviewChunkEvent uses the same coded and display size split.
@@ -136,7 +137,7 @@ func projectRemotePeer(remotePeer peer.RemotePeerSnapshot) RemotePeer {
 }
 
 func projectTransfers(transfers []peer.FileTransferSnapshot, remotePeers []peer.RemotePeerSnapshot) []FileTransfer {
-	nicknames := make(map[string]string, len(remotePeers))
+	nicknames := make(map[identity.PeerID]string, len(remotePeers))
 	for _, remotePeer := range remotePeers {
 		nicknames[remotePeer.PeerID] = remotePeer.Nickname
 	}

@@ -8,16 +8,16 @@ import (
 )
 
 const (
-	Version    byte = 1
-	wireDomain      = "bork/wire-v1/"
+	Version    byte = 2
+	wireDomain      = "bork/wire-v2/"
 
-	PacketHello         PacketType = 1
-	PacketPing          PacketType = 2
-	PacketPong          PacketType = 3
-	PacketBridgeControl PacketType = 4
-	PacketRoomDatagram  PacketType = 5
-	PacketReliable      PacketType = 6
-	PacketLeave         PacketType = 7
+	PacketHello        PacketType = 1
+	PacketPing         PacketType = 2
+	PacketPong         PacketType = 3
+	PacketBridge       PacketType = 4
+	PacketRoomDatagram PacketType = 5
+	PacketReliable     PacketType = 6
+	PacketLeave        PacketType = 7
 
 	prefixSize        = 4 + 1 + 16
 	sessionHeaderSize = prefixSize + 16 + 8
@@ -70,7 +70,7 @@ func ValidPacketSize(packetType PacketType, size int) bool {
 		return size == helloPacketSize
 	case PacketPing, PacketPong, PacketLeave:
 		return size == controlPacketSize
-	case PacketBridgeControl:
+	case PacketBridge:
 		return size >= bridgeMinPacketSize && size <= MaxDatagramSize
 	case PacketRoomDatagram:
 		return size >= roomDatagramMinPacketSize && size <= MaxDatagramSize
@@ -82,10 +82,10 @@ func ValidPacketSize(packetType PacketType, size int) bool {
 }
 
 type SessionHeader struct {
-	Type      PacketType
-	RoomTag   [16]byte
-	SessionID [16]byte
-	Sequence  uint64
+	Type           PacketType
+	RoomTag        [16]byte
+	SessionID      [16]byte
+	PacketSequence uint64
 }
 
 func appendSessionHeader(destination []byte, packetType PacketType, roomTag, sessionID [16]byte, sequence uint64) []byte {
@@ -99,15 +99,15 @@ func ParseSessionHeader(packet []byte) (SessionHeader, error) {
 		return SessionHeader{}, errors.New("session packet is truncated")
 	}
 	packetType, roomTag, err := ParsePrefix(packet)
-	if err != nil || (packetType != PacketPing && packetType != PacketPong && packetType != PacketBridgeControl && packetType != PacketReliable && packetType != PacketLeave) {
+	if err != nil || (packetType != PacketPing && packetType != PacketPong && packetType != PacketBridge && packetType != PacketReliable && packetType != PacketLeave) {
 		return SessionHeader{}, errors.New("session packet prefix is invalid")
 	}
 	var header SessionHeader
 	header.Type = packetType
 	header.RoomTag = roomTag
 	copy(header.SessionID[:], packet[prefixSize:prefixSize+16])
-	header.Sequence = binary.BigEndian.Uint64(packet[prefixSize+16 : sessionHeaderSize])
-	if header.Sequence == 0 {
+	header.PacketSequence = binary.BigEndian.Uint64(packet[prefixSize+16 : sessionHeaderSize])
+	if header.PacketSequence == 0 {
 		return SessionHeader{}, errors.New("session packet sequence is zero")
 	}
 	return header, nil

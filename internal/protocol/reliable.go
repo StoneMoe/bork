@@ -16,15 +16,15 @@ const (
 )
 
 type ReliablePacket struct {
-	Channel          uint16
-	Flags            byte
-	FragmentSequence uint64
-	MessageSequence  uint64
-	FragmentIndex    uint16
-	FragmentCount    uint16
-	AckBase          uint64
-	AckBitmap        uint64
-	Payload          []byte
+	Channel           uint16
+	Flags             byte
+	FragmentSequence  uint64
+	MessageSequence   uint64
+	FragmentIndex     uint16
+	FragmentCount     uint16
+	FragmentAckBase   uint64
+	FragmentAckBitmap uint64
+	Payload           []byte
 }
 
 func (p ReliablePacket) Ordered() bool {
@@ -35,7 +35,7 @@ func (p ReliablePacket) AckOnly() bool {
 	return p.Flags&ReliableFlagAckOnly != 0
 }
 
-func AckContains(base, bitmap, sequence uint64) bool {
+func FragmentAckContains(base, bitmap, sequence uint64) bool {
 	if base == 0 || sequence == 0 || sequence > base {
 		return false
 	}
@@ -63,8 +63,8 @@ func MarshalReliable(roomTag, sessionID [16]byte, packetSequence uint64, p Relia
 	binary.BigEndian.PutUint64(fixed[11:19], p.MessageSequence)
 	binary.BigEndian.PutUint16(fixed[19:21], p.FragmentIndex)
 	binary.BigEndian.PutUint16(fixed[21:23], p.FragmentCount)
-	binary.BigEndian.PutUint64(fixed[23:31], p.AckBase)
-	binary.BigEndian.PutUint64(fixed[31:39], p.AckBitmap)
+	binary.BigEndian.PutUint64(fixed[23:31], p.FragmentAckBase)
+	binary.BigEndian.PutUint64(fixed[31:39], p.FragmentAckBitmap)
 	packet = append(packet, fixed[:]...)
 	packet = append(packet, p.Payload...)
 	body := packet[sessionHeaderSize:]
@@ -91,15 +91,15 @@ func ParseReliable(packet []byte, expectedRoomTag, expectedSessionID [16]byte, p
 	}
 
 	decoded := ReliablePacket{
-		Channel:          binary.BigEndian.Uint16(opened[0:2]),
-		Flags:            opened[2],
-		FragmentSequence: binary.BigEndian.Uint64(opened[3:11]),
-		MessageSequence:  binary.BigEndian.Uint64(opened[11:19]),
-		FragmentIndex:    binary.BigEndian.Uint16(opened[19:21]),
-		FragmentCount:    binary.BigEndian.Uint16(opened[21:23]),
-		AckBase:          binary.BigEndian.Uint64(opened[23:31]),
-		AckBitmap:        binary.BigEndian.Uint64(opened[31:39]),
-		Payload:          opened[reliablePlaintextFixedSize:],
+		Channel:           binary.BigEndian.Uint16(opened[0:2]),
+		Flags:             opened[2],
+		FragmentSequence:  binary.BigEndian.Uint64(opened[3:11]),
+		MessageSequence:   binary.BigEndian.Uint64(opened[11:19]),
+		FragmentIndex:     binary.BigEndian.Uint16(opened[19:21]),
+		FragmentCount:     binary.BigEndian.Uint16(opened[21:23]),
+		FragmentAckBase:   binary.BigEndian.Uint64(opened[23:31]),
+		FragmentAckBitmap: binary.BigEndian.Uint64(opened[31:39]),
+		Payload:           opened[reliablePlaintextFixedSize:],
 	}
 	if len(decoded.Payload) == 0 {
 		decoded.Payload = nil
@@ -117,7 +117,7 @@ func validateReliableBody(p ReliablePacket) error {
 	if p.Flags&^(ReliableFlagOrdered|ReliableFlagAckOnly) != 0 {
 		return errors.New("reliable packet flags are invalid")
 	}
-	if !validReliableAck(p.AckBase, p.AckBitmap) {
+	if !validReliableAck(p.FragmentAckBase, p.FragmentAckBitmap) {
 		return errors.New("reliable packet acknowledgment is invalid")
 	}
 	if p.AckOnly() {

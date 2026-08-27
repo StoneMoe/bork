@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -16,8 +17,9 @@ import (
 )
 
 const (
-	helloInterval             = 2 * time.Second
-	maxHelloInterval          = 8 * time.Second
+	discoveryProbeInterval    = 2 * time.Second
+	maxDiscoveryProbeInterval = 8 * time.Second
+	sessionHelloInterval      = 2 * time.Second
 	pingInterval              = time.Second
 	remotePeerTimeout         = 8 * time.Second
 	pathFailoverTimeout       = 2500 * time.Millisecond
@@ -47,7 +49,7 @@ func (c *Client) addDiscoveryHint(hint discovery.Hint) {
 func (c *Client) addDiscoveryHintAt(hint discovery.Hint, now time.Time) {
 	address, added, changed := c.rememberDiscoveryHint(hint, now)
 	if added {
-		c.sendHello(address)
+		c.sendHelloProbe(address)
 	}
 	if changed {
 		c.publishStateChange()
@@ -88,8 +90,8 @@ func (c *Client) rememberDiscoveryHint(hint discovery.Hint, now time.Time) (neti
 		source:        hint.Source,
 		lastSeen:      now,
 		expiresAt:     hint.ExpiresAt,
-		nextProbe:     now.Add(helloInterval),
-		probeInterval: helloInterval,
+		nextProbe:     now.Add(discoveryProbeInterval),
+		probeInterval: discoveryProbeInterval,
 	}
 	return address, true, true
 }
@@ -261,39 +263,46 @@ func (c *Client) rememberCandidatePath(session *PeeringSession, path Path, now t
 	return true
 }
 
-func (c *Client) sendHello(destination netip.AddrPort) {
+func (c *Client) sendHelloProbe(destination netip.AddrPort) {
 	path, err := NewPath(destination)
 	if err != nil {
 		return
 	}
-	c.sendHelloOnPath(path)
+	c.sendHelloProbeOnPath(path)
 }
 
-func (c *Client) sendHelloOnPath(path Path) {
-	if len(c.helloPacket) == 0 {
+func (c *Client) sendHelloProbeOnPath(path Path) {
+	if len(c.helloProbePacket) == 0 {
 		return
 	}
-	_ = c.sendControlOnPath(path, c.helloPacket)
+	_ = c.sendPeerPacketOnPath(path, c.helloProbePacket)
 }
 
-func (c *Client) sendHellos(now time.Time) {
+func (c *Client) sendSessionHelloOnPath(peerSess *PeeringSession, path Path) {
+	if peerSess == nil || len(peerSess.localHelloPacket) == 0 {
+		return
+	}
+	_ = c.sendPeerPacketOnPath(path, peerSess.localHelloPacket)
+}
+
+func (c *Client) sendDiscoveryProbes(now time.Time) {
 	for address, remembered := range c.discoveredAddresses {
 		if discoveryExpired(remembered.expiresAt, now) || c.addressHasSessionPath(address) || now.Before(remembered.nextProbe) {
 			continue
 		}
-		remembered.probeInterval = nextHelloInterval(remembered.probeInterval)
+		remembered.probeInterval = nextDiscoveryProbeInterval(remembered.probeInterval)
 		remembered.nextProbe = now.Add(remembered.probeInterval)
 		c.discoveredAddresses[address] = remembered
-		c.sendHello(address)
+		c.sendHelloProbe(address)
 	}
 }
 
-func nextHelloInterval(interval time.Duration) time.Duration {
-	if interval < helloInterval {
-		return helloInterval
+func nextDiscoveryProbeInterval(interval time.Duration) time.Duration {
+	if interval < discoveryProbeInterval {
+		return discoveryProbeInterval
 	}
-	if interval >= maxHelloInterval || interval > maxHelloInterval/2 {
-		return maxHelloInterval
+	if interval >= maxDiscoveryProbeInterval || interval > maxDiscoveryProbeInterval/2 {
+		return maxDiscoveryProbeInterval
 	}
 	return interval * 2
 }
@@ -325,12 +334,6 @@ func shouldPromotePath(current Path, currentAuthenticated bool, currentRTT int64
 	return candidateRTT+likeForLikeMargin <= currentRTT
 }
 
-func rawPeerIdentity(peerIdentity identity.Identity) [32]byte {
-	var encoded [32]byte
-	copy(encoded[:], peerIdentity.PublicKey())
-	return encoded
-}
-
 func usableTopologyAddress(address, source netip.AddrPort) bool {
 	address, valid := normalizeDiscoveryAddress(address)
 	if !valid {
@@ -360,7 +363,7 @@ func (c *Client) handlePacket(packet endpoint.Datagram, mediaPort media.PeerPort
 		}
 	case protocol.PacketRoomDatagram:
 		c.handleRoomDatagram(packet, mediaPort)
-	case protocol.PacketBridgeControl:
+	case protocol.PacketBridge:
 		c.handleBridgePacket(packet)
 	}
 }
@@ -378,7 +381,7 @@ func (c *Client) handleSessionControlPacket(packet endpoint.Datagram, packetType
 }
 
 func (c *Client) sendReliable(now time.Time) {
-	peerIDs := make([]string, 0, len(c.remotePeers))
+	peerIDs := make([]identity.PeerID, 0, len(c.remotePeers))
 	for peerID, peer := range c.remotePeers {
 		if peer.activeSession != nil && peer.activeSession.authenticated && peer.activeSession.reliable != nil {
 			peerIDs = append(peerIDs, peerID)
@@ -387,8 +390,12 @@ func (c *Client) sendReliable(now time.Time) {
 	if len(peerIDs) == 0 {
 		return
 	}
-	sort.Strings(peerIDs)
-	start := sort.Search(len(peerIDs), func(index int) bool { return peerIDs[index] > c.reliablePeerCursor })
+	sort.Slice(peerIDs, func(left, right int) bool {
+		return bytes.Compare(peerIDs[left][:], peerIDs[right][:]) < 0
+	})
+	start := sort.Search(len(peerIDs), func(index int) bool {
+		return bytes.Compare(peerIDs[index][:], c.reliablePeerCursor[:]) > 0
+	})
 	if start == len(peerIDs) {
 		start = 0
 	}
@@ -407,15 +414,15 @@ func (c *Client) sendReliable(now time.Time) {
 			if !ok {
 				continue
 			}
-			sequence, err := activeSession.control.nextSendSequence()
+			sequence, err := activeSession.packetFlow.nextSendSequence()
 			if err != nil {
 				activeSession.authenticated = false
 				c.markPeerGraphDirty(activeSession.path.IsDirect())
 				continue
 			}
 			encoded, err := protocol.MarshalReliable(c.roomTag, activeSession.sessionID, sequence, packet, activeSession.ciphers.ControlSend)
-			background := packet.Channel == reliableChannelFileData && !packet.AckOnly()
-			if err != nil || c.sendPacketOnPath(activeSession.path, encoded, background) != nil {
+			lowPriority := packet.Channel == reliableChannelFileData && !packet.AckOnly()
+			if err != nil || c.sendPacketOnPath(activeSession.path, encoded, lowPriority) != nil {
 				activeSession.reliable.reject(reservation)
 				continue
 			}
@@ -439,11 +446,11 @@ func (c *Client) handleReliablePacketOnPath(data []byte, path Path) {
 		return
 	}
 	sender, peerSess, isPendingSession := c.sessionForHeader(header, path)
-	if peerSess == nil || isPendingSession || !peerSess.authenticated || !peerSess.acceptsDataPath(path) || !peerSess.control.mayReceive(header.Sequence) {
+	if peerSess == nil || isPendingSession || !peerSess.authenticated || !peerSess.acceptsDataPath(path) || !peerSess.packetFlow.mayReceive(header.PacketSequence) {
 		return
 	}
 	decoded, err := protocol.ParseReliable(data, c.roomTag, peerSess.sessionID, peerSess.ciphers.ControlRecv)
-	if err != nil || !peerSess.control.commitReceived(header.Sequence) {
+	if err != nil || !peerSess.packetFlow.commitReceived(header.PacketSequence) {
 		return
 	}
 	now := time.Now()
@@ -464,53 +471,112 @@ func (c *Client) handleHello(packet endpoint.Datagram) {
 
 func (c *Client) handleHelloOnPath(data []byte, path Path) {
 	hello, err := protocol.ParseHello(data, c.roomTag, c.admissionKey)
-	if err != nil {
+	if err != nil || hello.PeerID == c.localIdentity.PeerID {
 		return
 	}
-	remotePeerIdentity, err := identity.FromPublicKey(hello.IdentityKey)
-	if err != nil || remotePeerIdentity.PeerID() == c.localIdentity.PeerID() {
-		return
-	}
-	remotePeerID := remotePeerIdentity.PeerID()
-	material, err := protocol.DeriveSession(c.ephemeralPrivateKey, c.localHello, hello)
-	if err != nil {
-		return
-	}
-
-	remotePeer := c.remotePeers[remotePeerID]
+	remotePeer := c.remotePeers[hello.PeerID]
 	if remotePeer == nil {
-		remotePeer = &RemotePeer{identity: remotePeerIdentity}
-		c.remotePeers[remotePeerID] = remotePeer
+		remotePeer = &RemotePeer{peerID: hello.PeerID}
 	}
 	now := time.Now()
-	activeSession := remotePeer.activeSession
-	if activeSession != nil && activeSession.sessionID == material.SessionID {
-		if c.rememberCandidatePath(activeSession, path, now) {
-			c.sendHelloOnPath(path)
-		}
-		c.sendPing(remotePeerID, false)
-		return
+	if hello.IsProbe() {
+		c.handleHelloProbe(remotePeer, path, now)
+	} else {
+		c.handleSessionHello(remotePeer, hello, path, now)
 	}
+}
 
-	pendingSession := remotePeer.pendingSession
-	if pendingSession == nil || pendingSession.sessionID != material.SessionID {
-		pendingSession = newPeeringSession(path, material, now)
-		remotePeer.pendingSession = pendingSession
-		pendingSession.lastHelloSentAt = now
-		c.sendHelloOnPath(path)
-		c.sendPing(remotePeerID, true)
+func (c *Client) handleHelloProbe(remotePeer *RemotePeer, path Path, now time.Time) {
+	peerSess, usePendingSession := remotePeer.pendingSession, true
+	if peerSess == nil {
+		peerSess, usePendingSession = remotePeer.activeSession, false
+	}
+	if peerSess != nil {
+		c.rememberCandidatePath(peerSess, path, now)
+		c.sendSessionHelloOnPath(peerSess, path)
+		c.sendPing(remotePeer.peerID, usePendingSession)
 		return
 	}
-	if c.rememberCandidatePath(pendingSession, path, now) {
-		pendingSession.lastHelloSentAt = now
-		c.sendHelloOnPath(path)
+	// One deterministic initiator prevents simultaneous probes from creating
+	// two unrelated transcripts for the same pair of peers.
+	if bytes.Compare(c.localIdentity.PeerID[:], remotePeer.peerID[:]) < 0 {
+		c.startInitiatingSession(remotePeer, path, now)
+		return
 	}
-	c.sendPing(remotePeerID, true)
+	c.sendHelloProbeOnPath(path)
+}
+
+func (c *Client) handleSessionHello(remotePeer *RemotePeer, hello protocol.HelloPacket, path Path, now time.Time) {
+	if c.resumeSessionFromHello(remotePeer, remotePeer.activeSession, hello, path, now, false) {
+		return
+	}
+	if c.resumeSessionFromHello(remotePeer, remotePeer.pendingSession, hello, path, now, true) {
+		return
+	}
+	if bytes.Compare(c.localIdentity.PeerID[:], remotePeer.peerID[:]) < 0 {
+		c.handleUnexpectedResponderHello(remotePeer, hello, path, now)
+		return
+	}
+	peerSess, err := c.newSessionWithLocalHello(path, hello.HandshakeID, now)
+	if err != nil {
+		return
+	}
+	if err := peerSess.completeSessionHello(hello); err != nil {
+		return
+	}
+	remotePeer.pendingSession = peerSess
+	c.remotePeers[remotePeer.peerID] = remotePeer
+	peerSess.lastSessionHelloSentAt = now
+	c.sendSessionHelloOnPath(peerSess, path)
+	c.sendPing(remotePeer.peerID, true)
+}
+
+func (c *Client) resumeSessionFromHello(remotePeer *RemotePeer, peerSess *PeeringSession, hello protocol.HelloPacket, path Path, now time.Time, pending bool) bool {
+	if peerSess == nil {
+		return false
+	}
+	if !peerSess.sessionReady() && peerSess.localHello.HandshakeID == hello.HandshakeID {
+		if err := peerSess.completeSessionHello(hello); err != nil {
+			return false
+		}
+	} else if !peerSess.matchesRemoteHello(hello) {
+		return false
+	}
+	c.rememberCandidatePath(peerSess, path, now)
+	peerSess.lastSessionHelloSentAt = now
+	c.sendSessionHelloOnPath(peerSess, path)
+	c.sendPing(remotePeer.peerID, pending)
+	return true
+}
+
+func (c *Client) handleUnexpectedResponderHello(remotePeer *RemotePeer, hello protocol.HelloPacket, path Path, now time.Time) {
+	current := remotePeer.pendingSession
+	if current == nil {
+		current = remotePeer.activeSession
+	}
+	if current != nil && current.localHello.HandshakeID != hello.HandshakeID {
+		// A late Hello must not replace a newer transcript. Re-advertising the
+		// current Hello is enough for the deterministic initiator to converge.
+		c.sendSessionHelloOnPath(current, path)
+		return
+	}
+	c.startInitiatingSession(remotePeer, path, now)
+}
+
+func (c *Client) startInitiatingSession(remotePeer *RemotePeer, path Path, now time.Time) {
+	peerSess, err := c.newInitiatingSession(path, now)
+	if err != nil {
+		return
+	}
+	remotePeer.pendingSession = peerSess
+	c.remotePeers[remotePeer.peerID] = remotePeer
+	peerSess.lastSessionHelloSentAt = now
+	c.sendSessionHelloOnPath(peerSess, path)
 }
 
 func (c *Client) sendPings() {
 	type target struct {
-		peerID            string
+		peerID            identity.PeerID
 		usePendingSession bool
 	}
 	targets := make([]target, 0, len(c.remotePeers)*2)
@@ -527,7 +593,7 @@ func (c *Client) sendPings() {
 	}
 }
 
-func (c *Client) sendPing(peerID string, usePendingSession bool) {
+func (c *Client) sendPing(peerID identity.PeerID, usePendingSession bool) {
 	var peerSess *PeeringSession
 	peer := c.remotePeers[peerID]
 	if peer == nil {
@@ -543,10 +609,13 @@ func (c *Client) sendPing(peerID string, usePendingSession bool) {
 	}
 	if usePendingSession {
 		now := time.Now()
-		if now.Sub(peerSess.lastHelloSentAt) >= helloInterval {
-			peerSess.lastHelloSentAt = now
-			c.sendHelloOnPath(peerSess.path)
+		if now.Sub(peerSess.lastSessionHelloSentAt) >= sessionHelloInterval {
+			peerSess.lastSessionHelloSentAt = now
+			c.sendSessionHelloOnPath(peerSess, peerSess.path)
 		}
+	}
+	if !peerSess.sessionReady() {
+		return
 	}
 	c.sendPingOnPath(peerSess, peerSess.path, &peerSess.pendingPing)
 	if peerSess.candidatePath != nil {
@@ -563,7 +632,7 @@ func (c *Client) sendPingOnPath(peerSess *PeeringSession, path Path, pending *pe
 	if err != nil {
 		return
 	}
-	sequence, err := peerSess.control.nextSendSequence()
+	sequence, err := peerSess.packetFlow.nextSendSequence()
 	if err != nil {
 		if peerSess.authenticated {
 			peerSess.authenticated = false
@@ -574,7 +643,7 @@ func (c *Client) sendPingOnPath(peerSess *PeeringSession, path Path, pending *pe
 	*pending = pendingPing{challenge: challenge, path: path, sentAt: now}
 	packet, err := protocol.MarshalControl(protocol.PacketPing, c.roomTag, peerSess.sessionID, sequence, challenge, peerSess.ciphers.ControlSend)
 	if err == nil {
-		_ = c.sendControlOnPath(path, packet)
+		_ = c.sendPeerPacketOnPath(path, packet)
 	}
 }
 
@@ -584,11 +653,11 @@ func (c *Client) handleSessionPacketOnPath(data []byte, packetPath Path) {
 		return
 	}
 	remotePeer, peerSess, isPendingSession := c.sessionForHeader(header, packetPath)
-	if peerSess == nil || !peerSess.control.mayReceive(header.Sequence) {
+	if peerSess == nil || !peerSess.packetFlow.mayReceive(header.PacketSequence) {
 		return
 	}
 	decoded, err := protocol.ParseControl(data, c.roomTag, peerSess.sessionID, peerSess.ciphers.ControlRecv)
-	if err != nil || !peerSess.control.commitReceived(header.Sequence) {
+	if err != nil || !peerSess.packetFlow.commitReceived(header.PacketSequence) {
 		return
 	}
 	candidatePath := peerSess.candidateProbe(packetPath)
@@ -650,10 +719,10 @@ func (c *Client) handleSessionPacketOnPath(data []byte, packetPath Path) {
 		c.rememberAuthenticatedPath(packetPath, now)
 	}
 	if decoded.Type == protocol.PacketPing {
-		sequence, sequenceErr := peerSess.control.nextSendSequence()
+		sequence, sequenceErr := peerSess.packetFlow.nextSendSequence()
 		response, marshalErr := protocol.MarshalControl(protocol.PacketPong, c.roomTag, peerSess.sessionID, sequence, decoded.Challenge, peerSess.ciphers.ControlSend)
 		if sequenceErr == nil && marshalErr == nil {
-			_ = c.sendControlOnPath(packetPath, response)
+			_ = c.sendPeerPacketOnPath(packetPath, response)
 		}
 		return
 	}
@@ -664,7 +733,7 @@ func (c *Client) handleSessionPacketOnPath(data []byte, packetPath Path) {
 		c.queueScreenStates()
 	}
 	if remotePeerChanged {
-		c.rememberTopologyPeer(remotePeer.identity, now)
+		c.rememberTopologyPeer(remotePeer.peerID, now)
 		afterDirectPath, hasDirectPath := authenticatedDirectPath(remotePeer)
 		c.markPeerGraphDirty(hadDirectPath != hasDirectPath || (hasDirectPath && beforeDirectPath != afterDirectPath))
 		c.queueTopologySnapshots(now, true)
@@ -678,13 +747,13 @@ func (c *Client) handleSessionPacketOnPath(data []byte, packetPath Path) {
 func (c *Client) sessionForHeader(header protocol.SessionHeader, path Path) (*RemotePeer, *PeeringSession, bool) {
 	for _, peer := range c.remotePeers {
 		peerSess := peer.activeSession
-		if peerSess != nil && peerSess.sessionID == header.SessionID && peerSess.acceptsPath(path) {
+		if peerSess != nil && peerSess.sessionReady() && peerSess.sessionID == header.SessionID && peerSess.acceptsPath(path) {
 			return peer, peerSess, false
 		}
 	}
 	for _, peer := range c.remotePeers {
 		peerSess := peer.pendingSession
-		if peerSess != nil && peerSess.acceptsPath(path) && peerSess.sessionID == header.SessionID {
+		if peerSess != nil && peerSess.sessionReady() && peerSess.acceptsPath(path) && peerSess.sessionID == header.SessionID {
 			return peer, peerSess, true
 		}
 	}
@@ -772,7 +841,7 @@ func (c *Client) remotePeerSnapshots() []RemotePeerSnapshot {
 			transport = "bridge"
 		}
 		remotePeers = append(remotePeers, RemotePeerSnapshot{
-			PeerID:           peer.identity.PeerID(),
+			PeerID:           peer.peerID,
 			Address:          activeSession.path.Address().String(),
 			SessionID:        hex.EncodeToString(activeSession.sessionID[:]),
 			RTTMillis:        activeSession.rttMillis,
@@ -786,7 +855,9 @@ func (c *Client) remotePeerSnapshots() []RemotePeerSnapshot {
 			ScreenStreamID:   hex.EncodeToString(activeSession.remoteScreenState.streamID[:]),
 		})
 	}
-	sort.Slice(remotePeers, func(i, j int) bool { return remotePeers[i].PeerID < remotePeers[j].PeerID })
+	sort.Slice(remotePeers, func(i, j int) bool {
+		return bytes.Compare(remotePeers[i].PeerID[:], remotePeers[j].PeerID[:]) < 0
+	})
 	return remotePeers
 }
 

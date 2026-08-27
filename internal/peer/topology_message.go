@@ -1,12 +1,10 @@
 package peer
 
 import (
-	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
 	"net/netip"
 	"slices"
-	"sort"
 	"time"
 
 	"bork/internal/identity"
@@ -21,13 +19,13 @@ const (
 )
 
 type topologyEntry struct {
-	peerID    [32]byte
+	peerID    identity.PeerID
 	addresses []netip.AddrPort
 }
 
 type topologyMessage struct {
 	generation    uint64
-	audioStreamID [16]byte
+	voiceStreamID [16]byte
 	candidates    []netip.AddrPort
 	neighbors     []topologyEntry
 }
@@ -51,12 +49,12 @@ func (c *Client) queueTopologySnapshots(now time.Time, force bool) {
 	}
 }
 
-func (c *Client) marshalTopologyMessage(generation uint64, recipientID string, recipientAddress netip.AddrPort) ([]byte, error) {
+func (c *Client) marshalTopologyMessage(generation uint64, recipientID identity.PeerID, recipientAddress netip.AddrPort) ([]byte, error) {
 	if generation == 0 {
 		return nil, errors.New("topology generation is zero")
 	}
-	if c.audioStreamID == ([16]byte{}) {
-		return nil, errors.New("topology audio stream is zero")
+	if c.voiceStreamID == ([16]byte{}) {
+		return nil, errors.New("topology voice stream is zero")
 	}
 	candidates := make([]netip.AddrPort, 0, len(c.networkSnapshot.Endpoint.Candidates))
 	for _, candidateType := range []endpoint.CandidateType{endpoint.CandidatePortMapped, endpoint.CandidateSTUN, endpoint.CandidateNIC} {
@@ -70,33 +68,33 @@ func (c *Client) marshalTopologyMessage(generation uint64, recipientID string, r
 			}
 		}
 	}
-	peerIDs := make([]string, 0, len(c.remotePeers))
+	peerIDs := make([]identity.PeerID, 0, len(c.remotePeers))
 	for peerID, peer := range c.remotePeers {
 		if peerID != recipientID && peer.activeSession != nil && peer.activeSession.authenticated && peer.activeSession.path.IsDirect() {
 			peerIDs = append(peerIDs, peerID)
 		}
 	}
-	sort.Strings(peerIDs)
+	slices.SortFunc(peerIDs, comparePeerIDs)
 	neighbors := make([]topologyEntry, 0, len(peerIDs))
 	for _, peerID := range peerIDs {
 		peer := c.remotePeers[peerID]
-		entry := topologyEntry{peerID: rawPeerIdentity(peer.identity)}
+		entry := topologyEntry{peerID: peer.peerID}
 		if address := peer.activeSession.path.Address(); usableTopologyAddress(address, recipientAddress) {
 			entry.addresses = []netip.AddrPort{address}
 		}
 		neighbors = append(neighbors, entry)
 	}
-	return encodeTopologyMessage(topologyMessage{generation: generation, audioStreamID: c.audioStreamID, candidates: candidates, neighbors: neighbors})
+	return encodeTopologyMessage(topologyMessage{generation: generation, voiceStreamID: c.voiceStreamID, candidates: candidates, neighbors: neighbors})
 }
 
 func encodeTopologyMessage(message topologyMessage) ([]byte, error) {
-	if message.generation == 0 || message.audioStreamID == ([16]byte{}) || len(message.candidates) > int(^uint16(0)) || uint64(len(message.neighbors)) > uint64(^uint32(0)) {
+	if message.generation == 0 || message.voiceStreamID == ([16]byte{}) || len(message.candidates) > int(^uint16(0)) || uint64(len(message.neighbors)) > uint64(^uint32(0)) {
 		return nil, errors.New("topology message fields are invalid")
 	}
 	payload := make([]byte, 0, 31+len(message.candidates)*19+len(message.neighbors)*52)
 	payload = append(payload, topologyMessageVersion)
 	payload = binary.BigEndian.AppendUint64(payload, message.generation)
-	payload = append(payload, message.audioStreamID[:]...)
+	payload = append(payload, message.voiceStreamID[:]...)
 	payload = binary.BigEndian.AppendUint16(payload, uint16(len(message.candidates)))
 	for _, address := range message.candidates {
 		var err error
@@ -107,7 +105,7 @@ func encodeTopologyMessage(message topologyMessage) ([]byte, error) {
 	}
 	payload = binary.BigEndian.AppendUint32(payload, uint32(len(message.neighbors)))
 	for _, neighbor := range message.neighbors {
-		if zeroRawIdentity(neighbor.peerID) || len(neighbor.addresses) > int(^uint16(0)) {
+		if neighbor.peerID.IsZero() || len(neighbor.addresses) > int(^uint16(0)) {
 			return nil, errors.New("topology neighbor is invalid")
 		}
 		payload = append(payload, neighbor.peerID[:]...)
@@ -149,9 +147,9 @@ func decodeTopologyMessage(payload []byte) (topologyMessage, error) {
 	if message.generation == 0 {
 		return topologyMessage{}, errors.New("topology generation is zero")
 	}
-	copy(message.audioStreamID[:], payload[9:25])
-	if message.audioStreamID == ([16]byte{}) {
-		return topologyMessage{}, errors.New("topology audio stream is zero")
+	copy(message.voiceStreamID[:], payload[9:25])
+	if message.voiceStreamID == ([16]byte{}) {
+		return topologyMessage{}, errors.New("topology voice stream is zero")
 	}
 	offset := 27
 	candidateCount := int(binary.BigEndian.Uint16(payload[25:27]))
@@ -180,8 +178,8 @@ func decodeTopologyMessage(payload []byte) (topologyMessage, error) {
 		var entry topologyEntry
 		copy(entry.peerID[:], payload[offset:offset+32])
 		offset += 32
-		if zeroRawIdentity(entry.peerID) {
-			return topologyMessage{}, errors.New("topology neighbor identity is zero")
+		if entry.peerID.IsZero() {
+			return topologyMessage{}, errors.New("topology neighbor peer ID is zero")
 		}
 		addressCount := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
 		offset += 2
@@ -241,17 +239,16 @@ func (c *Client) handleTopologySnapshotAt(sender *RemotePeer, payload []byte, no
 	}
 	if message.generation > sender.activeSession.topologyReceivedGeneration {
 		sender.activeSession.topologyReceivedGeneration = message.generation
-		sender.activeSession.audioStreamID = message.audioStreamID
+		sender.activeSession.voiceStreamID = message.voiceStreamID
 	}
-	c.recordTopologyClaims(sender.identity, message.neighbors, now)
+	c.recordTopologyClaims(sender.peerID, message.neighbors, now)
 	for _, address := range message.candidates {
 		if usableTopologyAddress(address, sender.activeSession.path.Address()) {
 			c.addDiscoveryHintAt(discovery.Hint{Address: address, Source: discovery.SourceTopology, ExpiresAt: now.Add(topologyHintTTL)}, now)
 		}
 	}
 	for _, entry := range message.neighbors {
-		peerIdentity, identityErr := identity.FromPublicKey(ed25519.PublicKey(entry.peerID[:]))
-		if identityErr != nil || peerIdentity.PeerID() == c.localIdentity.PeerID() {
+		if entry.peerID == c.localIdentity.PeerID {
 			continue
 		}
 		for _, address := range entry.addresses {

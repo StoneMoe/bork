@@ -3,12 +3,14 @@ package peer
 import (
 	"errors"
 	"net/netip"
+
+	"bork/internal/identity"
 )
 
 type Path struct {
 	address      netip.AddrPort
-	intermediary [32]byte
-	target       [32]byte
+	intermediary identity.PeerID
+	target       identity.PeerID
 }
 
 func NewPath(address netip.AddrPort) (Path, error) {
@@ -19,9 +21,9 @@ func NewPath(address netip.AddrPort) (Path, error) {
 	return Path{address: address}, nil
 }
 
-func NewBridgePath(nextHop netip.AddrPort, intermediary, target [32]byte) (Path, error) {
+func NewBridgePath(nextHop netip.AddrPort, intermediary, target identity.PeerID) (Path, error) {
 	path, err := NewPath(nextHop)
-	if err != nil || intermediary == ([32]byte{}) || target == ([32]byte{}) || intermediary == target {
+	if err != nil || intermediary.IsZero() || target.IsZero() || intermediary == target {
 		return Path{}, errors.New("bridge path is invalid")
 	}
 	path.intermediary = intermediary
@@ -29,16 +31,16 @@ func NewBridgePath(nextHop netip.AddrPort, intermediary, target [32]byte) (Path,
 	return path, nil
 }
 
-func (p Path) Address() netip.AddrPort { return p.address }
-func (p Path) IsDirect() bool          { return p.intermediary == ([32]byte{}) && p.target == ([32]byte{}) }
-func (p Path) Intermediary() [32]byte  { return p.intermediary }
-func (p Path) Target() [32]byte        { return p.target }
+func (p Path) Address() netip.AddrPort       { return p.address }
+func (p Path) IsDirect() bool                { return p.intermediary.IsZero() && p.target.IsZero() }
+func (p Path) Intermediary() identity.PeerID { return p.intermediary }
+func (p Path) Target() identity.PeerID       { return p.target }
 
 func (p Path) IsValid() bool {
 	if !p.address.IsValid() || p.address.Port() == 0 {
 		return false
 	}
-	return p.IsDirect() || (p.intermediary != ([32]byte{}) && p.target != ([32]byte{}) && p.intermediary != p.target)
+	return p.IsDirect() || (!p.intermediary.IsZero() && !p.target.IsZero() && p.intermediary != p.target)
 }
 
 func (p Path) SameRoute(other Path) bool {

@@ -7,6 +7,7 @@ import (
 
 	"bork/internal/audio"
 	"bork/internal/globalkey"
+	"bork/internal/identity"
 	"bork/internal/invite"
 	"bork/internal/peer"
 	"bork/internal/screenshare"
@@ -30,7 +31,11 @@ func (a *App) GetInvite() (string, error) {
 	return client.EncodedInvite(), nil
 }
 
-func (a *App) OfferFile(recipientPeerID string) (string, error) {
+func (a *App) OfferFile(recipientPeerIDText string) (string, error) {
+	recipientPeerID, err := identity.ParsePeerID(recipientPeerIDText)
+	if err != nil {
+		return "", err
+	}
 	a.waitForStartup()
 	a.commandMu.Lock()
 	if a.isShuttingDown() {
@@ -315,7 +320,18 @@ func (a *App) StopScreenShare(captureID uint32) error {
 // SetScreenAudioSource follows a remote screen's sound. The frontend sends an
 // empty source peer ID while showing the local preview or no screen. The room
 // peer ID prevents a delayed call from changing the next room.
-func (a *App) SetScreenAudioSource(roomPeerID, sourcePeerID string) error {
+func (a *App) SetScreenAudioSource(roomPeerIDText, sourcePeerIDText string) error {
+	roomPeerID, err := identity.ParsePeerID(roomPeerIDText)
+	if err != nil {
+		return err
+	}
+	var sourcePeerID identity.PeerID
+	if sourcePeerIDText != "" {
+		sourcePeerID, err = identity.ParsePeerID(sourcePeerIDText)
+		if err != nil {
+			return err
+		}
+	}
 	a.waitForStartup()
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()

@@ -1,5 +1,7 @@
 package audio
 
+import "bork/internal/identity"
+
 const (
 	SampleRate       = 48000
 	Channels         = 1
@@ -36,23 +38,23 @@ type Device struct {
 }
 
 type Status struct {
-	Running                     bool     `json:"running"`
-	CaptureMuted                bool     `json:"captureMuted"`
-	PlaybackMuted               bool     `json:"playbackMuted"`
-	CaptureGain                 int      `json:"captureGain"`
-	CaptureLevel                float64  `json:"captureLevel"`
-	CaptureClipped              bool     `json:"captureClipped"`
-	PlaybackGain                int      `json:"playbackGain"`
-	EchoCancellation            bool     `json:"echoCancellation"`
-	NoiseSuppression            bool     `json:"noiseSuppression"`
-	RemoteLoudnessNormalization bool     `json:"remoteLoudnessNormalization"`
-	Speaking                    bool     `json:"speaking"`
-	SpeakingPeerIDs             []string `json:"speakingPeerIds"`
-	CaptureDeviceID             string   `json:"captureDeviceId"`
-	PlaybackDeviceID            string   `json:"playbackDeviceId"`
-	CaptureDevices              []Device `json:"captureDevices"`
-	PlaybackDevices             []Device `json:"playbackDevices"`
-	Error                       string   `json:"error,omitempty"`
+	Running                     bool              `json:"running"`
+	CaptureMuted                bool              `json:"captureMuted"`
+	PlaybackMuted               bool              `json:"playbackMuted"`
+	CaptureGain                 int               `json:"captureGain"`
+	CaptureLevel                float64           `json:"captureLevel"`
+	CaptureClipped              bool              `json:"captureClipped"`
+	PlaybackGain                int               `json:"playbackGain"`
+	EchoCancellation            bool              `json:"echoCancellation"`
+	NoiseSuppression            bool              `json:"noiseSuppression"`
+	RemoteLoudnessNormalization bool              `json:"remoteLoudnessNormalization"`
+	Speaking                    bool              `json:"speaking"`
+	SpeakingPeerIDs             []identity.PeerID `json:"speakingPeerIds" ts_type:"string[]"`
+	CaptureDeviceID             string            `json:"captureDeviceId"`
+	PlaybackDeviceID            string            `json:"playbackDeviceId"`
+	CaptureDevices              []Device          `json:"captureDevices"`
+	PlaybackDevices             []Device          `json:"playbackDevices"`
+	Error                       string            `json:"error,omitempty"`
 }
 
 func (s Status) DevicesAvailable() bool {
@@ -66,7 +68,7 @@ func defaultStatus() Status {
 		EchoCancellation:            true,
 		NoiseSuppression:            true,
 		RemoteLoudnessNormalization: true,
-		SpeakingPeerIDs:             []string{},
+		SpeakingPeerIDs:             []identity.PeerID{},
 	}
 }
 

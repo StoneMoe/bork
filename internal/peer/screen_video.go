@@ -7,9 +7,10 @@ import (
 	"fmt"
 	"math"
 	"net/netip"
-	"sort"
+	"slices"
 	"time"
 
+	"bork/internal/identity"
 	"bork/internal/protocol"
 )
 
@@ -74,7 +75,7 @@ type screenCommandResult struct {
 }
 
 type ScreenVideoChunk struct {
-	PeerID     string
+	PeerID     identity.PeerID
 	SessionID  [16]byte
 	Generation uint64
 	StreamID   [16]byte
@@ -464,7 +465,7 @@ func (c *Client) activateScreenShare(codec string, width, height uint16) error {
 		width:      width,
 		height:     height,
 	}
-	c.screenMediaSendSequence = 0
+	c.screenPacketSequence = 0
 	c.screenVideoChunkID = 0
 	c.queueScreenStates()
 	c.publishStateChange()
@@ -479,7 +480,7 @@ func (c *Client) stopScreenShare() error {
 		return errors.New("screen state generation is exhausted")
 	}
 	c.localScreenState = screenState{generation: c.localScreenState.generation + 1}
-	c.screenMediaSendSequence = 0
+	c.screenPacketSequence = 0
 	c.screenVideoChunkID = 0
 	c.queueScreenStates()
 	c.publishStateChange()
@@ -513,7 +514,7 @@ func (c *Client) handleScreenState(sender *RemotePeer, payload []byte) {
 		return
 	}
 	sender.activeSession.remoteScreenState = state
-	c.removeScreenVideoAssembliesForSender(rawPeerIdentity(sender.identity))
+	c.removeScreenVideoAssembliesForSender(sender.peerID)
 	c.publishStateChange()
 }
 
@@ -538,16 +539,16 @@ func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFram
 		return false, err
 	}
 	c.queueScreenStates()
-	if c.screenVideoChunkID == math.MaxUint32 || uint64(len(fragments)) > math.MaxUint64-c.screenMediaSendSequence {
+	if c.screenVideoChunkID == math.MaxUint32 || uint64(len(fragments)) > math.MaxUint64-c.screenPacketSequence {
 		return false, errors.New("screen media stream sequence is exhausted")
 	}
 	c.screenVideoChunkID++
 	packets := make([][]byte, 0, len(fragments))
 	for _, fragment := range fragments {
-		c.screenMediaSendSequence++
+		c.screenPacketSequence++
 		header := protocol.RoomDatagramHeader{
-			Class: protocol.TrafficInteractive, SenderID: c.roomDatagramSenderID,
-			StreamID: c.localScreenState.streamID, Sequence: c.screenMediaSendSequence,
+			Class: protocol.TrafficScreenVideo, SenderID: c.localIdentity.PeerID,
+			StreamID: c.localScreenState.streamID, PacketSequence: c.screenPacketSequence,
 		}
 		packet, marshalErr := protocol.MarshalRoomDatagram(c.roomTag, header, c.screenVideoChunkID, fragment, c.roomDatagramProtector, c.localIdentity)
 		if marshalErr != nil {
@@ -560,7 +561,7 @@ func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFram
 	if len(ready) == 0 {
 		return true, nil
 	}
-	return c.sendRealtimePacketsToPeers(protocol.TrafficInteractive, packets, ready, now.Add(screenVideoChunkTTL), 0), nil
+	return c.sendRealtimePacketsToPeers(protocol.TrafficScreenVideo, packets, ready, now.Add(screenVideoChunkTTL), 0), nil
 }
 
 func (c *Client) sendScreenAudioFrame(timestamp uint32, rawOpus []byte) error {
@@ -568,13 +569,13 @@ func (c *Client) sendScreenAudioFrame(timestamp uint32, rawOpus []byte) error {
 		return errors.New("screen sharing is not active")
 	}
 	c.queueScreenStates()
-	if c.screenMediaSendSequence == math.MaxUint64 {
+	if c.screenPacketSequence == math.MaxUint64 {
 		return errors.New("screen media stream sequence is exhausted")
 	}
-	c.screenMediaSendSequence++
+	c.screenPacketSequence++
 	header := protocol.RoomDatagramHeader{
-		Class: protocol.TrafficScreenAudio, SenderID: c.roomDatagramSenderID,
-		StreamID: c.localScreenState.streamID, Sequence: c.screenMediaSendSequence,
+		Class: protocol.TrafficScreenAudio, SenderID: c.localIdentity.PeerID,
+		StreamID: c.localScreenState.streamID, PacketSequence: c.screenPacketSequence,
 	}
 	packet, err := protocol.MarshalRoomDatagram(c.roomTag, header, timestamp, rawOpus, c.roomDatagramProtector, c.localIdentity)
 	if err != nil {
@@ -589,19 +590,19 @@ func (c *Client) sendScreenAudioFrame(timestamp uint32, rawOpus []byte) error {
 	return nil
 }
 
-func (c *Client) screenMediaDestinations(now time.Time) []string {
+func (c *Client) screenMediaDestinations(now time.Time) []identity.PeerID {
 	c.refreshFanout(now)
 	destinations := c.fanout.destinations
 	if !c.fanoutReady(now) {
-		destinations = make([]string, 0, len(c.remotePeers))
+		destinations = make([]identity.PeerID, 0, len(c.remotePeers))
 		for peerID, peer := range c.remotePeers {
 			if peer.activeSession != nil && peer.activeSession.authenticated && peer.activeSession.path.IsDirect() {
 				destinations = append(destinations, peerID)
 			}
 		}
-		sort.Strings(destinations)
+		slices.SortFunc(destinations, comparePeerIDs)
 	}
-	ready := make([]string, 0, len(destinations))
+	ready := make([]identity.PeerID, 0, len(destinations))
 	for _, peerID := range destinations {
 		if peer := c.remotePeers[peerID]; peer != nil && c.screenStateReady(peer.activeSession) {
 			ready = append(ready, peerID)
@@ -736,7 +737,7 @@ func (c *Client) removeScreenVideoChunkAssembly(key roomDatagramStreamKey, chunk
 	delete(state.assemblies, chunkID)
 }
 
-func (c *Client) removeScreenVideoAssembliesForSender(sender [32]byte) {
+func (c *Client) removeScreenVideoAssembliesForSender(sender identity.PeerID) {
 	for key := range c.screenVideoReceivers {
 		if key.sender == sender {
 			c.removeScreenVideoAssembly(key)
@@ -755,7 +756,7 @@ func (c *Client) expireScreenVideoChunks(now time.Time) {
 	}
 }
 
-func (c *Client) forwardScreenVideoChunk(senderID string, source netip.AddrPort, packets [][]byte, deadline time.Time) {
+func (c *Client) forwardScreenVideoChunk(senderID identity.PeerID, source netip.AddrPort, packets [][]byte, deadline time.Time) {
 	if c.roomNetwork == nil {
 		return
 	}
@@ -767,7 +768,7 @@ func (c *Client) forwardScreenVideoChunk(senderID string, source netip.AddrPort,
 	if assignment.generation == 0 {
 		return
 	}
-	c.sendRealtimePacketsToPeers(protocol.TrafficInteractive, packets, assignment.listeners, deadline, 0)
+	c.sendRealtimePacketsToPeers(protocol.TrafficScreenVideo, packets, assignment.listeners, deadline, 0)
 }
 
 func (c *Client) deliverScreenVideoChunk(chunk ScreenVideoChunk) {

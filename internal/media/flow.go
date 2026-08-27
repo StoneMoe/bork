@@ -4,6 +4,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"bork/internal/identity"
 )
 
 const maxReceivedFramesPerSource = 2
@@ -16,7 +18,7 @@ const (
 )
 
 type ReceivedFrame struct {
-	SourceID   string
+	SourceID   identity.PeerID
 	StreamKind AudioStreamKind
 	StreamID   [16]byte
 	Sequence   uint64
@@ -26,10 +28,10 @@ type ReceivedFrame struct {
 }
 
 type SendFrame struct {
-	Timestamp  uint32
-	Payload    []byte
-	Deadline   time.Time
-	Generation uint64
+	Timestamp      uint32
+	Payload        []byte
+	Deadline       time.Time
+	SendGeneration uint64
 }
 
 type PeerPort interface {
@@ -42,7 +44,7 @@ type PeerPort interface {
 type AudioPort interface {
 	ReceivedReady() <-chan struct{}
 	TakeReceived() (ReceivedFrame, bool)
-	ScreenAudioSource() string
+	ScreenAudioSource() identity.PeerID
 	SubmitSend(SendFrame) bool
 	InvalidateSend() uint64
 	Reset() uint64
@@ -57,7 +59,7 @@ type Flow struct {
 	receivedOrder       []receivedStreamKey
 	receivedNext        int
 	receivedReady       chan struct{}
-	screenAudioSourceID string
+	screenAudioSourceID identity.PeerID
 
 	send            SendFrame
 	hasSend         bool
@@ -69,7 +71,7 @@ type Flow struct {
 // receivedStreamKey keeps a peer's voice and screen audio in separate queues.
 // Each stream has its own packet sequence and decoder state.
 type receivedStreamKey struct {
-	sourceID string
+	sourceID identity.PeerID
 	kind     AudioStreamKind
 }
 
@@ -86,7 +88,7 @@ func (f *Flow) ReceivedReady() <-chan struct{} { return f.receivedReady }
 func (f *Flow) SendReady() <-chan struct{}     { return f.sendReady }
 
 func (f *Flow) SubmitReceived(frame ReceivedFrame) bool {
-	if frame.SourceID == "" || frame.Sequence == 0 || len(frame.Payload) == 0 {
+	if frame.SourceID.IsZero() || frame.Sequence == 0 || len(frame.Payload) == 0 {
 		return false
 	}
 	f.mu.Lock()
@@ -155,7 +157,7 @@ func (f *Flow) TakeReceived() (ReceivedFrame, bool) {
 
 // SetScreenAudioSource makes screen audio follow the screen selected by the
 // viewer. An empty source means the local preview or no remote screen.
-func (f *Flow) SetScreenAudioSource(sourceID string) {
+func (f *Flow) SetScreenAudioSource(sourceID identity.PeerID) {
 	f.mu.Lock()
 	if f.screenAudioSourceID == sourceID {
 		f.mu.Unlock()
@@ -170,7 +172,7 @@ func (f *Flow) SetScreenAudioSource(sourceID string) {
 	f.mu.Unlock()
 }
 
-func (f *Flow) ScreenAudioSource() string {
+func (f *Flow) ScreenAudioSource() identity.PeerID {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.screenAudioSourceID
@@ -181,7 +183,7 @@ func (f *Flow) SubmitSend(frame SendFrame) bool {
 		return false
 	}
 	f.mu.Lock()
-	if frame.Generation != f.sendGeneration {
+	if frame.SendGeneration != f.sendGeneration {
 		f.mu.Unlock()
 		return false
 	}

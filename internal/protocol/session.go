@@ -6,7 +6,6 @@ import (
 	"crypto/ecdh"
 	"crypto/hkdf"
 	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -27,11 +26,14 @@ func DeriveSession(privateKey *ecdh.PrivateKey, localHello, remoteHello HelloPac
 	if privateKey == nil {
 		return SessionMaterial{}, errors.New("local X25519 key is nil")
 	}
-	if len(localHello.IdentityKey) != 32 || len(remoteHello.IdentityKey) != 32 {
-		return SessionMaterial{}, errors.New("session identity key is invalid")
+	if localHello.PeerID.IsZero() || remoteHello.PeerID.IsZero() {
+		return SessionMaterial{}, errors.New("session peer ID is invalid")
 	}
-	if bytes.Equal(localHello.IdentityKey, remoteHello.IdentityKey) {
-		return SessionMaterial{}, errors.New("session identities are equal")
+	if localHello.PeerID == remoteHello.PeerID {
+		return SessionMaterial{}, errors.New("session peer IDs are equal")
+	}
+	if localHello.IsProbe() || remoteHello.IsProbe() || localHello.HandshakeID != remoteHello.HandshakeID {
+		return SessionMaterial{}, errors.New("session hello handshake IDs do not match")
 	}
 	if localHello.RoomTag != remoteHello.RoomTag {
 		return SessionMaterial{}, errors.New("session room tags do not match")
@@ -49,18 +51,13 @@ func DeriveSession(privateKey *ecdh.PrivateKey, localHello, remoteHello HelloPac
 	}
 
 	first, second := localHello, remoteHello
-	localFirst := bytes.Compare(localHello.IdentityKey, remoteHello.IdentityKey) < 0
+	localFirst := bytes.Compare(localHello.PeerID[:], remoteHello.PeerID[:]) < 0
 	if !localFirst {
 		first, second = second, first
 	}
 	hash := sha256.New()
 	_, _ = hash.Write([]byte(wireDomain + "handshake-transcript\x00"))
-	var length [2]byte
-	binary.BigEndian.PutUint16(length[:], uint16(len(first.wire)))
-	_, _ = hash.Write(length[:])
 	_, _ = hash.Write(first.wire[:])
-	binary.BigEndian.PutUint16(length[:], uint16(len(second.wire)))
-	_, _ = hash.Write(length[:])
 	_, _ = hash.Write(second.wire[:])
 	var transcriptHash [32]byte
 	copy(transcriptHash[:], hash.Sum(nil))

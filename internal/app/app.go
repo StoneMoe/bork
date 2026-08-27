@@ -11,6 +11,7 @@ import (
 	"bork/internal/audio"
 	"bork/internal/config"
 	"bork/internal/globalkey"
+	"bork/internal/identity"
 	"bork/internal/media"
 	"bork/internal/networking/discovery/tracker"
 	"bork/internal/networking/endpoint"
@@ -763,7 +764,7 @@ func emptyAudioStatus() audio.Status {
 		EchoCancellation:            true,
 		NoiseSuppression:            true,
 		RemoteLoudnessNormalization: true,
-		SpeakingPeerIDs:             []string{},
+		SpeakingPeerIDs:             []identity.PeerID{},
 		CaptureDevices:              []audio.Device{},
 		PlaybackDevices:             []audio.Device{},
 	}

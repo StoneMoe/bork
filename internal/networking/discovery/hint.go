@@ -24,10 +24,10 @@ type Hint struct {
 	ExpiresAt time.Time
 }
 
-func newPeerHint() (string, error) {
+func newAnnouncementID() (string, error) {
 	var random [8]byte
 	if _, err := rand.Read(random[:]); err != nil {
-		return "", fmt.Errorf("generate discovery peer hint: %w", err)
+		return "", fmt.Errorf("generate discovery announcement ID: %w", err)
 	}
 	return hex.EncodeToString(random[:]), nil
 }

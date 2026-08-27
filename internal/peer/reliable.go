@@ -215,7 +215,7 @@ func (r *reliableTransport) nextFragment(eligible func(*reliableFragment) bool) 
 }
 
 func (r *reliableTransport) receive(packet protocol.ReliablePacket, now time.Time) []deliveredReliableMessage {
-	r.consumeACK(packet.Channel, packet.AckBase, packet.AckBitmap, now)
+	r.consumeFragmentAck(packet.Channel, packet.FragmentAckBase, packet.FragmentAckBitmap, now)
 	if packet.AckOnly() {
 		return nil
 	}
@@ -295,10 +295,10 @@ func (r *reliableTransport) nextAck() (protocol.ReliablePacket, reliableReservat
 			continue
 		}
 		return protocol.ReliablePacket{
-				Channel:   channel,
-				Flags:     protocol.ReliableFlagAckOnly,
-				AckBase:   state.received.highest,
-				AckBitmap: state.received.seen,
+				Channel:           channel,
+				Flags:             protocol.ReliableFlagAckOnly,
+				FragmentAckBase:   state.received.highest,
+				FragmentAckBitmap: state.received.seen,
 			}, reliableReservation{
 				kind: reliableReservationACK, channel: state, ackIndex: index,
 			}, true
@@ -357,15 +357,15 @@ func (r *reliableTransport) packetFor(fragment *reliableFragment) protocol.Relia
 		flags = protocol.ReliableFlagOrdered
 	}
 	return protocol.ReliablePacket{
-		Channel:          fragment.channel,
-		Flags:            flags,
-		FragmentSequence: fragment.fragmentSequence,
-		MessageSequence:  fragment.messageSequence,
-		FragmentIndex:    fragment.fragmentIndex,
-		FragmentCount:    fragment.fragmentCount,
-		AckBase:          state.received.highest,
-		AckBitmap:        state.received.seen,
-		Payload:          fragment.payload,
+		Channel:           fragment.channel,
+		Flags:             flags,
+		FragmentSequence:  fragment.fragmentSequence,
+		MessageSequence:   fragment.messageSequence,
+		FragmentIndex:     fragment.fragmentIndex,
+		FragmentCount:     fragment.fragmentCount,
+		FragmentAckBase:   state.received.highest,
+		FragmentAckBitmap: state.received.seen,
+		Payload:           fragment.payload,
 	}
 }
 
@@ -420,14 +420,14 @@ func (r *reliableTransport) advance(reservation reliableReservation) {
 	r.preferACK = true
 }
 
-func (r *reliableTransport) consumeACK(channel uint16, base, bitmap uint64, now time.Time) {
+func (r *reliableTransport) consumeFragmentAck(channel uint16, base, bitmap uint64, now time.Time) {
 	if base == 0 || bitmap == 0 {
 		return
 	}
 	ackedBytes := 0
 	remaining := r.outbound[:0]
 	for _, fragment := range r.outbound {
-		if fragment.channel != channel || fragment.transmissions == 0 || !protocol.AckContains(base, bitmap, fragment.fragmentSequence) {
+		if fragment.channel != channel || fragment.transmissions == 0 || !protocol.FragmentAckContains(base, bitmap, fragment.fragmentSequence) {
 			remaining = append(remaining, fragment)
 			continue
 		}
