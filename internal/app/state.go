@@ -18,18 +18,17 @@ const (
 )
 
 type RemotePeer struct {
-	PeerID           identity.PeerID `json:"peerId" ts_type:"string"`
-	Nickname         string          `json:"nickname"`
-	Muted            bool            `json:"muted"`
-	PlaybackMuted    bool            `json:"playbackMuted"`
-	Address          string          `json:"address"`
-	SessionID        string          `json:"sessionId"`
-	RTTMillis        int64           `json:"rttMillis"`
-	Transport        string          `json:"transport"`
-	Connected        bool            `json:"connected"`
-	ScreenSharing    bool            `json:"screenSharing"`
-	ScreenGeneration uint64          `json:"screenGeneration"`
-	ScreenStreamID   string          `json:"screenStreamId"`
+	PeerID         identity.PeerID `json:"peerId" ts_type:"string"`
+	Nickname       string          `json:"nickname"`
+	Muted          bool            `json:"muted"`
+	PlaybackMuted  bool            `json:"playbackMuted"`
+	Address        string          `json:"address"`
+	SessionID      string          `json:"sessionId"`
+	RTTMillis      int64           `json:"rttMillis"`
+	Transport      string          `json:"transport"`
+	Connected      bool            `json:"connected"`
+	ScreenSharing  bool            `json:"screenSharing"`
+	ScreenStreamID string          `json:"screenStreamId"`
 }
 
 type RoomState struct {
@@ -58,8 +57,6 @@ type FileTransfer struct {
 // describe the centered visible area after the captured window changes size.
 type ScreenVideoChunkEvent struct {
 	PeerID        identity.PeerID `json:"peerId" ts_type:"string"`
-	SessionID     string          `json:"sessionId"`
-	Generation    uint64          `json:"generation"`
 	StreamID      string          `json:"streamId"`
 	ChunkID       uint32          `json:"chunkId"`
 	Codec         string          `json:"codec"`
@@ -132,7 +129,7 @@ func projectRemotePeer(remotePeer peer.RemotePeerSnapshot) RemotePeer {
 		PeerID: remotePeer.PeerID, Nickname: remotePeer.Nickname, Muted: remotePeer.Muted, PlaybackMuted: remotePeer.PlaybackMuted,
 		Address: remotePeer.Address, SessionID: remotePeer.SessionID,
 		RTTMillis: remotePeer.RTTMillis, Transport: remotePeer.Transport, Connected: remotePeer.Connected,
-		ScreenSharing: remotePeer.ScreenSharing, ScreenGeneration: remotePeer.ScreenGeneration, ScreenStreamID: remotePeer.ScreenStreamID,
+		ScreenSharing: remotePeer.ScreenSharing, ScreenStreamID: remotePeer.ScreenStreamID,
 	}
 }
 

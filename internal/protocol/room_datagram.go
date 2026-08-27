@@ -1,42 +1,26 @@
 package protocol
 
 import (
-	"bytes"
-	"crypto"
 	"crypto/cipher"
-	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
-
-	"bork/internal/identity"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-type TrafficClass byte
-
-const (
-	TrafficVoice TrafficClass = iota + 1
-	TrafficScreenVideo
-	// TrafficScreenAudio uses the screen endpoint lane so microphone
-	// packets always keep their higher scheduling priority.
-	TrafficScreenAudio
-)
-
 type RoomDatagramHeader struct {
-	Class          TrafficClass
-	SenderID       identity.PeerID
+	Type           PacketType
 	StreamID       [16]byte
 	PacketSequence uint64
 }
 
 type RoomDatagram struct {
-	MediaSequence uint32
-	Payload       []byte
+	MediaUnitID uint32
+	Payload     []byte
 }
 
-func validTrafficClass(class TrafficClass) bool {
-	return class >= TrafficVoice && class <= TrafficScreenAudio
+func validRoomDatagramType(packetType PacketType) bool {
+	return packetType == PacketVoice || packetType == PacketScreenVideo || packetType == PacketScreenAudio
 }
 
 func NewRoomDatagramCipher(roomDatagramKey [32]byte) cipher.AEAD {
@@ -44,19 +28,18 @@ func NewRoomDatagramCipher(roomDatagramKey [32]byte) cipher.AEAD {
 	return protector
 }
 
-func ParseRoomDatagramHeader(packet []byte, expectedRoomTag [16]byte) (RoomDatagramHeader, error) {
+func ParseRoomDatagramHeader(packet []byte) (RoomDatagramHeader, error) {
 	if len(packet) < roomDatagramHeaderSize {
 		return RoomDatagramHeader{}, errors.New("room datagram is truncated")
 	}
-	packetType, roomTag, err := ParsePrefix(packet)
-	if err != nil || packetType != PacketRoomDatagram || roomTag != expectedRoomTag {
+	packetType, err := ParsePrefix(packet)
+	if err != nil || !validRoomDatagramType(packetType) {
 		return RoomDatagramHeader{}, errors.New("room datagram prefix is invalid")
 	}
-	header := RoomDatagramHeader{Class: TrafficClass(packet[prefixSize])}
-	copy(header.SenderID[:], packet[prefixSize+1:prefixSize+1+32])
-	copy(header.StreamID[:], packet[prefixSize+1+32:prefixSize+1+32+16])
+	header := RoomDatagramHeader{Type: packetType}
+	copy(header.StreamID[:], packet[prefixSize:prefixSize+len(header.StreamID)])
 	header.PacketSequence = binary.BigEndian.Uint64(packet[roomDatagramHeaderSize-8 : roomDatagramHeaderSize])
-	if !validTrafficClass(header.Class) || header.SenderID.IsZero() || header.StreamID == ([16]byte{}) || header.PacketSequence == 0 {
+	if !validRoomDatagramHeader(header) {
 		return RoomDatagramHeader{}, errors.New("room datagram header is invalid")
 	}
 	return header, nil
@@ -66,66 +49,55 @@ func roomDatagramNonce(packet []byte) []byte {
 	return packet[roomDatagramHeaderSize-chacha20poly1305.NonceSizeX : roomDatagramHeaderSize]
 }
 
-func MarshalRoomDatagram(roomTag [16]byte, header RoomDatagramHeader, mediaSequence uint32, payload []byte, protector cipher.AEAD, signer crypto.Signer) ([]byte, error) {
-	if !validTrafficClass(header.Class) || header.SenderID.IsZero() || header.StreamID == ([16]byte{}) || header.PacketSequence == 0 {
+func MarshalRoomDatagram(header RoomDatagramHeader, mediaUnitID uint32, payload []byte, protector cipher.AEAD) ([]byte, error) {
+	if !validRoomDatagramHeader(header) {
 		return nil, errors.New("room datagram header is invalid")
 	}
-	if len(payload) == 0 || len(payload) > MaxRoomDatagramPayload {
+	if !sizeWithin(len(payload), 1, MaxRoomDatagramPayload) {
 		return nil, errors.New("room datagram payload length is invalid")
 	}
-	if protector == nil || protector.NonceSize() != chacha20poly1305.NonceSizeX || protector.Overhead() != aeadTagSize {
+	if !validRoomDatagramCipher(protector) {
 		return nil, errors.New("room datagram protector is invalid")
 	}
-	if signer == nil {
-		return nil, errors.New("room datagram signer is invalid")
-	}
-	publicKey, ok := signer.Public().(ed25519.PublicKey)
-	if !ok || len(publicKey) != ed25519.PublicKeySize || !bytes.Equal(publicKey, header.SenderID[:]) {
-		return nil, errors.New("room datagram signer does not match sender peer ID")
-	}
-	packet := make([]byte, 0, roomDatagramHeaderSize+4+len(payload)+aeadTagSize+roomDatagramSignatureSize)
-	packet = appendPrefix(packet, PacketRoomDatagram, roomTag)
-	packet = append(packet, byte(header.Class))
-	packet = append(packet, header.SenderID[:]...)
+	packet := make([]byte, 0, roomDatagramHeaderSize+4+len(payload)+aeadTagSize)
+	packet = appendPrefix(packet, header.Type)
 	packet = append(packet, header.StreamID[:]...)
 	packet = appendUint64(packet, header.PacketSequence)
-	packet = binary.BigEndian.AppendUint32(packet, mediaSequence)
+	packet = binary.BigEndian.AppendUint32(packet, mediaUnitID)
 	packet = append(packet, payload...)
 	body := packet[roomDatagramHeaderSize:]
 	sealed := protector.Seal(body[:0], roomDatagramNonce(packet), body, packet[:roomDatagramHeaderSize])
-	packet = packet[:roomDatagramHeaderSize+len(sealed)]
-	signature, err := signer.Sign(nil, packet, crypto.Hash(0))
-	if err != nil {
-		return nil, errors.New("room datagram signing failed")
-	}
-	if len(signature) != roomDatagramSignatureSize {
-		return nil, errors.New("room datagram signature length is invalid")
-	}
-	return append(packet, signature...), nil
+	return packet[:roomDatagramHeaderSize+len(sealed)], nil
 }
 
-func ParseRoomDatagram(packet []byte, expectedRoomTag [16]byte, expected RoomDatagramHeader, protector cipher.AEAD) (RoomDatagram, error) {
-	if len(packet) < roomDatagramMinPacketSize || len(packet) > MaxDatagramSize {
+func ParseRoomDatagram(packet []byte, expected RoomDatagramHeader, protector cipher.AEAD) (RoomDatagram, error) {
+	if !sizeWithin(len(packet), roomDatagramMinPacketSize, MaxDatagramSize) {
 		return RoomDatagram{}, errors.New("room datagram length is invalid")
 	}
-	if protector == nil || protector.NonceSize() != chacha20poly1305.NonceSizeX || protector.Overhead() != aeadTagSize {
+	if !validRoomDatagramCipher(protector) {
 		return RoomDatagram{}, errors.New("room datagram protector is invalid")
 	}
-	header, err := ParseRoomDatagramHeader(packet, expectedRoomTag)
+	header, err := ParseRoomDatagramHeader(packet)
 	if err != nil || header != expected {
 		return RoomDatagram{}, errors.New("room datagram header does not match")
 	}
-	signatureOffset := len(packet) - roomDatagramSignatureSize
-	if !ed25519.Verify(ed25519.PublicKey(header.SenderID[:]), packet[:signatureOffset], packet[signatureOffset:]) {
-		return RoomDatagram{}, errors.New("room datagram signature verification failed")
-	}
-	body := append([]byte(nil), packet[roomDatagramHeaderSize:signatureOffset]...)
-	opened, err := protector.Open(body[:0], roomDatagramNonce(packet), body, packet[:roomDatagramHeaderSize])
+	body := packet[roomDatagramHeaderSize:]
+	// Forwarders resend the original datagram after inspection, so decryption
+	// must not overwrite its ciphertext in place.
+	opened, err := protector.Open(nil, roomDatagramNonce(packet), body, packet[:roomDatagramHeaderSize])
 	if err != nil || len(opened) <= 4 {
 		return RoomDatagram{}, errors.New("room datagram authentication failed")
 	}
 	return RoomDatagram{
-		MediaSequence: binary.BigEndian.Uint32(opened[:4]),
-		Payload:       opened[4:],
+		MediaUnitID: binary.BigEndian.Uint32(opened[:4]),
+		Payload:     opened[4:],
 	}, nil
+}
+
+func validRoomDatagramHeader(header RoomDatagramHeader) bool {
+	return validRoomDatagramType(header.Type) && header.StreamID != ([16]byte{}) && header.PacketSequence != 0
+}
+
+func validRoomDatagramCipher(protector cipher.AEAD) bool {
+	return protector != nil && protector.NonceSize() == chacha20poly1305.NonceSizeX && protector.Overhead() == aeadTagSize
 }

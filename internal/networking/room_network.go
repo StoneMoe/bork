@@ -44,38 +44,12 @@ func (s RoomSnapshot) Clone() RoomSnapshot {
 	return s
 }
 
-type roomEndpoint interface {
-	Run(context.Context) error
-	Snapshot() endpoint.Snapshot
-	SnapshotChanges() <-chan struct{}
-	ControlPackets() <-chan endpoint.Datagram
-	ReliablePackets() <-chan endpoint.Datagram
-	BridgePackets() <-chan endpoint.Datagram
-	VoicePackets() <-chan endpoint.Datagram
-	ScreenPackets() <-chan endpoint.Datagram
-	EnqueueControl([]byte, netip.AddrPort) error
-	WriteControl(context.Context, []byte, netip.AddrPort) error
-	EnqueueLowPriority([]byte, netip.AddrPort) error
-	SendRealtimeBatch(endpoint.RealtimeBatch) error
-	SetRealtimeSendGeneration(uint64)
-}
-
-type roomTracker interface {
-	UpdateCandidates([]tracker.AnnounceCandidate)
-	Run(context.Context, chan<- discovery.Hint) error
-	Snapshot() []tracker.ProviderStatus
-	StatusChanges() <-chan struct{}
-}
-
 type RoomNetwork struct {
 	roomTag           [16]byte
 	logger            *slog.Logger
-	endpoint          roomEndpoint
+	endpoint          *endpoint.Endpoint
 	discoveryServices []discovery.Service
-	discoveryRetry    func(context.Context, time.Duration) bool
-	discoveryInitial  time.Duration
-	discoveryMax      time.Duration
-	tracker           roomTracker
+	tracker           *tracker.Group
 	portMapper        portmap.Mapper
 	ipv6PortMapper    portmap.Mapper
 	initializationErr error
@@ -214,8 +188,15 @@ func NewRoomNetwork(roomTag [16]byte, trackerHash [20]byte, peerID identity.Peer
 	if logger == nil {
 		logger = slog.Default()
 	}
-	endpointUDP := endpoint.New(options.Endpoint, roomTag, logger)
-	network := newRoomNetwork(roomTag, endpointUDP, discovery.DefaultServices(), logger)
+	endpointUDP := endpoint.New(options.Endpoint, logger)
+	network := &RoomNetwork{
+		roomTag:           roomTag,
+		logger:            logger,
+		endpoint:          endpointUDP,
+		discoveryServices: discovery.DefaultServices(),
+		stateChanges:      make(chan struct{}, 1),
+		discovered:        make(chan discovery.Hint, 64),
+	}
 	if len(options.TrackerURLs) > 0 {
 		network.tracker, network.initializationErr = tracker.New(options.TrackerURLs, trackerHash, peerID, logger)
 	}
@@ -224,23 +205,6 @@ func NewRoomNetwork(roomTag [16]byte, trackerHash [20]byte, peerID identity.Peer
 		network.ipv6PortMapper = portmap.NewIPv6PCP(logger)
 	}
 	return network
-}
-
-func newRoomNetwork(roomTag [16]byte, endpointUDP roomEndpoint, discoveryServices []discovery.Service, logger *slog.Logger) *RoomNetwork {
-	if logger == nil {
-		logger = slog.Default()
-	}
-	return &RoomNetwork{
-		roomTag:           roomTag,
-		logger:            logger,
-		endpoint:          endpointUDP,
-		discoveryServices: discoveryServices,
-		discoveryRetry:    waitForDiscoveryRetry,
-		discoveryInitial:  defaultDiscoveryRetryInitial,
-		discoveryMax:      defaultDiscoveryRetryMax,
-		stateChanges:      make(chan struct{}, 1),
-		discovered:        make(chan discovery.Hint, 64),
-	}
 }
 
 func (n *RoomNetwork) Run(parent context.Context) error {
@@ -520,42 +484,27 @@ func (n *RoomNetwork) superviseDiscovery(
 	listenAddress netip.AddrPort,
 	events chan<- discoveryEvent,
 ) {
-	delay := n.discoveryInitial
-	if delay <= 0 {
-		delay = defaultDiscoveryRetryInitial
-	}
-	maxDelay := n.discoveryMax
-	if maxDelay < delay {
-		maxDelay = delay
-	}
-	wait := n.discoveryRetry
-	if wait == nil {
-		wait = waitForDiscoveryRetry
-	}
-
+	delay := defaultDiscoveryRetryInitial
 	for {
 		startedAt := time.Now()
 		err := service.Run(ctx, n.roomTag, listenAddress, n.discovered)
 		if ctx.Err() != nil {
 			return
 		}
-		if time.Since(startedAt) >= maxDelay {
-			delay = n.discoveryInitial
-			if delay <= 0 {
-				delay = defaultDiscoveryRetryInitial
-			}
+		if time.Since(startedAt) >= defaultDiscoveryRetryMax {
+			delay = defaultDiscoveryRetryInitial
 		}
 		if err == nil {
 			err = errors.New("discovery service stopped unexpectedly")
 		}
 		n.logger.Warn("room discovery degraded", "service", index, "error", err, "retry_in", delay)
-		if !sendDiscoveryEvent(ctx, events, discoveryEvent{service: index, err: err}) || !wait(ctx, delay) {
+		if !sendDiscoveryEvent(ctx, events, discoveryEvent{service: index, err: err}) || !waitForDiscoveryRetry(ctx, delay) {
 			return
 		}
 		if !sendDiscoveryEvent(ctx, events, discoveryEvent{service: index}) {
 			return
 		}
-		delay = nextDiscoveryRetryDelay(delay, maxDelay)
+		delay = nextDiscoveryRetryDelay(delay, defaultDiscoveryRetryMax)
 	}
 }
 
@@ -621,7 +570,6 @@ func (n *RoomNetwork) ControlPackets() <-chan endpoint.Datagram { return n.endpo
 func (n *RoomNetwork) ReliablePackets() <-chan endpoint.Datagram {
 	return n.endpoint.ReliablePackets()
 }
-func (n *RoomNetwork) BridgePackets() <-chan endpoint.Datagram { return n.endpoint.BridgePackets() }
 func (n *RoomNetwork) VoicePackets() <-chan endpoint.Datagram  { return n.endpoint.VoicePackets() }
 func (n *RoomNetwork) ScreenPackets() <-chan endpoint.Datagram { return n.endpoint.ScreenPackets() }
 

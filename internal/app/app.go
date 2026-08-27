@@ -354,7 +354,7 @@ func (a *App) publishScreenVideoChunk(room *roomSession, chunk peer.ScreenVideoC
 	a.stateMu.RUnlock()
 	if active && ctx != nil {
 		a.emit(ctx, screenVideoChunkEvent, ScreenVideoChunkEvent{
-			PeerID: chunk.PeerID, SessionID: hex.EncodeToString(chunk.SessionID[:]), Generation: chunk.Generation, StreamID: hex.EncodeToString(chunk.StreamID[:]),
+			PeerID: chunk.PeerID, StreamID: hex.EncodeToString(chunk.StreamID[:]),
 			ChunkID: chunk.ChunkID,
 			Codec:   chunk.Codec, Width: chunk.Width, Height: chunk.Height,
 			DisplayWidth: chunk.DisplayWidth, DisplayHeight: chunk.DisplayHeight,

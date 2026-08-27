@@ -123,8 +123,7 @@ func (i Invite) TrackerHash() [TrackerHashSize]byte {
 
 // RoomDatagramKey returns the room-scoped symmetric key that seals realtime
 // room datagrams. It is a room transport key, not forward-secret group E2EE:
-// every RoomSeed holder can decrypt, while signatures bind packets to a
-// transient PeerID for forwarding and replay checks, not member authorization.
+// every RoomSeed holder can encrypt and decrypt every media stream.
 func (i Invite) RoomDatagramKey() [32]byte {
 	derived := i.derive("bork/room-datagram/v1", 32)
 	var key [32]byte
@@ -140,7 +139,7 @@ func (i Invite) AdmissionKey() [sha256.Size]byte {
 	return key
 }
 
-// RoomTag returns the compact public tag used to route packets and filter discovery results.
+// RoomTag returns the compact public tag used only for discovery and tracker routing.
 func (i Invite) RoomTag() [16]byte {
 	derived := i.derive("bork/room-tag/v1", 16)
 	var tag [16]byte

@@ -29,7 +29,7 @@ func TestScreenMediaDoesNotReuseNonceAcrossAudioAndVideo(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.localScreenState = screenState{
-		generation: 2, active: true, streamID: [16]byte{1},
+		revision: 2, streamID: [16]byte{1},
 		codec: ScreenVideoCodecH264Baseline, width: 640, height: 360,
 	}
 	recorder := &recordingAEAD{AEAD: client.roomDatagramProtector}
@@ -48,11 +48,10 @@ func TestScreenMediaDoesNotReuseNonceAcrossAudioAndVideo(t *testing.T) {
 
 func TestScreenVideoDisplaySizeMatchesCodedFrame(t *testing.T) {
 	state := screenState{
-		generation: 2, active: true, streamID: [16]byte{1},
+		revision: 2, streamID: [16]byte{1},
 		codec: ScreenVideoCodecH264Baseline, width: 640, height: 360,
 	}
 	metadata := screenVideoMetadata{
-		generation: 2, codec: ScreenVideoCodecH264Baseline,
 		displayWidth: 320, displayHeight: 360,
 		timestamp: 1, duration: 10_000, keyFrame: true,
 	}

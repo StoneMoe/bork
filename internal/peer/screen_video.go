@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net/netip"
 	"slices"
 	"time"
 
@@ -22,11 +21,8 @@ const (
 	MaxScreenVideoWidth      = 2560
 	MaxScreenVideoHeight     = 1440
 
-	reliableChannelScreenState         = 4
-	screenStateVersion                 = 1
-	screenStateSize                    = 31
-	screenVideoFragmentVersion         = 1
-	screenVideoFragmentHeaderSize      = 35
+	screenStateSize                    = 21
+	screenVideoFragmentHeaderSize      = 23
 	maxScreenVideoFragmentBytes        = protocol.MaxRoomDatagramPayload - screenVideoFragmentHeaderSize
 	maxScreenVideoFragments            = (MaxScreenVideoChunkBytes + maxScreenVideoFragmentBytes - 1) / maxScreenVideoFragmentBytes
 	maxScreenVideoDurationMicros       = 1_000_000
@@ -39,13 +35,16 @@ const (
 )
 
 type screenState struct {
-	generation uint64
-	active     bool
-	streamID   [16]byte
-	codec      string
-	width      uint16
-	height     uint16
+	// revision is local bookkeeping for reliable full-state replacement. It is
+	// deliberately not encoded; ordered delivery makes StreamID the wire identity.
+	revision uint64
+	streamID [16]byte
+	codec    string
+	width    uint16
+	height   uint16
 }
+
+func (state screenState) active() bool { return state.streamID != ([16]byte{}) }
 
 type screenCommandKind byte
 
@@ -75,12 +74,10 @@ type screenCommandResult struct {
 }
 
 type ScreenVideoChunk struct {
-	PeerID     identity.PeerID
-	SessionID  [16]byte
-	Generation uint64
-	StreamID   [16]byte
-	ChunkID    uint32
-	Codec      string
+	PeerID   identity.PeerID
+	StreamID [16]byte
+	ChunkID  uint32
+	Codec    string
 	// Width and Height are the fixed H.264 coded size. DisplayWidth and
 	// DisplayHeight identify the current content area within that frame.
 	Width         uint16
@@ -94,8 +91,6 @@ type ScreenVideoChunk struct {
 }
 
 type screenVideoMetadata struct {
-	generation    uint64
-	codec         string
 	displayWidth  uint16
 	displayHeight uint16
 	timestamp     uint64
@@ -111,17 +106,12 @@ type decodedScreenVideoFragment struct {
 	bytes     []byte
 }
 
-type retainedScreenVideoFragment struct {
-	bytes  []byte
-	packet []byte
-}
-
 type screenVideoAssembly struct {
 	chunkID       uint32
 	metadata      screenVideoMetadata
 	fragmentCount uint16
 	totalSize     uint32
-	fragments     map[uint16]retainedScreenVideoFragment
+	fragments     map[uint16][]byte
 	videoBytes    int
 	retainedBytes int
 	startedAt     time.Time
@@ -131,14 +121,14 @@ type screenVideoReceiveState struct {
 	newestChunkID    uint32
 	deliveredChunkID uint32
 	assemblies       map[uint32]*screenVideoAssembly
+	forwardPackets   [][]byte
+	forwardDeadline  time.Time
 }
 
 type completedScreenVideoChunk struct {
 	chunkID  uint32
 	metadata screenVideoMetadata
 	bytes    []byte
-	packets  [][]byte
-	deadline time.Time
 }
 
 func encodeScreenState(state screenState) ([]byte, error) {
@@ -146,36 +136,31 @@ func encodeScreenState(state screenState) ([]byte, error) {
 		return nil, err
 	}
 	payload := make([]byte, screenStateSize)
-	payload[0] = screenStateVersion
-	binary.BigEndian.PutUint64(payload[1:9], state.generation)
-	if state.active {
-		payload[9] = 1
-		payload[10], _ = screenVideoCodecCode(state.codec)
-		binary.BigEndian.PutUint16(payload[11:13], state.width)
-		binary.BigEndian.PutUint16(payload[13:15], state.height)
+	if state.active() {
+		payload[0], _ = screenVideoCodecCode(state.codec)
+		binary.BigEndian.PutUint16(payload[1:3], state.width)
+		binary.BigEndian.PutUint16(payload[3:5], state.height)
 	}
-	copy(payload[15:], state.streamID[:])
+	copy(payload[5:], state.streamID[:])
 	return payload, nil
 }
 
 func decodeScreenState(payload []byte) (screenState, error) {
-	if len(payload) != screenStateSize || payload[0] != screenStateVersion || payload[9] > 1 {
+	if len(payload) != screenStateSize {
 		return screenState{}, errors.New("screen state encoding is invalid")
 	}
 	state := screenState{
-		generation: binary.BigEndian.Uint64(payload[1:9]),
-		active:     payload[9] == 1,
-		width:      binary.BigEndian.Uint16(payload[11:13]),
-		height:     binary.BigEndian.Uint16(payload[13:15]),
+		width:  binary.BigEndian.Uint16(payload[1:3]),
+		height: binary.BigEndian.Uint16(payload[3:5]),
 	}
-	copy(state.streamID[:], payload[15:])
-	if state.active {
+	copy(state.streamID[:], payload[5:])
+	if state.active() {
 		var ok bool
-		state.codec, ok = screenVideoCodecName(payload[10])
+		state.codec, ok = screenVideoCodecName(payload[0])
 		if !ok {
 			return screenState{}, errors.New("screen state codec is invalid")
 		}
-	} else if payload[10] != 0 {
+	} else if payload[0] != 0 {
 		return screenState{}, errors.New("inactive screen state codec is not zero")
 	}
 	if err := validateScreenState(state); err != nil {
@@ -185,17 +170,11 @@ func decodeScreenState(payload []byte) (screenState, error) {
 }
 
 func validateScreenState(state screenState) error {
-	if state.generation == 0 {
-		return errors.New("screen state generation is zero")
-	}
-	if !state.active {
+	if !state.active() {
 		if state.streamID != ([16]byte{}) || state.codec != "" || state.width != 0 || state.height != 0 {
 			return errors.New("inactive screen state fields are not zero")
 		}
 		return nil
-	}
-	if state.streamID == ([16]byte{}) {
-		return errors.New("active screen state stream is zero")
 	}
 	return validateScreenVideoConfig(state.codec, int(state.width), int(state.height))
 }
@@ -237,12 +216,6 @@ func validateScreenVideoTiming(timestamp uint64, duration uint32) error {
 }
 
 func validateScreenVideoMetadata(metadata screenVideoMetadata) error {
-	if metadata.generation == 0 {
-		return errors.New("screen video generation is zero")
-	}
-	if _, ok := screenVideoCodecCode(metadata.codec); !ok {
-		return errors.New("screen video codec is not supported")
-	}
 	if err := validateScreenVideoSize(int(metadata.displayWidth), int(metadata.displayHeight)); err != nil {
 		return err
 	}
@@ -267,25 +240,20 @@ func encodeScreenVideoFragments(metadata screenVideoMetadata, data []byte) ([][]
 	if count > maxScreenVideoFragments {
 		return nil, errors.New("screen video chunk needs too many fragments")
 	}
-	codec, _ := screenVideoCodecCode(metadata.codec)
 	fragments := make([][]byte, count)
 	for index := range count {
 		start := index * maxScreenVideoFragmentBytes
 		end := min(start+maxScreenVideoFragmentBytes, len(data))
 		payload := make([]byte, screenVideoFragmentHeaderSize+end-start)
-		payload[0] = screenVideoFragmentVersion
 		if metadata.keyFrame {
-			payload[1] = screenVideoFlagKeyFrame
+			payload[0] = screenVideoFlagKeyFrame
 		}
-		payload[2] = codec
-		binary.BigEndian.PutUint16(payload[3:5], uint16(index))
-		binary.BigEndian.PutUint16(payload[5:7], uint16(count))
-		binary.BigEndian.PutUint64(payload[7:15], metadata.generation)
-		binary.BigEndian.PutUint64(payload[15:23], metadata.timestamp)
-		binary.BigEndian.PutUint32(payload[23:27], metadata.duration)
-		binary.BigEndian.PutUint32(payload[27:31], uint32(len(data)))
-		binary.BigEndian.PutUint16(payload[31:33], metadata.displayWidth)
-		binary.BigEndian.PutUint16(payload[33:35], metadata.displayHeight)
+		binary.BigEndian.PutUint16(payload[1:3], uint16(index))
+		binary.BigEndian.PutUint64(payload[3:11], metadata.timestamp)
+		binary.BigEndian.PutUint32(payload[11:15], metadata.duration)
+		binary.BigEndian.PutUint32(payload[15:19], uint32(len(data)))
+		binary.BigEndian.PutUint16(payload[19:21], metadata.displayWidth)
+		binary.BigEndian.PutUint16(payload[21:23], metadata.displayHeight)
 		copy(payload[screenVideoFragmentHeaderSize:], data[start:end])
 		fragments[index] = payload
 	}
@@ -293,26 +261,19 @@ func encodeScreenVideoFragments(metadata screenVideoMetadata, data []byte) ([][]
 }
 
 func decodeScreenVideoFragment(payload []byte) (decodedScreenVideoFragment, error) {
-	if len(payload) <= screenVideoFragmentHeaderSize || len(payload) > protocol.MaxRoomDatagramPayload || payload[0] != screenVideoFragmentVersion || payload[1]&^screenVideoFlagKeyFrame != 0 {
+	if len(payload) <= screenVideoFragmentHeaderSize || len(payload) > protocol.MaxRoomDatagramPayload || payload[0]&^screenVideoFlagKeyFrame != 0 {
 		return decodedScreenVideoFragment{}, errors.New("screen video fragment encoding is invalid")
-	}
-	codec, ok := screenVideoCodecName(payload[2])
-	if !ok {
-		return decodedScreenVideoFragment{}, errors.New("screen video fragment codec is invalid")
 	}
 	fragment := decodedScreenVideoFragment{
 		metadata: screenVideoMetadata{
-			generation:    binary.BigEndian.Uint64(payload[7:15]),
-			codec:         codec,
-			displayWidth:  binary.BigEndian.Uint16(payload[31:33]),
-			displayHeight: binary.BigEndian.Uint16(payload[33:35]),
-			timestamp:     binary.BigEndian.Uint64(payload[15:23]),
-			duration:      binary.BigEndian.Uint32(payload[23:27]),
-			keyFrame:      payload[1]&screenVideoFlagKeyFrame != 0,
+			displayWidth:  binary.BigEndian.Uint16(payload[19:21]),
+			displayHeight: binary.BigEndian.Uint16(payload[21:23]),
+			timestamp:     binary.BigEndian.Uint64(payload[3:11]),
+			duration:      binary.BigEndian.Uint32(payload[11:15]),
+			keyFrame:      payload[0]&screenVideoFlagKeyFrame != 0,
 		},
-		index:     binary.BigEndian.Uint16(payload[3:5]),
-		count:     binary.BigEndian.Uint16(payload[5:7]),
-		totalSize: binary.BigEndian.Uint32(payload[27:31]),
+		index:     binary.BigEndian.Uint16(payload[1:3]),
+		totalSize: binary.BigEndian.Uint32(payload[15:19]),
 		bytes:     payload[screenVideoFragmentHeaderSize:],
 	}
 	if err := validateScreenVideoMetadata(fragment.metadata); err != nil {
@@ -322,9 +283,10 @@ func decodeScreenVideoFragment(payload []byte) (decodedScreenVideoFragment, erro
 		return decodedScreenVideoFragment{}, errors.New("screen video fragment total size is invalid")
 	}
 	expectedCount := (int(fragment.totalSize) + maxScreenVideoFragmentBytes - 1) / maxScreenVideoFragmentBytes
-	if fragment.count == 0 || int(fragment.count) != expectedCount || int(fragment.count) > maxScreenVideoFragments || fragment.index >= fragment.count {
+	if expectedCount > maxScreenVideoFragments || int(fragment.index) >= expectedCount {
 		return decodedScreenVideoFragment{}, errors.New("screen video fragment count is invalid")
 	}
+	fragment.count = uint16(expectedCount)
 	expectedBytes := maxScreenVideoFragmentBytes
 	if fragment.index == fragment.count-1 {
 		expectedBytes = int(fragment.totalSize) - int(fragment.index)*maxScreenVideoFragmentBytes
@@ -336,8 +298,7 @@ func decodeScreenVideoFragment(payload []byte) (decodedScreenVideoFragment, erro
 }
 
 func screenVideoMetadataMatchesState(metadata screenVideoMetadata, state screenState) bool {
-	return state.active && metadata.generation == state.generation && metadata.codec == state.codec &&
-		metadata.displayWidth <= state.width && metadata.displayHeight <= state.height
+	return state.active() && metadata.displayWidth <= state.width && metadata.displayHeight <= state.height
 }
 
 func (c *Client) ScreenVideoChunks() <-chan ScreenVideoChunk { return c.screenVideoChunks }
@@ -431,23 +392,20 @@ func (c *Client) handleScreenCommand(command screenCommand) {
 }
 
 func (c *Client) startScreenShare(codec string, width, height uint16) error {
-	if c.localScreenState.active {
+	if c.localScreenState.active() {
 		return errors.New("screen sharing is already active")
 	}
 	return c.activateScreenShare(codec, width, height)
 }
 
 func (c *Client) replaceScreenShare(codec string, width, height uint16) error {
-	if !c.localScreenState.active {
+	if !c.localScreenState.active() {
 		return errors.New("screen sharing is not active")
 	}
 	return c.activateScreenShare(codec, width, height)
 }
 
 func (c *Client) activateScreenShare(codec string, width, height uint16) error {
-	if c.localScreenState.generation == math.MaxUint64 {
-		return errors.New("screen state generation is exhausted")
-	}
 	if err := validateScreenVideoConfig(codec, int(width), int(height)); err != nil {
 		return err
 	}
@@ -458,12 +416,11 @@ func (c *Client) activateScreenShare(codec string, width, height uint16) error {
 		}
 	}
 	c.localScreenState = screenState{
-		generation: c.localScreenState.generation + 1,
-		active:     true,
-		streamID:   streamID,
-		codec:      codec,
-		width:      width,
-		height:     height,
+		revision: c.localScreenState.revision + 1,
+		streamID: streamID,
+		codec:    codec,
+		width:    width,
+		height:   height,
 	}
 	c.screenPacketSequence = 0
 	c.screenVideoChunkID = 0
@@ -473,13 +430,10 @@ func (c *Client) activateScreenShare(codec string, width, height uint16) error {
 }
 
 func (c *Client) stopScreenShare() error {
-	if !c.localScreenState.active {
+	if !c.localScreenState.active() {
 		return errors.New("screen sharing is not active")
 	}
-	if c.localScreenState.generation == math.MaxUint64 {
-		return errors.New("screen state generation is exhausted")
-	}
-	c.localScreenState = screenState{generation: c.localScreenState.generation + 1}
+	c.localScreenState = screenState{revision: c.localScreenState.revision + 1}
 	c.screenPacketSequence = 0
 	c.screenVideoChunkID = 0
 	c.queueScreenStates()
@@ -494,37 +448,35 @@ func (c *Client) queueScreenStates() {
 	}
 	for _, peer := range c.remotePeers {
 		activeSession := peer.activeSession
-		if activeSession == nil || !activeSession.authenticated || activeSession.reliable == nil || activeSession.screenStateSentGeneration == c.localScreenState.generation {
+		if activeSession == nil || !activeSession.authenticated || activeSession.reliable == nil || activeSession.screenStateSentRevision == c.localScreenState.revision {
 			continue
 		}
-		if activeSession.reliable.queue(reliableChannelScreenState, false, payload) != nil {
+		if activeSession.reliable.queue(reliableChannelScreenState, payload) != nil {
 			continue
 		}
-		activeSession.screenStateSentGeneration = c.localScreenState.generation
+		activeSession.screenStateSentRevision = c.localScreenState.revision
 	}
 }
 
-func (c *Client) screenStateReady(activeSession *PeeringSession) bool {
-	return activeSession != nil && activeSession.authenticated && activeSession.reliable != nil && activeSession.screenStateSentGeneration == c.localScreenState.generation && !activeSession.reliable.pendingChannel(reliableChannelScreenState)
+func (c *Client) screenStateReady(activeSession *Session) bool {
+	return activeSession != nil && activeSession.authenticated && activeSession.reliable != nil && activeSession.screenStateSentRevision == c.localScreenState.revision && !activeSession.reliable.pendingChannel(reliableChannelScreenState)
 }
 
 func (c *Client) handleScreenState(sender *RemotePeer, payload []byte) {
 	state, err := decodeScreenState(payload)
-	if err != nil || sender == nil || sender.activeSession == nil || state.generation <= sender.activeSession.remoteScreenState.generation {
+	if err != nil || sender == nil || state == sender.screenState {
 		return
 	}
-	sender.activeSession.remoteScreenState = state
+	sender.screenState = state
 	c.removeScreenVideoAssembliesForSender(sender.peerID)
 	c.publishStateChange()
 }
 
 func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFrame bool, displayWidth, displayHeight uint16, data []byte) (bool, error) {
-	if !c.localScreenState.active {
+	if !c.localScreenState.active() {
 		return false, errors.New("screen sharing is not active")
 	}
 	metadata := screenVideoMetadata{
-		generation:    c.localScreenState.generation,
-		codec:         c.localScreenState.codec,
 		displayWidth:  displayWidth,
 		displayHeight: displayHeight,
 		timestamp:     timestamp,
@@ -547,10 +499,9 @@ func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFram
 	for _, fragment := range fragments {
 		c.screenPacketSequence++
 		header := protocol.RoomDatagramHeader{
-			Class: protocol.TrafficScreenVideo, SenderID: c.localIdentity.PeerID,
-			StreamID: c.localScreenState.streamID, PacketSequence: c.screenPacketSequence,
+			Type: protocol.PacketScreenVideo, StreamID: c.localScreenState.streamID, PacketSequence: c.screenPacketSequence,
 		}
-		packet, marshalErr := protocol.MarshalRoomDatagram(c.roomTag, header, c.screenVideoChunkID, fragment, c.roomDatagramProtector, c.localIdentity)
+		packet, marshalErr := protocol.MarshalRoomDatagram(header, c.screenVideoChunkID, fragment, c.roomDatagramProtector)
 		if marshalErr != nil {
 			return false, marshalErr
 		}
@@ -561,11 +512,11 @@ func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFram
 	if len(ready) == 0 {
 		return true, nil
 	}
-	return c.sendRealtimePacketsToPeers(protocol.TrafficScreenVideo, packets, ready, now.Add(screenVideoChunkTTL), 0), nil
+	return c.sendRealtimePacketsToPeers(packets, ready, now.Add(screenVideoChunkTTL), 0), nil
 }
 
 func (c *Client) sendScreenAudioFrame(timestamp uint32, rawOpus []byte) error {
-	if !c.localScreenState.active {
+	if !c.localScreenState.active() {
 		return errors.New("screen sharing is not active")
 	}
 	c.queueScreenStates()
@@ -574,10 +525,9 @@ func (c *Client) sendScreenAudioFrame(timestamp uint32, rawOpus []byte) error {
 	}
 	c.screenPacketSequence++
 	header := protocol.RoomDatagramHeader{
-		Class: protocol.TrafficScreenAudio, SenderID: c.localIdentity.PeerID,
-		StreamID: c.localScreenState.streamID, PacketSequence: c.screenPacketSequence,
+		Type: protocol.PacketScreenAudio, StreamID: c.localScreenState.streamID, PacketSequence: c.screenPacketSequence,
 	}
-	packet, err := protocol.MarshalRoomDatagram(c.roomTag, header, timestamp, rawOpus, c.roomDatagramProtector, c.localIdentity)
+	packet, err := protocol.MarshalRoomDatagram(header, timestamp, rawOpus, c.roomDatagramProtector)
 	if err != nil {
 		return err
 	}
@@ -586,7 +536,7 @@ func (c *Client) sendScreenAudioFrame(timestamp uint32, rawOpus []byte) error {
 	if len(ready) == 0 {
 		return nil
 	}
-	c.sendRealtimePacketsToPeers(protocol.TrafficScreenAudio, [][]byte{packet}, ready, now.Add(screenAudioSendBudget), 0)
+	c.sendRealtimePacketsToPeers([][]byte{packet}, ready, now.Add(screenAudioSendBudget), 0)
 	return nil
 }
 
@@ -611,12 +561,8 @@ func (c *Client) screenMediaDestinations(now time.Time) []identity.PeerID {
 	return ready
 }
 
-func (c *Client) acceptScreenVideoFragment(key roomDatagramStreamKey, chunkID uint32, fragment decodedScreenVideoFragment, packet []byte, now time.Time) *completedScreenVideoChunk {
-	state := c.screenVideoReceivers[key]
-	if state == nil {
-		state = &screenVideoReceiveState{assemblies: make(map[uint32]*screenVideoAssembly)}
-		c.screenVideoReceivers[key] = state
-	}
+func (c *Client) acceptScreenVideoFragment(key roomDatagramStreamKey, chunkID uint32, fragment decodedScreenVideoFragment, now time.Time) *completedScreenVideoChunk {
+	state := c.screenVideoReceiveState(key)
 	if chunkID <= state.deliveredChunkID || (chunkID < state.newestChunkID && state.newestChunkID-chunkID > 1) {
 		return nil
 	}
@@ -632,7 +578,7 @@ func (c *Client) acceptScreenVideoFragment(key roomDatagramStreamKey, chunkID ui
 	if assembly == nil {
 		assembly = &screenVideoAssembly{
 			chunkID: chunkID, metadata: fragment.metadata, fragmentCount: fragment.count, totalSize: fragment.totalSize,
-			fragments: make(map[uint16]retainedScreenVideoFragment), startedAt: now,
+			fragments: make(map[uint16][]byte), startedAt: now,
 		}
 		state.assemblies[chunkID] = assembly
 	}
@@ -651,15 +597,13 @@ func (c *Client) acceptScreenVideoFragment(key roomDatagramStreamKey, chunkID ui
 		c.removeScreenVideoChunkAssembly(key, chunkID)
 		return nil
 	}
-	cost := len(fragment.bytes) + len(packet)
+	cost := len(fragment.bytes)
 	if !c.makeScreenVideoRetentionRoom(assembly, cost) || state.assemblies[chunkID] != assembly {
 		return nil
 	}
-	retained := retainedScreenVideoFragment{
-		bytes: append([]byte(nil), fragment.bytes...), packet: append([]byte(nil), packet...),
-	}
+	retained := append([]byte(nil), fragment.bytes...)
 	assembly.fragments[fragment.index] = retained
-	assembly.videoBytes += len(retained.bytes)
+	assembly.videoBytes += len(retained)
 	assembly.retainedBytes += cost
 	c.screenVideoRetainedBytes += cost
 	if len(assembly.fragments) != int(assembly.fragmentCount) {
@@ -670,13 +614,10 @@ func (c *Client) acceptScreenVideoFragment(key roomDatagramStreamKey, chunkID ui
 		chunkID:  assembly.chunkID,
 		metadata: assembly.metadata,
 		bytes:    make([]byte, 0, assembly.videoBytes),
-		packets:  make([][]byte, assembly.fragmentCount),
-		deadline: assembly.startedAt.Add(screenVideoChunkTTL),
 	}
 	for index := range assembly.fragmentCount {
 		part := assembly.fragments[index]
-		completed.bytes = append(completed.bytes, part.bytes...)
-		completed.packets[index] = part.packet
+		completed.bytes = append(completed.bytes, part...)
 	}
 	state.deliveredChunkID = chunkID
 	for retainedID := range state.assemblies {
@@ -688,6 +629,53 @@ func (c *Client) acceptScreenVideoFragment(key roomDatagramStreamKey, chunkID ui
 		return nil
 	}
 	return completed
+}
+
+func (c *Client) screenVideoReceiveState(key roomDatagramStreamKey) *screenVideoReceiveState {
+	state := c.screenVideoReceivers[key]
+	if state == nil {
+		state = &screenVideoReceiveState{assemblies: make(map[uint32]*screenVideoAssembly)}
+		c.screenVideoReceivers[key] = state
+	}
+	return state
+}
+
+// queueScreenVideoForward keeps forwarding independent from local preview
+// reassembly. A small cap avoids turning each fragment into its own endpoint
+// batch while the receive loop drains a burst.
+func (c *Client) queueScreenVideoForward(key roomDatagramStreamKey, packet []byte, deadline time.Time) {
+	state := c.screenVideoReceiveState(key)
+	if len(state.forwardPackets) == 0 {
+		state.forwardDeadline = deadline
+	}
+	state.forwardPackets = append(state.forwardPackets, packet)
+}
+
+func (c *Client) flushScreenVideoForwards() {
+	for key := range c.screenVideoReceivers {
+		c.flushScreenVideoForward(key)
+	}
+}
+
+func (c *Client) flushScreenVideoForward(key roomDatagramStreamKey) {
+	state := c.screenVideoReceivers[key]
+	if state == nil || len(state.forwardPackets) == 0 {
+		return
+	}
+	packets := state.forwardPackets
+	deadline := state.forwardDeadline
+	state.forwardPackets = nil
+	state.forwardDeadline = time.Time{}
+
+	sender := c.remotePeers[key.sender]
+	if c.roomNetwork == nil || sender == nil || sender.activeSession == nil || !sender.activeSession.authenticated || !sender.activeSession.path.IsDirect() {
+		return
+	}
+	listeners := sender.activeSession.inboundFanout
+	if listeners == nil {
+		return
+	}
+	c.sendRealtimePacketsToPeers(packets, listeners, deadline, 0)
 }
 
 func (c *Client) makeScreenVideoRetentionRoom(current *screenVideoAssembly, cost int) bool {
@@ -754,21 +742,6 @@ func (c *Client) expireScreenVideoChunks(now time.Time) {
 			}
 		}
 	}
-}
-
-func (c *Client) forwardScreenVideoChunk(senderID identity.PeerID, source netip.AddrPort, packets [][]byte, deadline time.Time) {
-	if c.roomNetwork == nil {
-		return
-	}
-	sender := c.remotePeers[senderID]
-	if sender == nil || sender.activeSession == nil || !sender.activeSession.authenticated || !sender.activeSession.path.IsDirect() || sender.activeSession.path.Address() != source {
-		return
-	}
-	assignment := sender.activeSession.inboundFanout
-	if assignment.generation == 0 {
-		return
-	}
-	c.sendRealtimePacketsToPeers(protocol.TrafficScreenVideo, packets, assignment.listeners, deadline, 0)
 }
 
 func (c *Client) deliverScreenVideoChunk(chunk ScreenVideoChunk) {

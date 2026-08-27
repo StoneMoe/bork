@@ -30,7 +30,7 @@ func (c *Client) recordTopologyClaims(sender identity.PeerID, entries []topology
 		if c.rememberTopologyPeer(peerID, now) == nil {
 			continue
 		}
-		if peerID != sender && peerID != c.localIdentity.PeerID {
+		if peerID != sender && peerID != c.localPeerID {
 			claims[peerID] = now.Add(topologyClaimTTL)
 		}
 	}
@@ -55,7 +55,7 @@ func (c *Client) recordTopologyClaims(sender identity.PeerID, entries []topology
 }
 
 func (c *Client) bridgePathTo(targetID identity.PeerID, now time.Time) (Path, bool) {
-	if targetID.IsZero() || targetID == c.localIdentity.PeerID {
+	if targetID.IsZero() || targetID == c.localPeerID {
 		return Path{}, false
 	}
 	if target := c.remotePeers[targetID]; target != nil && target.activeSession != nil && target.activeSession.authenticated && target.activeSession.path.IsDirect() {
@@ -109,16 +109,16 @@ func (c *Client) probeBridgePaths(now time.Time) {
 			c.sendHelloProbeOnPath(path)
 			continue
 		}
-		peerSess := remote.pendingSession
-		if peerSess == nil {
-			peerSess = remote.activeSession
+		session := remote.pendingSession
+		if session == nil {
+			session = remote.activeSession
 		}
-		if peerSess == nil {
+		if session == nil {
 			c.sendHelloProbeOnPath(path)
 			continue
 		}
-		c.rememberCandidatePath(peerSess, path, now)
-		c.sendSessionHelloOnPath(peerSess, path)
+		c.rememberCandidatePath(session, path, now)
+		c.sendSessionHelloOnPath(session, path)
 	}
 }
 
@@ -161,7 +161,7 @@ func (c *Client) writeControlOnPath(ctx context.Context, path Path, inner []byte
 }
 
 func (c *Client) bridgePacket(path Path, inner []byte, lowPriority bool) ([]byte, netip.AddrPort, error) {
-	origin := c.localIdentity.PeerID
+	origin := c.localPeerID
 	if origin.IsZero() || path.Target().IsZero() || path.Target() == origin || path.Intermediary() == origin {
 		return nil, netip.AddrPort{}, errors.New("bridge path endpoints are invalid")
 	}
@@ -174,7 +174,7 @@ func (c *Client) bridgePacket(path Path, inner []byte, lowPriority bool) ([]byte
 	if err != nil {
 		return nil, netip.AddrPort{}, err
 	}
-	packet, err := protocol.MarshalBridge(c.roomTag, adjacent.sessionID, sequence, origin, path.Target(), lowPriority, inner, adjacent.ciphers.ControlSend)
+	packet, err := protocol.MarshalBridge(adjacent.id(), sequence, path.Target(), lowPriority, inner, adjacent.ciphers.Send)
 	if err != nil {
 		return nil, netip.AddrPort{}, err
 	}
@@ -187,14 +187,14 @@ func (c *Client) handleBridgePacket(packet endpoint.Datagram) {
 		return
 	}
 	header, err := protocol.ParseSessionHeader(packet.Data)
-	if err != nil || header.RoomTag != c.roomTag || header.Type != protocol.PacketBridge {
+	if err != nil || (header.Type != protocol.PacketBridge && header.Type != protocol.PacketBridgeLowPriority) {
 		return
 	}
 	previous, adjacent, isPendingSession := c.sessionForHeader(header, outerPath)
 	if adjacent == nil || isPendingSession || !adjacent.authenticated || !adjacent.path.IsDirect() || !adjacent.acceptsDataPath(outerPath) || !adjacent.packetFlow.mayReceive(header.PacketSequence) {
 		return
 	}
-	decoded, err := protocol.ParseBridge(packet.Data, c.roomTag, adjacent.sessionID, adjacent.ciphers.ControlRecv)
+	decoded, err := protocol.ParseBridge(packet.Data, adjacent.id(), adjacent.ciphers.Receive)
 	if err != nil || !adjacent.packetFlow.commitReceived(header.PacketSequence) {
 		return
 	}
@@ -202,32 +202,30 @@ func (c *Client) handleBridgePacket(packet endpoint.Datagram) {
 	adjacent.lastAuthenticatedPacketAt = now
 	c.rememberAuthenticatedPath(outerPath, now)
 
-	localID := c.localIdentity.PeerID
+	localID := c.localPeerID
 	previousID := previous.peerID
 	if decoded.Target == localID {
-		path, pathErr := NewBridgePath(packet.From, previousID, decoded.Origin)
-		if pathErr == nil {
-			c.handleBridgedInner(decoded.Inner, path, decoded.Origin)
-		}
+		c.handleBridgedInner(decoded.Inner, packet.From, previousID)
 		return
 	}
-	if decoded.Origin != previousID {
+	if decoded.Target == previousID {
 		return
 	}
 	c.forwardBridgePacket(decoded)
 }
 
-func (c *Client) handleBridgedInner(inner []byte, path Path, origin identity.PeerID) {
-	packetType, roomTag, err := protocol.ParsePrefix(inner)
-	if err != nil || roomTag != c.roomTag {
+func (c *Client) handleBridgedInner(inner []byte, nextHop netip.AddrPort, intermediary identity.PeerID) {
+	packetType, origin, ok := c.bridgedInnerOrigin(inner)
+	if !ok || origin == c.localPeerID || origin == intermediary {
+		return
+	}
+	path, err := NewBridgePath(nextHop, intermediary, origin)
+	if err != nil {
 		return
 	}
 	switch packetType {
-	case protocol.PacketHello:
-		hello, err := protocol.ParseHello(inner, c.roomTag, c.admissionKey)
-		if err == nil && hello.PeerID == origin {
-			c.handleHelloOnPath(inner, path)
-		}
+	case protocol.PacketHelloProbe, protocol.PacketSessionHello:
+		c.handleHelloOnPath(inner, path)
 	case protocol.PacketPing, protocol.PacketPong:
 		c.handleSessionPacketOnPath(inner, path)
 	case protocol.PacketReliable:
@@ -235,6 +233,48 @@ func (c *Client) handleBridgedInner(inner []byte, path Path, origin identity.Pee
 	case protocol.PacketLeave:
 		c.handleLeavePacketOnPath(inner, path)
 	}
+}
+
+// The final bridge target derives the source from the authenticated inner
+// packet. This keeps one source identity instead of repeating it in the bridge
+// envelope.
+func (c *Client) bridgedInnerOrigin(inner []byte) (protocol.PacketType, identity.PeerID, bool) {
+	packetType, err := protocol.ParsePrefix(inner)
+	if err != nil {
+		return 0, identity.PeerID{}, false
+	}
+	switch packetType {
+	case protocol.PacketHelloProbe:
+		peerID, parseErr := protocol.ParseHelloProbe(inner, c.admissionKey)
+		return packetType, peerID, parseErr == nil
+	case protocol.PacketSessionHello:
+		hello, parseErr := protocol.ParseSessionHello(inner, c.admissionKey)
+		return packetType, hello.PeerID, parseErr == nil
+	case protocol.PacketPing, protocol.PacketPong, protocol.PacketReliable, protocol.PacketLeave:
+		header, parseErr := protocol.ParseSessionHeader(inner)
+		if parseErr != nil {
+			return 0, identity.PeerID{}, false
+		}
+		peer := c.remotePeerForSessionID(header.SessionID)
+		if peer == nil {
+			return 0, identity.PeerID{}, false
+		}
+		return packetType, peer.peerID, true
+	default:
+		return 0, identity.PeerID{}, false
+	}
+}
+
+func (c *Client) remotePeerForSessionID(sessionID [16]byte) *RemotePeer {
+	for _, peer := range c.remotePeers {
+		if session := peer.activeSession; session != nil && session.sessionReady() && session.id() == sessionID {
+			return peer
+		}
+		if session := peer.pendingSession; session != nil && session.sessionReady() && session.id() == sessionID {
+			return peer
+		}
+	}
+	return nil
 }
 
 func (c *Client) forwardBridgePacket(decoded protocol.BridgePacket) {
@@ -247,7 +287,7 @@ func (c *Client) forwardBridgePacket(decoded protocol.BridgePacket) {
 	if err != nil {
 		return
 	}
-	packet, err := protocol.MarshalBridge(c.roomTag, adjacent.sessionID, sequence, decoded.Origin, decoded.Target, decoded.LowPriority, decoded.Inner, adjacent.ciphers.ControlSend)
+	packet, err := protocol.MarshalBridge(adjacent.id(), sequence, decoded.Target, decoded.LowPriority, decoded.Inner, adjacent.ciphers.Send)
 	if err == nil {
 		if decoded.LowPriority {
 			_ = c.roomNetwork.EnqueueLowPriority(packet, adjacent.path.Address())
@@ -299,7 +339,7 @@ func (c *Client) expireTopology(now time.Time) {
 }
 
 func (c *Client) rememberTopologyPeer(peerID identity.PeerID, now time.Time) *topologyPeer {
-	if peerID.IsZero() || peerID == c.localIdentity.PeerID {
+	if peerID.IsZero() || peerID == c.localPeerID {
 		return nil
 	}
 	if peer, exists := c.topology[peerID]; exists {

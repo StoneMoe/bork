@@ -33,17 +33,17 @@ func TestNewClientUsesEphemeralRoomPeerID(t *testing.T) {
 func TestExpireRemotePeersDropsStaleSessionRecord(t *testing.T) {
 	now := time.Now()
 	stale := now.Add(-remotePeerTimeout - time.Second)
-	freshPending := &PeeringSession{lastAuthenticatedPacketAt: now}
+	freshPending := &Session{lastAuthenticatedPacketAt: now}
 	goneID := identity.PeerID{1}
 	pendingID := identity.PeerID{2}
 	client := &Client{remotePeers: map[identity.PeerID]*RemotePeer{
 		goneID: {
 			peerID:        goneID,
-			activeSession: &PeeringSession{everAuthenticated: true, lastAuthenticatedPacketAt: stale},
+			activeSession: &Session{everAuthenticated: true, lastAuthenticatedPacketAt: stale},
 		},
 		pendingID: {
 			peerID:         pendingID,
-			activeSession:  &PeeringSession{everAuthenticated: true, lastAuthenticatedPacketAt: stale},
+			activeSession:  &Session{everAuthenticated: true, lastAuthenticatedPacketAt: stale},
 			pendingSession: freshPending,
 		},
 	}, stateChanges: make(chan struct{}, 1)}
@@ -65,7 +65,7 @@ func TestExpireRemotePeersDropsStaleSessionRecord(t *testing.T) {
 }
 
 func TestExpireRemotePeersKeepsVisiblePeerWhileReconnecting(t *testing.T) {
-	session := &PeeringSession{
+	session := &Session{
 		authenticated:             true,
 		everAuthenticated:         true,
 		lastAuthenticatedPacketAt: time.Now().Add(-pathFailoverTimeout - time.Second),

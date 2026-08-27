@@ -21,15 +21,12 @@ import (
 )
 
 const (
-	reliableChannelFileControl = 5
-	reliableChannelFileData    = 6
-	fileProtocolVersion        = 1
-	fileChunkSize              = 32 << 10
-	MaxFileTransferBytes       = 1 << 30
-	maxFileTransferRecords     = 32
-	fileOfferTimeout           = 10 * time.Minute
-	fileTransferTimeout        = 2 * time.Minute
-	maxFileNameBytes           = 255
+	fileChunkSize          = 32 << 10
+	MaxFileTransferBytes   = 1 << 30
+	maxFileTransferRecords = 32
+	fileOfferTimeout       = 10 * time.Minute
+	fileTransferTimeout    = 2 * time.Minute
+	maxFileNameBytes       = 255
 )
 
 const (
@@ -193,7 +190,7 @@ func (c *Client) startFileOffer(peerID identity.PeerID, path string) (string, er
 	}
 	now := time.Now()
 	workContext, cancelWork := context.WithCancel(c.fileContext)
-	transfer := &fileTransfer{id: id, peerID: peerID, sessionID: peer.activeSession.sessionID, direction: "outgoing", path: path, name: filepath.Base(path), status: "preparing", updatedAt: now, working: true, workContext: workContext, cancelWork: cancelWork}
+	transfer := &fileTransfer{id: id, peerID: peerID, sessionID: peer.activeSession.id(), direction: "outgoing", path: path, name: filepath.Base(path), status: "preparing", updatedAt: now, working: true, workContext: workContext, cancelWork: cancelWork}
 	c.fileTransfers[id] = transfer
 	c.startFileWork(fileWorkResult{kind: fileWorkOffer, transferID: hex.EncodeToString(id[:])}, func(result *fileWorkResult) {
 		file, err := os.Open(path)
@@ -256,7 +253,7 @@ func (c *Client) rejectFile(encodedID string) error {
 	if transfer == nil || transfer.direction != "incoming" || transfer.status != "offered" {
 		return errors.New("file offer is not pending")
 	}
-	c.queueFileControl(transfer, fileControlReject, 0)
+	c.queueFileControl(transfer, fileControlReject)
 	c.finishFileTransfer(transfer, "rejected", "")
 	return nil
 }
@@ -267,7 +264,7 @@ func (c *Client) cancelFile(encodedID string, notify bool, reason string) error 
 		return errors.New("file transfer is not active")
 	}
 	if notify {
-		c.queueFileControl(transfer, fileControlCancel, 0)
+		c.queueFileControl(transfer, fileControlCancel)
 	}
 	c.finishFileTransfer(transfer, "canceled", reason)
 	return nil
@@ -298,7 +295,7 @@ func (c *Client) handleFileWorkResult(result fileWorkResult) {
 	}
 	transfer.working = false
 	if result.err != nil {
-		c.queueFileControl(transfer, fileControlCancel, 0)
+		c.queueFileControl(transfer, fileControlCancel)
 		c.finishFileTransfer(transfer, "failed", result.err.Error())
 		return
 	}
@@ -310,7 +307,7 @@ func (c *Client) handleFileWorkResult(result fileWorkResult) {
 		}
 		transfer.size, transfer.digest, transfer.status, transfer.updatedAt = result.size, result.digest, "offered", time.Now()
 		payload, err := encodeFileOffer(transfer)
-		if err != nil || c.queueFilePayload(transfer, reliableChannelFileControl, true, payload) != nil {
+		if err != nil || c.queueFilePayload(transfer, reliableChannelFileControl, payload) != nil {
 			c.finishFileTransfer(transfer, "failed", "could not queue file offer")
 			return
 		}
@@ -320,11 +317,11 @@ func (c *Client) handleFileWorkResult(result fileWorkResult) {
 			return
 		}
 		transfer.file, transfer.hasher, transfer.status, transfer.updatedAt = result.file, sha256.New(), "transferring", time.Now()
-		if err := c.queueFileControl(transfer, fileControlAccept, 0); err != nil {
+		if err := c.queueFileControl(transfer, fileControlAccept); err != nil {
 			c.finishFileTransfer(transfer, "failed", err.Error())
 		} else if transfer.size == 0 {
 			if transfer.digest != sha256.Sum256(nil) {
-				c.queueFileControl(transfer, fileControlCancel, 0)
+				c.queueFileControl(transfer, fileControlCancel)
 				c.finishFileTransfer(transfer, "failed", "SHA-256 mismatch")
 				break
 			}
@@ -342,8 +339,8 @@ func (c *Client) handleFileWorkResult(result fileWorkResult) {
 		if transfer.status != "transferring" {
 			return
 		}
-		payload := encodeFileData(transfer.id, transfer.transferred, result.data)
-		if err := c.queueFilePayload(transfer, reliableChannelFileData, false, payload); err != nil {
+		payload := encodeFileData(transfer.id, result.data)
+		if err := c.queueFilePayload(transfer, reliableChannelFileData, payload); err != nil {
 			c.finishFileTransfer(transfer, "failed", err.Error())
 			return
 		}
@@ -357,7 +354,7 @@ func (c *Client) handleFileWorkResult(result fileWorkResult) {
 		transfer.updatedAt = time.Now()
 		if transfer.transferred == transfer.size {
 			if got := transfer.hasher.Sum(nil); !strings.EqualFold(hex.EncodeToString(got), hex.EncodeToString(transfer.digest[:])) {
-				c.queueFileControl(transfer, fileControlCancel, 0)
+				c.queueFileControl(transfer, fileControlCancel)
 				c.finishFileTransfer(transfer, "failed", "SHA-256 mismatch")
 				return
 			}
@@ -372,7 +369,7 @@ func (c *Client) handleFileWorkResult(result fileWorkResult) {
 			})
 			return
 		}
-		if err := c.queueFileControl(transfer, fileControlDataAck, transfer.transferred); err != nil {
+		if err := c.queueFileControl(transfer, fileControlDataAck); err != nil {
 			c.finishFileTransfer(transfer, "failed", err.Error())
 		}
 	case fileWorkFinish:
@@ -380,7 +377,7 @@ func (c *Client) handleFileWorkResult(result fileWorkResult) {
 		if transfer.status != "transferring" {
 			return
 		}
-		if err := c.queueFileControl(transfer, fileControlDataAck, transfer.transferred); err != nil {
+		if err := c.queueFileControl(transfer, fileControlDataAck); err != nil {
 			c.finishFileTransfer(transfer, "failed", err.Error())
 			return
 		}
@@ -394,7 +391,7 @@ func (c *Client) handleFileMessage(sender *RemotePeer, message deliveredReliable
 		return
 	}
 	if message.channel == reliableChannelFileControl {
-		kind, id, value, offer, err := decodeFileControl(message.payload)
+		kind, id, offer, err := decodeFileControl(message.payload)
 		if err != nil {
 			return
 		}
@@ -403,7 +400,7 @@ func (c *Client) handleFileMessage(sender *RemotePeer, message deliveredReliable
 			return
 		}
 		transfer := c.fileTransfers[id]
-		if transfer == nil || transfer.peerID != sender.peerID || transfer.sessionID != sender.activeSession.sessionID || fileTerminal(transfer.status) {
+		if transfer == nil || transfer.peerID != sender.peerID || transfer.sessionID != sender.activeSession.id() || fileTerminal(transfer.status) {
 			return
 		}
 		switch kind {
@@ -422,10 +419,12 @@ func (c *Client) handleFileMessage(sender *RemotePeer, message deliveredReliable
 		case fileControlCancel:
 			c.finishFileTransfer(transfer, "canceled", "canceled by peer")
 		case fileControlDataAck:
-			if transfer.direction == "outgoing" && transfer.status == "waiting" && value >= transfer.transferred && value <= transfer.size && value-transfer.transferred <= fileChunkSize && (value > transfer.transferred || transfer.size == 0) {
+			if transfer.direction == "outgoing" && transfer.status == "waiting" {
 				sender.activeSession.reliable.discardOutboundChannel(reliableChannelFileData)
-				transfer.transferred, transfer.updatedAt = value, time.Now()
-				if value == transfer.size {
+				advance := min(uint64(fileChunkSize), transfer.size-transfer.transferred)
+				transfer.transferred += advance
+				transfer.updatedAt = time.Now()
+				if transfer.transferred == transfer.size {
 					c.finishFileTransfer(transfer, "completed", "")
 				} else {
 					transfer.status = "transferring"
@@ -439,11 +438,16 @@ func (c *Client) handleFileMessage(sender *RemotePeer, message deliveredReliable
 	if message.channel != reliableChannelFileData {
 		return
 	}
-	id, offset, data, err := decodeFileData(message.payload)
+	id, data, err := decodeFileData(message.payload)
 	transfer := c.fileTransfers[id]
-	if err != nil || transfer == nil || transfer.direction != "incoming" || transfer.status != "transferring" || transfer.working || transfer.peerID != sender.peerID || transfer.sessionID != sender.activeSession.sessionID || offset != transfer.transferred || uint64(len(data)) > transfer.size-transfer.transferred {
+	if err != nil || transfer == nil || transfer.direction != "incoming" || transfer.status != "transferring" || transfer.working || transfer.peerID != sender.peerID || transfer.sessionID != sender.activeSession.id() {
 		return
 	}
+	expectedSize := min(uint64(fileChunkSize), transfer.size-transfer.transferred)
+	if uint64(len(data)) != expectedSize {
+		return
+	}
+	offset := transfer.transferred
 	transfer.working = true
 	copyData := append([]byte(nil), data...)
 	file := transfer.file
@@ -463,7 +467,7 @@ func (c *Client) receiveFileOffer(sender *RemotePeer, id [16]byte, offer decoded
 		return
 	}
 	workContext, cancelWork := context.WithCancel(c.fileContext)
-	transfer := &fileTransfer{id: id, peerID: sender.peerID, sessionID: sender.activeSession.sessionID, direction: "incoming", name: offer.name, status: "offered", size: offer.size, digest: offer.digest, updatedAt: time.Now(), workContext: workContext, cancelWork: cancelWork}
+	transfer := &fileTransfer{id: id, peerID: sender.peerID, sessionID: sender.activeSession.id(), direction: "incoming", name: offer.name, status: "offered", size: offer.size, digest: offer.digest, updatedAt: time.Now(), workContext: workContext, cancelWork: cancelWork}
 	c.fileTransfers[id] = transfer
 	c.pruneFileTransfers()
 	c.publishStateChange()
@@ -490,97 +494,78 @@ func (c *Client) readNextFileChunk(transfer *fileTransfer) {
 	})
 }
 
-func (c *Client) queueFileControl(transfer *fileTransfer, kind byte, value uint64) error {
-	payload := make([]byte, 18)
-	payload[0], payload[1] = fileProtocolVersion, kind
-	copy(payload[2:18], transfer.id[:])
-	if kind == fileControlDataAck {
-		payload = append(payload, make([]byte, 8)...)
-		binary.BigEndian.PutUint64(payload[18:], value)
-	}
-	return c.queueFilePayload(transfer, reliableChannelFileControl, true, payload)
+func (c *Client) queueFileControl(transfer *fileTransfer, kind byte) error {
+	payload := make([]byte, 17)
+	payload[0] = kind
+	copy(payload[1:17], transfer.id[:])
+	return c.queueFilePayload(transfer, reliableChannelFileControl, payload)
 }
 
-func (c *Client) queueFilePayload(transfer *fileTransfer, channel uint16, ordered bool, payload []byte) error {
+func (c *Client) queueFilePayload(transfer *fileTransfer, channel uint16, payload []byte) error {
 	peer := c.remotePeers[transfer.peerID]
-	if peer == nil || peer.activeSession == nil || !peer.activeSession.authenticated || peer.activeSession.sessionID != transfer.sessionID {
+	if peer == nil || peer.activeSession == nil || !peer.activeSession.authenticated || peer.activeSession.id() != transfer.sessionID {
 		return errors.New("file transfer session is unavailable")
 	}
-	return peer.activeSession.reliable.queue(channel, ordered, payload)
+	return peer.activeSession.reliable.queue(channel, payload)
 }
 
 func encodeFileOffer(transfer *fileTransfer) ([]byte, error) {
 	if transfer == nil || !validFileName(transfer.name) || transfer.size > MaxFileTransferBytes {
 		return nil, errors.New("file offer is invalid")
 	}
-	payload := make([]byte, 60+len(transfer.name))
-	payload[0], payload[1] = fileProtocolVersion, fileControlOffer
-	copy(payload[2:18], transfer.id[:])
-	binary.BigEndian.PutUint64(payload[18:26], transfer.size)
-	copy(payload[26:58], transfer.digest[:])
-	binary.BigEndian.PutUint16(payload[58:60], uint16(len(transfer.name)))
-	copy(payload[60:], transfer.name)
+	payload := make([]byte, 57+len(transfer.name))
+	payload[0] = fileControlOffer
+	copy(payload[1:17], transfer.id[:])
+	binary.BigEndian.PutUint64(payload[17:25], transfer.size)
+	copy(payload[25:57], transfer.digest[:])
+	copy(payload[57:], transfer.name)
 	return payload, nil
 }
 
-func decodeFileControl(payload []byte) (byte, [16]byte, uint64, decodedFileOffer, error) {
+func decodeFileControl(payload []byte) (byte, [16]byte, decodedFileOffer, error) {
 	var id [16]byte
-	if len(payload) < 18 || payload[0] != fileProtocolVersion {
-		return 0, id, 0, decodedFileOffer{}, errors.New("file control header is invalid")
+	if len(payload) < 17 {
+		return 0, id, decodedFileOffer{}, errors.New("file control header is invalid")
 	}
-	kind := payload[1]
-	copy(id[:], payload[2:18])
+	kind := payload[0]
+	copy(id[:], payload[1:17])
 	if id == ([16]byte{}) {
-		return 0, id, 0, decodedFileOffer{}, errors.New("file transfer ID is zero")
+		return 0, id, decodedFileOffer{}, errors.New("file transfer ID is zero")
 	}
 	if kind == fileControlOffer {
-		if len(payload) < 60 {
-			return 0, id, 0, decodedFileOffer{}, errors.New("file offer is truncated")
+		if len(payload) <= 57 {
+			return 0, id, decodedFileOffer{}, errors.New("file offer is truncated")
 		}
-		nameLength := int(binary.BigEndian.Uint16(payload[58:60]))
-		if nameLength == 0 || len(payload) != 60+nameLength {
-			return 0, id, 0, decodedFileOffer{}, errors.New("file offer length is invalid")
-		}
-		offer := decodedFileOffer{name: string(payload[60:]), size: binary.BigEndian.Uint64(payload[18:26])}
-		copy(offer.digest[:], payload[26:58])
+		offer := decodedFileOffer{name: string(payload[57:]), size: binary.BigEndian.Uint64(payload[17:25])}
+		copy(offer.digest[:], payload[25:57])
 		if offer.size > MaxFileTransferBytes || !validFileName(offer.name) {
-			return 0, id, 0, decodedFileOffer{}, errors.New("file offer fields are invalid")
+			return 0, id, decodedFileOffer{}, errors.New("file offer fields are invalid")
 		}
-		return kind, id, 0, offer, nil
+		return kind, id, offer, nil
 	}
-	if kind == fileControlDataAck {
-		if len(payload) != 26 {
-			return 0, id, 0, decodedFileOffer{}, errors.New("file data acknowledgment length is invalid")
-		}
-		return kind, id, binary.BigEndian.Uint64(payload[18:26]), decodedFileOffer{}, nil
+	if (kind != fileControlAccept && kind != fileControlReject && kind != fileControlCancel && kind != fileControlDataAck) || len(payload) != 17 {
+		return 0, id, decodedFileOffer{}, errors.New("file control encoding is invalid")
 	}
-	if (kind != fileControlAccept && kind != fileControlReject && kind != fileControlCancel) || len(payload) != 18 {
-		return 0, id, 0, decodedFileOffer{}, errors.New("file control encoding is invalid")
-	}
-	return kind, id, 0, decodedFileOffer{}, nil
+	return kind, id, decodedFileOffer{}, nil
 }
 
-func encodeFileData(id [16]byte, offset uint64, data []byte) []byte {
-	payload := make([]byte, 29+len(data))
-	payload[0] = fileProtocolVersion
-	copy(payload[1:17], id[:])
-	binary.BigEndian.PutUint64(payload[17:25], offset)
-	binary.BigEndian.PutUint32(payload[25:29], uint32(len(data)))
-	copy(payload[29:], data)
+func encodeFileData(id [16]byte, data []byte) []byte {
+	payload := make([]byte, 16+len(data))
+	copy(payload[0:16], id[:])
+	copy(payload[16:], data)
 	return payload
 }
 
-func decodeFileData(payload []byte) ([16]byte, uint64, []byte, error) {
+func decodeFileData(payload []byte) ([16]byte, []byte, error) {
 	var id [16]byte
-	if len(payload) < 29 || payload[0] != fileProtocolVersion {
-		return id, 0, nil, errors.New("file data header is invalid")
+	if len(payload) <= 16 || len(payload) > 16+fileChunkSize {
+		return id, nil, errors.New("file data header is invalid")
 	}
-	copy(id[:], payload[1:17])
-	size := int(binary.BigEndian.Uint32(payload[25:29]))
-	if id == ([16]byte{}) || size == 0 || size > fileChunkSize || len(payload) != 29+size {
-		return id, 0, nil, errors.New("file data encoding is invalid")
+	copy(id[:], payload[0:16])
+	if id == ([16]byte{}) {
+		return id, nil, errors.New("file data encoding is invalid")
 	}
-	return id, binary.BigEndian.Uint64(payload[17:25]), payload[29:], nil
+	return id, payload[16:], nil
 }
 
 func validFileName(name string) bool {
@@ -648,7 +633,7 @@ func (c *Client) finishFileTransfer(transfer *fileTransfer, status, reason strin
 		transfer.cancelWork()
 		transfer.cancelWork = nil
 	}
-	if peer := c.remotePeers[transfer.peerID]; peer != nil && peer.activeSession != nil && peer.activeSession.sessionID == transfer.sessionID {
+	if peer := c.remotePeers[transfer.peerID]; peer != nil && peer.activeSession != nil && peer.activeSession.id() == transfer.sessionID {
 		if transfer.direction == "outgoing" {
 			peer.activeSession.reliable.discardOutboundChannel(reliableChannelFileData)
 		} else {
@@ -680,7 +665,7 @@ func (c *Client) expireFileTransfers(now time.Time) {
 			continue
 		}
 		peer := c.remotePeers[transfer.peerID]
-		if peer == nil || peer.activeSession == nil || !peer.activeSession.authenticated || peer.activeSession.sessionID != transfer.sessionID {
+		if peer == nil || peer.activeSession == nil || !peer.activeSession.authenticated || peer.activeSession.id() != transfer.sessionID {
 			c.finishFileTransfer(transfer, "failed", "peer session ended")
 			continue
 		}
@@ -692,7 +677,7 @@ func (c *Client) expireFileTransfers(now time.Time) {
 			timeout = fileOfferTimeout
 		}
 		if !now.Before(transfer.updatedAt.Add(timeout)) {
-			c.queueFileControl(transfer, fileControlCancel, 0)
+			c.queueFileControl(transfer, fileControlCancel)
 			c.finishFileTransfer(transfer, "failed", "file transfer timed out")
 		}
 	}

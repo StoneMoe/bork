@@ -1,7 +1,6 @@
 package peer
 
 import (
-	"encoding/binary"
 	"errors"
 	"strings"
 	"unicode"
@@ -9,14 +8,12 @@ import (
 )
 
 const (
-	reliableChannelMemberState = 3
-	memberStateVersion         = 2
-	maxNicknameRunes           = 32
-	maxNicknameBytes           = 128
+	maxNicknameRunes = 32
+	maxNicknameBytes = 128
 )
 
 type memberState struct {
-	generation    uint64
+	revision      uint64
 	nickname      string
 	muted         bool
 	playbackMuted bool
@@ -39,37 +36,32 @@ func NormalizeNickname(nickname string) (string, error) {
 }
 
 func encodeMemberState(state memberState) ([]byte, error) {
-	if state.generation == 0 {
-		return nil, errors.New("member state generation is zero")
-	}
 	nickname, err := NormalizeNickname(state.nickname)
 	if err != nil {
 		return nil, err
 	}
-	payload := make([]byte, 10+len(nickname))
-	payload[0] = memberStateVersion
-	binary.BigEndian.PutUint64(payload[1:9], state.generation)
+	payload := make([]byte, 1+len(nickname))
 	if state.muted {
-		payload[9] |= 1
+		payload[0] |= 1
 	}
 	if state.playbackMuted {
-		payload[9] |= 2
+		payload[0] |= 2
 	}
-	copy(payload[10:], nickname)
+	copy(payload[1:], nickname)
 	return payload, nil
 }
 
 func decodeMemberState(payload []byte) (memberState, error) {
-	if len(payload) < 10 || payload[0] != memberStateVersion {
+	if len(payload) < 1 {
 		return memberState{}, errors.New("member state header is invalid")
 	}
-	state := memberState{generation: binary.BigEndian.Uint64(payload[1:9])}
-	if state.generation == 0 || payload[9]&^byte(3) != 0 {
+	state := memberState{}
+	if payload[0]&^byte(3) != 0 {
 		return memberState{}, errors.New("member state fields are invalid")
 	}
-	state.muted = payload[9]&1 != 0
-	state.playbackMuted = payload[9]&2 != 0
-	rawNickname := string(payload[10:])
+	state.muted = payload[0]&1 != 0
+	state.playbackMuted = payload[0]&2 != 0
+	rawNickname := string(payload[1:])
 	nickname, err := NormalizeNickname(rawNickname)
 	if err != nil || nickname != rawNickname {
 		return memberState{}, errors.New("member state nickname is invalid")
@@ -106,10 +98,7 @@ func (c *Client) applyDesiredMemberState() {
 	if c.localMemberState.nickname == desired.nickname && c.localMemberState.muted == desired.muted && c.localMemberState.playbackMuted == desired.playbackMuted {
 		return
 	}
-	desired.generation = c.localMemberState.generation + 1
-	if desired.generation == 0 {
-		desired.generation = 1
-	}
+	desired.revision = c.localMemberState.revision + 1
 	c.localMemberState = desired
 	c.queueMemberStates()
 }
@@ -121,21 +110,21 @@ func (c *Client) queueMemberStates() {
 	}
 	for _, peer := range c.remotePeers {
 		activeSession := peer.activeSession
-		if activeSession == nil || !activeSession.authenticated || activeSession.reliable == nil || activeSession.memberStateSentGeneration == c.localMemberState.generation {
+		if activeSession == nil || !activeSession.authenticated || activeSession.reliable == nil || activeSession.memberStateSentRevision == c.localMemberState.revision {
 			continue
 		}
-		if activeSession.reliable.queue(reliableChannelMemberState, false, payload) != nil {
+		if activeSession.reliable.queue(reliableChannelMemberState, payload) != nil {
 			continue
 		}
-		activeSession.memberStateSentGeneration = c.localMemberState.generation
+		activeSession.memberStateSentRevision = c.localMemberState.revision
 	}
 }
 
 func (c *Client) handleMemberState(sender *RemotePeer, payload []byte) {
 	state, err := decodeMemberState(payload)
-	if err != nil || sender == nil || sender.activeSession == nil || state.generation <= sender.activeSession.remoteMemberState.generation {
+	if err != nil || sender == nil || state == sender.memberState {
 		return
 	}
-	sender.activeSession.remoteMemberState = state
+	sender.memberState = state
 	c.publishStateChange()
 }

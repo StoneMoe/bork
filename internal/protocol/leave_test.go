@@ -9,42 +9,39 @@ import (
 
 func TestLeaveRoundTripAndAuthentication(t *testing.T) {
 	protector := newTestProtector(t, 1)
-	roomTag := [16]byte{1}
 	sessionID := [16]byte{2}
-	packet, err := MarshalControl(PacketLeave, roomTag, sessionID, 3, 0, protector)
+	packet, err := MarshalControl(PacketLeave, sessionID, 3, 0, protector)
 	if err != nil {
 		t.Fatal(err)
 	}
-	decoded, err := ParseControl(packet, roomTag, sessionID, protector)
+	pingSequence, err := ParseControl(packet, sessionID, protector)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Type != PacketLeave {
-		t.Fatalf("leave decoded as packet type %d", decoded.Type)
+	if pingSequence != 0 {
+		t.Fatalf("leave decoded with ping sequence %d", pingSequence)
 	}
 
 	packet[len(packet)-1] ^= 1
-	if _, err := ParseControl(packet, roomTag, sessionID, protector); err == nil {
+	if _, err := ParseControl(packet, sessionID, protector); err == nil {
 		t.Fatal("tampered leave packet was accepted")
 	}
 }
 
 func TestLeaveCanBeBridgeInner(t *testing.T) {
-	roomTag := [16]byte{1}
 	sessionID := [16]byte{2}
-	leave, err := MarshalControl(PacketLeave, roomTag, sessionID, 3, 0, newTestProtector(t, 1))
+	leave, err := MarshalControl(PacketLeave, sessionID, 3, 0, newTestProtector(t, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	origin := [32]byte{4}
-	target := [32]byte{5}
+	target := [16]byte{5}
 	bridgeProtector := newTestProtector(t, 2)
-	packet, err := MarshalBridge(roomTag, sessionID, 6, origin, target, false, leave, bridgeProtector)
+	packet, err := MarshalBridge(sessionID, 6, target, false, leave, bridgeProtector)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ParseBridge(packet, roomTag, sessionID, bridgeProtector); err != nil {
+	if _, err := ParseBridge(packet, sessionID, bridgeProtector); err != nil {
 		t.Fatal(err)
 	}
 }

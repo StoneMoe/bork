@@ -8,6 +8,13 @@ import (
 )
 
 const (
+	reliableChannelTopology    uint16 = 1
+	reliableChannelFanout             = 2
+	reliableChannelMemberState        = 3
+	reliableChannelScreenState        = 4
+	reliableChannelFileControl        = 5
+	reliableChannelFileData           = 6
+
 	reliableMSS                = protocol.MaxReliablePayload
 	initialReliableCwnd        = 4 * reliableMSS
 	minimumReliableCwnd        = 2 * reliableMSS
@@ -17,7 +24,6 @@ const (
 	maximumReliableRTO         = 5 * time.Second
 	maxQueuedReliableBytes     = 4 << 20
 	maxReassemblyReliableBytes = 4 << 20
-	maxReliableChannels        = 64
 	maxReliableAssemblies      = 4096
 	maxReliableFragments       = 8192
 )
@@ -48,20 +54,16 @@ type reliableTransport struct {
 }
 
 type reliableChannel struct {
-	modeSet              bool
-	ordered              bool
-	nextMessageSequence  uint64
-	nextFragmentSequence uint64
-	received             sequenceWindow
-	ackDirty             bool
-	nextDeliveredMessage uint64
-	reassemblies         map[uint64]*reliableAssembly
+	nextFragmentSequence  uint64
+	received              sequenceWindow
+	ackDirty              bool
+	nextDeliveredFragment uint64
+	reassemblies          map[uint64]*reliableAssembly
 }
 
 type reliableFragment struct {
 	channel          uint16
 	fragmentSequence uint64
-	messageSequence  uint64
 	fragmentIndex    uint16
 	fragmentCount    uint16
 	payload          []byte
@@ -103,8 +105,8 @@ func newReliableTransport() *reliableTransport {
 	}
 }
 
-func (r *reliableTransport) queue(channel uint16, ordered bool, payload []byte) error {
-	if err := r.canQueue(channel, ordered, len(payload)); err != nil {
+func (r *reliableTransport) queue(channel uint16, payload []byte) error {
+	if err := r.canQueue(channel, len(payload)); err != nil {
 		return err
 	}
 
@@ -113,11 +115,6 @@ func (r *reliableTransport) queue(channel uint16, ordered bool, payload []byte) 
 	if state == nil {
 		state = r.addChannel(channel)
 	}
-	state.modeSet = true
-	state.ordered = ordered
-	state.nextMessageSequence++
-	messageSequence := state.nextMessageSequence
-
 	for index := 0; index < fragmentCount; index++ {
 		start := index * reliableMSS
 		end := min(start+reliableMSS, len(payload))
@@ -125,7 +122,6 @@ func (r *reliableTransport) queue(channel uint16, ordered bool, payload []byte) 
 		r.outbound = append(r.outbound, &reliableFragment{
 			channel:          channel,
 			fragmentSequence: state.nextFragmentSequence,
-			messageSequence:  messageSequence,
 			fragmentIndex:    uint16(index),
 			fragmentCount:    uint16(fragmentCount),
 			payload:          append([]byte(nil), payload[start:end]...),
@@ -135,9 +131,9 @@ func (r *reliableTransport) queue(channel uint16, ordered bool, payload []byte) 
 	return nil
 }
 
-func (r *reliableTransport) canQueue(channel uint16, ordered bool, size int) error {
-	if channel == 0 {
-		return errors.New("reliable channel is zero")
+func (r *reliableTransport) canQueue(channel uint16, size int) error {
+	if _, known := reliableChannelOrdered(channel); !known {
+		return errors.New("reliable channel is unknown")
 	}
 	if size == 0 {
 		return errors.New("reliable message is empty")
@@ -151,10 +147,7 @@ func (r *reliableTransport) canQueue(channel uint16, ordered bool, size int) err
 
 	fragmentCount := (size + reliableMSS - 1) / reliableMSS
 	state := r.channels[channel]
-	if state != nil && state.modeSet && state.ordered != ordered {
-		return errors.New("reliable channel mode changed")
-	}
-	if state != nil && (state.nextMessageSequence == ^uint64(0) || uint64(fragmentCount) > ^uint64(0)-state.nextFragmentSequence) {
+	if state != nil && uint64(fragmentCount) > ^uint64(0)-state.nextFragmentSequence {
 		return errors.New("reliable sequence exhausted")
 	}
 	return nil
@@ -215,20 +208,17 @@ func (r *reliableTransport) nextFragment(eligible func(*reliableFragment) bool) 
 }
 
 func (r *reliableTransport) receive(packet protocol.ReliablePacket, now time.Time) []deliveredReliableMessage {
+	ordered, known := reliableChannelOrdered(packet.Channel)
+	if !known {
+		return nil
+	}
 	r.consumeFragmentAck(packet.Channel, packet.FragmentAckBase, packet.FragmentAckBitmap, now)
 	if packet.AckOnly() {
 		return nil
 	}
 
 	state := r.channels[packet.Channel]
-	ordered := packet.Ordered()
-	if state != nil && state.modeSet && state.ordered != ordered {
-		return nil
-	}
 	if state == nil {
-		if len(r.channels) >= maxReliableChannels {
-			return nil
-		}
 		state = r.addChannel(packet.Channel)
 	}
 	// Rejected repeats still trigger the current ACK, but only retained data is
@@ -237,11 +227,12 @@ func (r *reliableTransport) receive(packet protocol.ReliablePacket, now time.Tim
 	if !state.received.mayAccept(packet.FragmentSequence) {
 		return nil
 	}
-	if ordered && packet.MessageSequence < state.nextDeliveredMessage {
+	messageStart := packet.FragmentSequence - uint64(packet.FragmentIndex)
+	if ordered && (state.nextDeliveredFragment == 0 || messageStart < state.nextDeliveredFragment) {
 		return nil
 	}
 
-	assembly := state.reassemblies[packet.MessageSequence]
+	assembly := state.reassemblies[messageStart]
 	if assembly != nil {
 		if assembly.fragmentCount != packet.FragmentCount {
 			return nil
@@ -256,7 +247,7 @@ func (r *reliableTransport) receive(packet protocol.ReliablePacket, now time.Tim
 	if r.reassemblyParts >= maxReliableFragments {
 		return nil
 	}
-	assembly = state.reassemblies[packet.MessageSequence]
+	assembly = state.reassemblies[messageStart]
 	if assembly == nil {
 		if r.reassemblyCount >= maxReliableAssemblies {
 			return nil
@@ -265,22 +256,20 @@ func (r *reliableTransport) receive(packet protocol.ReliablePacket, now time.Tim
 			fragmentCount: packet.FragmentCount,
 			fragments:     make(map[uint16][]byte),
 		}
-		state.reassemblies[packet.MessageSequence] = assembly
+		state.reassemblies[messageStart] = assembly
 		r.reassemblyCount++
 	}
 	assembly.fragments[packet.FragmentIndex] = append([]byte(nil), packet.Payload...)
 	assembly.bytes += len(packet.Payload)
 	r.reassemblyBytes += len(packet.Payload)
 	r.reassemblyParts++
-	state.modeSet = true
-	state.ordered = ordered
 	state.received.accept(packet.FragmentSequence)
 	if len(assembly.fragments) != int(assembly.fragmentCount) {
 		return nil
 	}
 	if !ordered {
 		delivered := deliveredReliableMessage{channel: packet.Channel, payload: assembleReliable(assembly)}
-		r.removeAssembly(state, packet.MessageSequence)
+		r.removeAssembly(state, messageStart)
 		return []deliveredReliableMessage{delivered}
 	}
 	return r.deliverOrdered(packet.Channel, state)
@@ -296,7 +285,6 @@ func (r *reliableTransport) nextAck() (protocol.ReliablePacket, reliableReservat
 		}
 		return protocol.ReliablePacket{
 				Channel:           channel,
-				Flags:             protocol.ReliableFlagAckOnly,
 				FragmentAckBase:   state.received.highest,
 				FragmentAckBitmap: state.received.seen,
 			}, reliableReservation{
@@ -342,8 +330,8 @@ func (r *reliableTransport) discardInboundChannel(channel uint16) {
 
 func (r *reliableTransport) addChannel(channel uint16) *reliableChannel {
 	state := &reliableChannel{
-		nextDeliveredMessage: 1,
-		reassemblies:         make(map[uint64]*reliableAssembly),
+		nextDeliveredFragment: 1,
+		reassemblies:          make(map[uint64]*reliableAssembly),
 	}
 	r.channels[channel] = state
 	r.ackChannels = append(r.ackChannels, channel)
@@ -352,15 +340,9 @@ func (r *reliableTransport) addChannel(channel uint16) *reliableChannel {
 
 func (r *reliableTransport) packetFor(fragment *reliableFragment) protocol.ReliablePacket {
 	state := r.channels[fragment.channel]
-	flags := byte(0)
-	if state.ordered {
-		flags = protocol.ReliableFlagOrdered
-	}
 	return protocol.ReliablePacket{
 		Channel:           fragment.channel,
-		Flags:             flags,
 		FragmentSequence:  fragment.fragmentSequence,
-		MessageSequence:   fragment.messageSequence,
 		FragmentIndex:     fragment.fragmentIndex,
 		FragmentCount:     fragment.fragmentCount,
 		FragmentAckBase:   state.received.highest,
@@ -481,7 +463,7 @@ func (r *reliableTransport) removeAssembly(state *reliableChannel, sequence uint
 func (r *reliableTransport) deliverOrdered(channel uint16, state *reliableChannel) []deliveredReliableMessage {
 	var delivered []deliveredReliableMessage
 	for {
-		assembly := state.reassemblies[state.nextDeliveredMessage]
+		assembly := state.reassemblies[state.nextDeliveredFragment]
 		if assembly == nil || len(assembly.fragments) != int(assembly.fragmentCount) {
 			return delivered
 		}
@@ -489,8 +471,24 @@ func (r *reliableTransport) deliverOrdered(channel uint16, state *reliableChanne
 			channel: channel,
 			payload: assembleReliable(assembly),
 		})
-		r.removeAssembly(state, state.nextDeliveredMessage)
-		state.nextDeliveredMessage++
+		r.removeAssembly(state, state.nextDeliveredFragment)
+		next := state.nextDeliveredFragment + uint64(assembly.fragmentCount)
+		if next < state.nextDeliveredFragment {
+			state.nextDeliveredFragment = 0
+			return delivered
+		}
+		state.nextDeliveredFragment = next
+	}
+}
+
+func reliableChannelOrdered(channel uint16) (ordered, known bool) {
+	switch channel {
+	case reliableChannelTopology, reliableChannelFanout, reliableChannelMemberState, reliableChannelScreenState, reliableChannelFileControl:
+		return true, true
+	case reliableChannelFileData:
+		return false, true
+	default:
+		return false, false
 	}
 }
 

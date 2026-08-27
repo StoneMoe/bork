@@ -7,19 +7,15 @@ import (
 )
 
 const (
-	ReliableFlagOrdered byte = 1 << 0
-	ReliableFlagAckOnly byte = 1 << 1
-
 	MaxReliableFragments       = 1024
-	reliablePlaintextFixedSize = 2 + 1 + 8 + 8 + 2 + 2 + 8 + 8
+	reliablePlaintextFixedSize = 2 + 8 + 2 + 2 + 8 + 8
+	reliableMinPacketSize      = sessionHeaderSize + reliablePlaintextFixedSize + aeadTagSize
 	MaxReliablePayload         = MaxBridgeInnerSize - sessionHeaderSize - reliablePlaintextFixedSize - aeadTagSize
 )
 
 type ReliablePacket struct {
 	Channel           uint16
-	Flags             byte
 	FragmentSequence  uint64
-	MessageSequence   uint64
 	FragmentIndex     uint16
 	FragmentCount     uint16
 	FragmentAckBase   uint64
@@ -27,12 +23,8 @@ type ReliablePacket struct {
 	Payload           []byte
 }
 
-func (p ReliablePacket) Ordered() bool {
-	return p.Flags&ReliableFlagOrdered != 0
-}
-
 func (p ReliablePacket) AckOnly() bool {
-	return p.Flags&ReliableFlagAckOnly != 0
+	return p.FragmentSequence == 0
 }
 
 func FragmentAckContains(base, bitmap, sequence uint64) bool {
@@ -43,7 +35,7 @@ func FragmentAckContains(base, bitmap, sequence uint64) bool {
 	return delta < 64 && bitmap&(uint64(1)<<delta) != 0
 }
 
-func MarshalReliable(roomTag, sessionID [16]byte, packetSequence uint64, p ReliablePacket, protector cipher.AEAD) ([]byte, error) {
+func MarshalReliable(sessionID [16]byte, packetSequence uint64, p ReliablePacket, protector cipher.AEAD) ([]byte, error) {
 	if packetSequence == 0 {
 		return nil, errors.New("reliable packet sequence is zero")
 	}
@@ -55,16 +47,14 @@ func MarshalReliable(roomTag, sessionID [16]byte, packetSequence uint64, p Relia
 	}
 
 	packet := make([]byte, 0, sessionHeaderSize+reliablePlaintextFixedSize+len(p.Payload)+aeadTagSize)
-	packet = appendSessionHeader(packet, PacketReliable, roomTag, sessionID, packetSequence)
+	packet = appendSessionHeader(packet, PacketReliable, sessionID, packetSequence)
 	var fixed [reliablePlaintextFixedSize]byte
 	binary.BigEndian.PutUint16(fixed[0:2], p.Channel)
-	fixed[2] = p.Flags
-	binary.BigEndian.PutUint64(fixed[3:11], p.FragmentSequence)
-	binary.BigEndian.PutUint64(fixed[11:19], p.MessageSequence)
-	binary.BigEndian.PutUint16(fixed[19:21], p.FragmentIndex)
-	binary.BigEndian.PutUint16(fixed[21:23], p.FragmentCount)
-	binary.BigEndian.PutUint64(fixed[23:31], p.FragmentAckBase)
-	binary.BigEndian.PutUint64(fixed[31:39], p.FragmentAckBitmap)
+	binary.BigEndian.PutUint64(fixed[2:10], p.FragmentSequence)
+	binary.BigEndian.PutUint16(fixed[10:12], p.FragmentIndex)
+	binary.BigEndian.PutUint16(fixed[12:14], p.FragmentCount)
+	binary.BigEndian.PutUint64(fixed[14:22], p.FragmentAckBase)
+	binary.BigEndian.PutUint64(fixed[22:30], p.FragmentAckBitmap)
 	packet = append(packet, fixed[:]...)
 	packet = append(packet, p.Payload...)
 	body := packet[sessionHeaderSize:]
@@ -72,16 +62,15 @@ func MarshalReliable(roomTag, sessionID [16]byte, packetSequence uint64, p Relia
 	return packet[:sessionHeaderSize+len(sealed)], nil
 }
 
-func ParseReliable(packet []byte, expectedRoomTag, expectedSessionID [16]byte, protector cipher.AEAD) (ReliablePacket, error) {
-	minimumSize := sessionHeaderSize + reliablePlaintextFixedSize + aeadTagSize
-	if len(packet) < minimumSize || len(packet) > MaxBridgeInnerSize {
+func ParseReliable(packet []byte, expectedSessionID [16]byte, protector cipher.AEAD) (ReliablePacket, error) {
+	if len(packet) < reliableMinPacketSize || len(packet) > MaxBridgeInnerSize {
 		return ReliablePacket{}, errors.New("reliable packet length is invalid")
 	}
 	if !validPairwiseCipher(protector) {
 		return ReliablePacket{}, errors.New("reliable packet protector is invalid")
 	}
 	header, err := ParseSessionHeader(packet)
-	if err != nil || header.Type != PacketReliable || header.RoomTag != expectedRoomTag || header.SessionID != expectedSessionID {
+	if err != nil || header.Type != PacketReliable || header.SessionID != expectedSessionID {
 		return ReliablePacket{}, errors.New("reliable packet header is invalid")
 	}
 	body := packet[sessionHeaderSize:]
@@ -92,13 +81,11 @@ func ParseReliable(packet []byte, expectedRoomTag, expectedSessionID [16]byte, p
 
 	decoded := ReliablePacket{
 		Channel:           binary.BigEndian.Uint16(opened[0:2]),
-		Flags:             opened[2],
-		FragmentSequence:  binary.BigEndian.Uint64(opened[3:11]),
-		MessageSequence:   binary.BigEndian.Uint64(opened[11:19]),
-		FragmentIndex:     binary.BigEndian.Uint16(opened[19:21]),
-		FragmentCount:     binary.BigEndian.Uint16(opened[21:23]),
-		FragmentAckBase:   binary.BigEndian.Uint64(opened[23:31]),
-		FragmentAckBitmap: binary.BigEndian.Uint64(opened[31:39]),
+		FragmentSequence:  binary.BigEndian.Uint64(opened[2:10]),
+		FragmentIndex:     binary.BigEndian.Uint16(opened[10:12]),
+		FragmentCount:     binary.BigEndian.Uint16(opened[12:14]),
+		FragmentAckBase:   binary.BigEndian.Uint64(opened[14:22]),
+		FragmentAckBitmap: binary.BigEndian.Uint64(opened[22:30]),
 		Payload:           opened[reliablePlaintextFixedSize:],
 	}
 	if len(decoded.Payload) == 0 {
@@ -114,23 +101,26 @@ func validateReliableBody(p ReliablePacket) error {
 	if p.Channel == 0 {
 		return errors.New("reliable packet channel is zero")
 	}
-	if p.Flags&^(ReliableFlagOrdered|ReliableFlagAckOnly) != 0 {
-		return errors.New("reliable packet flags are invalid")
-	}
 	if !validReliableAck(p.FragmentAckBase, p.FragmentAckBitmap) {
 		return errors.New("reliable packet acknowledgment is invalid")
 	}
 	if p.AckOnly() {
-		if p.Flags != ReliableFlagAckOnly || p.FragmentSequence != 0 || p.MessageSequence != 0 || p.FragmentIndex != 0 || p.FragmentCount != 0 || len(p.Payload) != 0 {
+		if p.FragmentIndex != 0 || p.FragmentCount != 0 || len(p.Payload) != 0 {
 			return errors.New("reliable acknowledgment-only packet is invalid")
 		}
 		return nil
 	}
-	if p.FragmentSequence == 0 || p.MessageSequence == 0 {
-		return errors.New("reliable data sequence is zero")
-	}
 	if p.FragmentCount == 0 || p.FragmentCount > MaxReliableFragments || p.FragmentIndex >= p.FragmentCount {
 		return errors.New("reliable fragment fields are invalid")
+	}
+	// Every message occupies one contiguous fragment-sequence range. The first
+	// sequence is therefore also the message's reassembly and delivery key.
+	if p.FragmentSequence <= uint64(p.FragmentIndex) {
+		return errors.New("reliable fragment sequence is invalid")
+	}
+	messageStart := p.FragmentSequence - uint64(p.FragmentIndex)
+	if uint64(p.FragmentCount)-1 > ^uint64(0)-messageStart {
+		return errors.New("reliable fragment sequence overflows")
 	}
 	if len(p.Payload) == 0 || len(p.Payload) > MaxReliablePayload {
 		return errors.New("reliable payload length is invalid")

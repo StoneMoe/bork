@@ -1,8 +1,6 @@
 package protocol
 
 import (
-	"crypto"
-	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
@@ -10,90 +8,93 @@ import (
 	"bork/internal/identity"
 )
 
-// HelloPacket is either a discovery probe with empty handshake fields or one
-// side of a Session transcript with both handshake fields populated.
-type HelloPacket struct {
-	RoomTag      [16]byte
-	HandshakeID  [16]byte
+// SessionHello is one side of a Session transcript. The initiator chooses the
+// SessionID, and both peers keep the encoded packet for the Session lifetime.
+type SessionHello struct {
+	SessionID    [16]byte
 	PeerID       identity.PeerID
 	EphemeralKey [32]byte
-	wire         [helloPacketSize]byte
+	wire         [sessionHelloPacketSize]byte
 }
 
-// MarshalHelloProbe creates an authenticated discovery probe. A probe identifies
-// its sender but is never part of a Session transcript.
-func MarshalHelloProbe(roomTag [16]byte, admissionKey [32]byte, signer crypto.Signer) ([]byte, error) {
-	return marshalHello(roomTag, admissionKey, signer, [16]byte{}, [32]byte{})
-}
-
-// MarshalSessionHello creates one side of a Session transcript. Both peers use
-// the same handshake ID and keep this packet for the lifetime of that Session.
-func MarshalSessionHello(roomTag [16]byte, admissionKey [32]byte, signer crypto.Signer, handshakeID [16]byte, ephemeralKey [32]byte) ([]byte, error) {
-	if handshakeID == [16]byte{} {
-		return nil, errors.New("session hello handshake ID is empty")
+// MarshalHelloProbe announces a room member on a candidate path. It is not
+// part of a Session transcript and therefore carries no Session key material.
+func MarshalHelloProbe(admissionKey [32]byte, peerID identity.PeerID) ([]byte, error) {
+	if peerID.IsZero() {
+		return nil, errors.New("hello probe peer ID is empty")
 	}
-	if ephemeralKey == [32]byte{} {
+	packet := make([]byte, 0, helloProbePacketSize)
+	packet = appendPrefix(packet, PacketHelloProbe)
+	packet = append(packet, peerID[:]...)
+	return appendAdmissionMAC(packet, admissionKey), nil
+}
+
+func ParseHelloProbe(packet []byte, admissionKey [32]byte) (identity.PeerID, error) {
+	if len(packet) != helloProbePacketSize {
+		return identity.PeerID{}, errors.New("hello probe length is invalid")
+	}
+	packetType, err := ParsePrefix(packet)
+	if err != nil || packetType != PacketHelloProbe || !validAdmissionMAC(packet, admissionKey) {
+		return identity.PeerID{}, errors.New("hello probe authentication failed")
+	}
+	var peerID identity.PeerID
+	copy(peerID[:], packet[prefixSize:prefixSize+len(peerID)])
+	if peerID.IsZero() {
+		return identity.PeerID{}, errors.New("hello probe peer ID is empty")
+	}
+	return peerID, nil
+}
+
+func MarshalSessionHello(admissionKey [32]byte, peerID identity.PeerID, sessionID [16]byte, ephemeralKey [32]byte) ([]byte, error) {
+	if peerID.IsZero() {
+		return nil, errors.New("session hello peer ID is empty")
+	}
+	if sessionID == ([16]byte{}) {
+		return nil, errors.New("session hello session ID is empty")
+	}
+	if ephemeralKey == ([32]byte{}) {
 		return nil, errors.New("session hello ephemeral key is empty")
 	}
-	return marshalHello(roomTag, admissionKey, signer, handshakeID, ephemeralKey)
-}
-
-func marshalHello(roomTag [16]byte, admissionKey [32]byte, signer crypto.Signer, handshakeID [16]byte, ephemeralKey [32]byte) ([]byte, error) {
-	publicKey, ok := signer.Public().(ed25519.PublicKey)
-	if !ok || len(publicKey) != ed25519.PublicKeySize {
-		return nil, errors.New("hello signer must use Ed25519")
-	}
-	packet := make([]byte, 0, helloPacketSize)
-	packet = appendPrefix(packet, PacketHello, roomTag)
-	packet = append(packet, handshakeID[:]...)
-	packet = append(packet, publicKey...)
+	packet := make([]byte, 0, sessionHelloPacketSize)
+	packet = appendPrefix(packet, PacketSessionHello)
+	packet = append(packet, sessionID[:]...)
+	packet = append(packet, peerID[:]...)
 	packet = append(packet, ephemeralKey[:]...)
-
-	mac := hmac.New(sha256.New, admissionKey[:])
-	_, _ = mac.Write(packet)
-	packet = mac.Sum(packet)
-	signature, err := signer.Sign(nil, packet, crypto.Hash(0))
-	if err != nil {
-		return nil, err
-	}
-	packet = append(packet, signature...)
-	return packet, nil
+	return appendAdmissionMAC(packet, admissionKey), nil
 }
 
-func ParseHello(packet []byte, expectedRoomTag [16]byte, admissionKey [32]byte) (HelloPacket, error) {
-	if len(packet) != helloPacketSize {
-		return HelloPacket{}, errors.New("hello packet length is invalid")
+func ParseSessionHello(packet []byte, admissionKey [32]byte) (SessionHello, error) {
+	if len(packet) != sessionHelloPacketSize {
+		return SessionHello{}, errors.New("session hello length is invalid")
 	}
-	packetType, roomTag, err := ParsePrefix(packet)
-	if err != nil || packetType != PacketHello || roomTag != expectedRoomTag {
-		return HelloPacket{}, errors.New("hello packet prefix is invalid")
-	}
-	bodyEnd := prefixSize + helloBodySize
-	macEnd := bodyEnd + helloMACSize
-	mac := hmac.New(sha256.New, admissionKey[:])
-	_, _ = mac.Write(packet[:bodyEnd])
-	if !hmac.Equal(packet[bodyEnd:macEnd], mac.Sum(nil)) {
-		return HelloPacket{}, errors.New("hello admission MAC is invalid")
+	packetType, err := ParsePrefix(packet)
+	if err != nil || packetType != PacketSessionHello || !validAdmissionMAC(packet, admissionKey) {
+		return SessionHello{}, errors.New("session hello authentication failed")
 	}
 
-	identityOffset := prefixSize + 16
-	publicKey := ed25519.PublicKey(packet[identityOffset : identityOffset+ed25519.PublicKeySize])
-	if !ed25519.Verify(publicKey, packet[:macEnd], packet[macEnd:]) {
-		return HelloPacket{}, errors.New("hello peer ID signature is invalid")
-	}
-
-	var hello HelloPacket
-	hello.RoomTag = roomTag
-	copy(hello.HandshakeID[:], packet[prefixSize:prefixSize+16])
-	copy(hello.PeerID[:], publicKey)
-	copy(hello.EphemeralKey[:], packet[identityOffset+ed25519.PublicKeySize:bodyEnd])
-	if (hello.HandshakeID == [16]byte{}) != (hello.EphemeralKey == [32]byte{}) {
-		return HelloPacket{}, errors.New("hello handshake fields are inconsistent")
+	var hello SessionHello
+	offset := prefixSize
+	copy(hello.SessionID[:], packet[offset:offset+len(hello.SessionID)])
+	offset += len(hello.SessionID)
+	copy(hello.PeerID[:], packet[offset:offset+len(hello.PeerID)])
+	offset += len(hello.PeerID)
+	copy(hello.EphemeralKey[:], packet[offset:offset+len(hello.EphemeralKey)])
+	if hello.SessionID == ([16]byte{}) || hello.PeerID.IsZero() || hello.EphemeralKey == ([32]byte{}) {
+		return SessionHello{}, errors.New("session hello fields are invalid")
 	}
 	copy(hello.wire[:], packet)
 	return hello, nil
 }
 
-func (hello HelloPacket) IsProbe() bool {
-	return hello.HandshakeID == [16]byte{}
+func appendAdmissionMAC(packet []byte, admissionKey [32]byte) []byte {
+	mac := hmac.New(sha256.New, admissionKey[:])
+	_, _ = mac.Write(packet)
+	return mac.Sum(packet)
+}
+
+func validAdmissionMAC(packet []byte, admissionKey [32]byte) bool {
+	bodyEnd := len(packet) - helloMACSize
+	mac := hmac.New(sha256.New, admissionKey[:])
+	_, _ = mac.Write(packet[:bodyEnd])
+	return hmac.Equal(packet[bodyEnd:], mac.Sum(nil))
 }

@@ -16,29 +16,9 @@ import (
 	"bork/internal/invite"
 	"bork/internal/media"
 	"bork/internal/networking"
-	"bork/internal/networking/discovery"
 	"bork/internal/networking/endpoint"
 	"bork/internal/protocol"
 )
-
-type roomNetwork interface {
-	Run(context.Context) error
-	Snapshot() networking.RoomSnapshot
-	StateChanges() <-chan struct{}
-	DiscoveredPeers() <-chan discovery.Hint
-	ControlPackets() <-chan endpoint.Datagram
-	ReliablePackets() <-chan endpoint.Datagram
-	BridgePackets() <-chan endpoint.Datagram
-	VoicePackets() <-chan endpoint.Datagram
-	ScreenPackets() <-chan endpoint.Datagram
-	EnqueueControl([]byte, netip.AddrPort) error
-	WriteControl(context.Context, []byte, netip.AddrPort) error
-	EnqueueLowPriority([]byte, netip.AddrPort) error
-	SendRealtimeBatch(endpoint.RealtimeBatch) error
-	SetRealtimeSendGeneration(uint64)
-}
-
-type roomNetworkFactory func() roomNetwork
 
 type ClientSnapshot struct {
 	Name          string
@@ -59,10 +39,10 @@ type DiscoveryHintSnapshot struct {
 }
 
 type Client struct {
-	localIdentity  *identity.LocalIdentity
+	localPeerID    identity.PeerID
 	roomInvite     invite.Invite
+	networkOptions networking.Options
 	logger         *slog.Logger
-	networkFactory roomNetworkFactory
 
 	memberStateMu      sync.Mutex
 	desiredMemberState memberState
@@ -76,64 +56,49 @@ type Client struct {
 	fileContext        context.Context
 	fileWorkers        sync.WaitGroup
 
-	snapshotMu                 sync.RWMutex
-	snapshot                   ClientSnapshot
-	roomNetwork                roomNetwork
-	networkSnapshot            networking.RoomSnapshot
-	roomTag                    [16]byte
-	admissionKey               [32]byte
-	helloProbePacket           []byte
-	discoveredAddresses        map[netip.AddrPort]discoveredAddress
-	remotePeers                map[identity.PeerID]*RemotePeer
-	topologyGeneration         uint64
-	topology                   map[identity.PeerID]*topologyPeer
-	voiceStreamID              [16]byte
-	roomDatagramProtector      cipher.AEAD
-	voicePacketSequence        uint64
-	voiceStreamPendingTopology bool
-	roomDatagramReceivers      map[roomDatagramStreamKey]*roomDatagramReceiveState
-	screenVideoReceivers       map[roomDatagramStreamKey]*screenVideoReceiveState
-	screenVideoRetainedBytes   int
-	fanout                     outboundFanout
-	fanoutDirty                bool
-	reliablePeerCursor         identity.PeerID
-	localMemberState           memberState
-	localScreenState           screenState
-	screenPacketSequence       uint64
-	screenVideoChunkID         uint32
-	fileTransfers              map[[16]byte]*fileTransfer
+	snapshotMu               sync.RWMutex
+	snapshot                 ClientSnapshot
+	roomNetwork              *networking.RoomNetwork
+	networkSnapshot          networking.RoomSnapshot
+	admissionKey             [32]byte
+	helloProbePacket         []byte
+	discoveredAddresses      map[netip.AddrPort]discoveredAddress
+	remotePeers              map[identity.PeerID]*RemotePeer
+	topologyRevision         uint64
+	topology                 map[identity.PeerID]*topologyPeer
+	roomDatagramProtector    cipher.AEAD
+	voicePacketSequence      uint64
+	roomDatagramReceivers    map[roomDatagramStreamKey]*roomDatagramReceiveState
+	screenVideoReceivers     map[roomDatagramStreamKey]*screenVideoReceiveState
+	screenVideoRetainedBytes int
+	fanout                   outboundFanout
+	fanoutDirty              bool
+	reliablePeerCursor       identity.PeerID
+	localMemberState         memberState
+	localScreenState         screenState
+	screenPacketSequence     uint64
+	screenVideoChunkID       uint32
+	fileTransfers            map[[16]byte]*fileTransfer
 
 	stateChanges chan struct{}
 	started      atomic.Bool
 }
 
 func NewClient(roomInvite invite.Invite, networkOptions networking.Options, logger *slog.Logger) (*Client, error) {
-	localIdentity, err := identity.New()
+	localPeerID, err := identity.New()
 	if err != nil {
 		return nil, err
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return newClient(
-		localIdentity,
-		roomInvite,
-		func() roomNetwork {
-			return networking.NewRoomNetwork(roomInvite.RoomTag(), roomInvite.TrackerHash(), localIdentity.PeerID, networkOptions, logger)
-		},
-		logger,
-	), nil
-}
-
-func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, networkFactory roomNetworkFactory, logger *slog.Logger) *Client {
 	roomDatagramProtector := protocol.NewRoomDatagramCipher(roomInvite.RoomDatagramKey())
-	client := &Client{
-		localIdentity:         localIdentity,
+	return &Client{
+		localPeerID:           localPeerID,
 		roomInvite:            roomInvite,
+		networkOptions:        networkOptions,
 		logger:                logger,
-		networkFactory:        networkFactory,
 		snapshot:              ClientSnapshot{Name: roomInvite.DisplayName, RemotePeers: []RemotePeerSnapshot{}},
-		roomTag:               roomInvite.RoomTag(),
 		admissionKey:          roomInvite.AdmissionKey(),
 		discoveredAddresses:   make(map[netip.AddrPort]discoveredAddress),
 		remotePeers:           make(map[identity.PeerID]*RemotePeer),
@@ -146,16 +111,15 @@ func newClient(localIdentity *identity.LocalIdentity, roomInvite invite.Invite, 
 		fileWorkResults:       make(chan fileWorkResult, 64),
 		loopReady:             make(chan struct{}),
 		loopDone:              make(chan struct{}),
-		localMemberState:      memberState{generation: 1},
-		localScreenState:      screenState{generation: 1},
-		topologyGeneration:    1,
+		localMemberState:      memberState{revision: 1},
+		localScreenState:      screenState{revision: 1},
+		topologyRevision:      1,
 		roomDatagramProtector: roomDatagramProtector,
 		roomDatagramReceivers: make(map[roomDatagramStreamKey]*roomDatagramReceiveState),
 		screenVideoReceivers:  make(map[roomDatagramStreamKey]*screenVideoReceiveState),
 		fileTransfers:         make(map[[16]byte]*fileTransfer),
 		fanoutDirty:           true,
-	}
-	return client
+	}, nil
 }
 
 func (c *Client) StateChanges() <-chan struct{} {
@@ -172,7 +136,6 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	if err := c.initHelloProbe(); err != nil {
 		return err
 	}
-	c.initVoiceStream()
 	c.applyDesiredMemberState()
 
 	ctx, cancel := context.WithCancel(parent)
@@ -185,7 +148,7 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 		c.fileWorkers.Wait()
 		c.discardFileWorkResults()
 	}()
-	roomNetwork := c.networkFactory()
+	roomNetwork := networking.NewRoomNetwork(c.roomInvite.RoomTag(), c.roomInvite.TrackerHash(), c.localPeerID, c.networkOptions, c.logger)
 	c.roomNetwork = roomNetwork
 	close(c.loopReady)
 	if mediaPort != nil {
@@ -202,7 +165,6 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	discoveredPeers := roomNetwork.DiscoveredPeers()
 	controlPackets := roomNetwork.ControlPackets()
 	reliablePackets := roomNetwork.ReliablePackets()
-	bridgePackets := roomNetwork.BridgePackets()
 	voicePackets := roomNetwork.VoicePackets()
 	screenPackets := roomNetwork.ScreenPackets()
 	probeTicker := time.NewTicker(discoveryProbeInterval)
@@ -285,12 +247,6 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 				continue
 			}
 			c.handlePacket(packet, mediaPort)
-		case packet, ok := <-bridgePackets:
-			if !ok {
-				bridgePackets = nil
-				continue
-			}
-			c.handlePacket(packet, mediaPort)
 		case packet, ok := <-voicePackets:
 			if !ok {
 				voicePackets = nil
@@ -302,7 +258,9 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 				screenPackets = nil
 				continue
 			}
-			c.handlePacket(packet, mediaPort)
+			if !c.handleScreenPacketBurst(packet, screenPackets, mediaPort) {
+				screenPackets = nil
+			}
 		case <-sendReady:
 			mediaPort.ConsumeSend(c.sendVoiceFrame)
 		case now := <-probeTicker.C:
@@ -338,8 +296,25 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 	}
 }
 
+func (c *Client) handleScreenPacketBurst(first endpoint.Datagram, packets <-chan endpoint.Datagram, mediaPort media.PeerPort) bool {
+	c.handleRoomDatagram(first, mediaPort)
+	defer c.flushScreenVideoForwards()
+	for range maxRealtimeEventsPerTurn - 1 {
+		select {
+		case packet, ok := <-packets:
+			if !ok {
+				return false
+			}
+			c.handleRoomDatagram(packet, mediaPort)
+		default:
+			return true
+		}
+	}
+	return true
+}
+
 func (c *Client) initHelloProbe() error {
-	packet, err := protocol.MarshalHelloProbe(c.roomTag, c.admissionKey, c.localIdentity)
+	packet, err := protocol.MarshalHelloProbe(c.admissionKey, c.localPeerID)
 	if err != nil {
 		return err
 	}
@@ -365,7 +340,7 @@ func (c *Client) StateSnapshot() (ClientSnapshot, networking.RoomSnapshot) {
 
 func (c *Client) EncodedInvite() string { return c.roomInvite.Encode() }
 
-func (c *Client) PeerID() identity.PeerID { return c.localIdentity.PeerID }
+func (c *Client) PeerID() identity.PeerID { return c.localPeerID }
 
 func (c *Client) applyNetworkSnapshot(snapshot networking.RoomSnapshot) {
 	if !slices.Equal(c.networkSnapshot.Endpoint.Candidates, snapshot.Endpoint.Candidates) {
@@ -394,7 +369,7 @@ func (c *Client) publishStateChange() {
 func (c *Client) refreshSnapshotLocked() {
 	c.snapshot = ClientSnapshot{
 		Name:          c.roomInvite.DisplayName,
-		ScreenSharing: c.localScreenState.active,
+		ScreenSharing: c.localScreenState.active(),
 		RemotePeers:   c.remotePeerSnapshots(),
 		Transfers:     c.fileTransferSnapshots(),
 		Connectivity:  c.connectivitySnapshot(),

@@ -45,7 +45,6 @@ const (
 	packetDrop packetClass = iota
 	packetControl
 	packetReliable
-	packetBridge
 	packetVoice
 	packetScreen
 )
@@ -56,7 +55,6 @@ type RealtimeDatagram struct {
 }
 
 type RealtimeBatch struct {
-	Class          protocol.TrafficClass
 	Datagrams      []RealtimeDatagram
 	Deadline       time.Time
 	SendGeneration uint64
@@ -85,7 +83,6 @@ type stunProbeFunc func(context.Context, netip.AddrPort) stunProbeResult
 
 type Endpoint struct {
 	options Options
-	roomTag [16]byte
 	logger  *slog.Logger
 
 	mu       sync.RWMutex
@@ -98,7 +95,6 @@ type Endpoint struct {
 	snapshotChanges       chan struct{}
 	controlPackets        chan Datagram
 	reliablePackets       chan Datagram
-	bridgePackets         chan Datagram
 	voicePackets          chan Datagram
 	screenPackets         chan Datagram
 	voiceBatches          chan RealtimeBatch
@@ -109,19 +105,17 @@ type Endpoint struct {
 	currentSendGeneration uint64
 }
 
-func New(options Options, roomTag [16]byte, logger *slog.Logger) *Endpoint {
+func New(options Options, logger *slog.Logger) *Endpoint {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Endpoint{
 		options:           normalizeOptions(options),
-		roomTag:           roomTag,
 		logger:            logger,
 		pending:           make(map[stunTransaction]pendingSTUN),
 		snapshotChanges:   make(chan struct{}, 1),
 		controlPackets:    make(chan Datagram, maxPeerDatagrams),
 		reliablePackets:   make(chan Datagram, maxPeerDatagrams),
-		bridgePackets:     make(chan Datagram, maxPeerDatagrams),
 		voicePackets:      make(chan Datagram, maxPeerDatagrams),
 		screenPackets:     make(chan Datagram, maxPeerDatagrams),
 		voiceBatches:      make(chan RealtimeBatch, maxVoiceBatches),
@@ -131,29 +125,20 @@ func New(options Options, roomTag [16]byte, logger *slog.Logger) *Endpoint {
 	}
 }
 
-func (e *Endpoint) classifyRoomPacket(packet []byte) packetClass {
-	packetType, roomTag, err := protocol.ParsePrefix(packet)
-	if err != nil || roomTag != e.roomTag || !protocol.ValidPacketSize(packetType, len(packet)) {
+func classifyRoomPacket(packet []byte) packetClass {
+	packetType, err := protocol.ParsePrefix(packet)
+	if err != nil || !protocol.ValidPacketSize(packetType, len(packet)) {
 		return packetDrop
 	}
 	switch packetType {
-	case protocol.PacketRoomDatagram:
-		header, err := protocol.ParseRoomDatagramHeader(packet, e.roomTag)
-		if err != nil {
-			return packetDrop
-		}
-		switch header.Class {
-		case protocol.TrafficVoice:
-			return packetVoice
-		case protocol.TrafficScreenVideo, protocol.TrafficScreenAudio:
-			return packetScreen
-		}
-	case protocol.PacketHello, protocol.PacketPing, protocol.PacketPong, protocol.PacketLeave:
+	case protocol.PacketVoice:
+		return packetVoice
+	case protocol.PacketScreenVideo, protocol.PacketScreenAudio:
+		return packetScreen
+	case protocol.PacketHelloProbe, protocol.PacketSessionHello, protocol.PacketPing, protocol.PacketPong, protocol.PacketBridge, protocol.PacketLeave:
 		return packetControl
-	case protocol.PacketReliable:
+	case protocol.PacketBridgeLowPriority, protocol.PacketReliable:
 		return packetReliable
-	case protocol.PacketBridge:
-		return packetBridge
 	}
 	return packetDrop
 }
@@ -170,7 +155,6 @@ func (e *Endpoint) Snapshot() Snapshot {
 
 func (e *Endpoint) ControlPackets() <-chan Datagram  { return e.controlPackets }
 func (e *Endpoint) ReliablePackets() <-chan Datagram { return e.reliablePackets }
-func (e *Endpoint) BridgePackets() <-chan Datagram   { return e.bridgePackets }
 func (e *Endpoint) VoicePackets() <-chan Datagram    { return e.voicePackets }
 func (e *Endpoint) ScreenPackets() <-chan Datagram   { return e.screenPackets }
 
@@ -238,13 +222,13 @@ func (e *Endpoint) SendRealtimeBatch(batch RealtimeBatch) error {
 		return errors.New("realtime batch deadline has expired")
 	}
 	var batches chan RealtimeBatch
-	switch batch.Class {
-	case protocol.TrafficVoice:
+	switch classifyRoomPacket(batch.Datagrams[0].Data) {
+	case packetVoice:
 		batches = e.voiceBatches
-	case protocol.TrafficScreenVideo, protocol.TrafficScreenAudio:
+	case packetScreen:
 		batches = e.screenBatches
 	default:
-		return errors.New("realtime batch traffic class is invalid")
+		return errors.New("realtime batch packet type is invalid")
 	}
 	totalBytes := 0
 	for _, packet := range batch.Datagrams {
@@ -374,7 +358,6 @@ func (e *Endpoint) Run(ctx context.Context) error {
 	close(e.snapshotChanges)
 	close(e.controlPackets)
 	close(e.reliablePackets)
-	close(e.bridgePackets)
 	close(e.voicePackets)
 	close(e.screenPackets)
 	return runErr
@@ -424,7 +407,7 @@ func (e *Endpoint) readLoop(conn *net.UDPConn) error {
 				continue
 			}
 		}
-		class := e.classifyRoomPacket(buffer[:count])
+		class := classifyRoomPacket(buffer[:count])
 		if class == packetDrop {
 			continue
 		}
@@ -436,8 +419,6 @@ func (e *Endpoint) readLoop(conn *net.UDPConn) error {
 			enqueueFresh(e.controlPackets, packet)
 		case packetReliable:
 			enqueueFresh(e.reliablePackets, packet)
-		case packetBridge:
-			enqueueFresh(e.bridgePackets, packet)
 		case packetVoice:
 			enqueueFresh(e.voicePackets, packet)
 		case packetScreen:
@@ -551,7 +532,11 @@ func (e *Endpoint) writeLoop(ctx context.Context, conn *net.UDPConn) error {
 
 		var err error
 		if selected == voiceLane || selected == screenLane {
-			batch, err = e.writeRealtimeDatagram(ctx, conn, batch)
+			writeBudget := min(maxScreenWriteTime, maxNonAudioWriteTime)
+			if selected == voiceLane {
+				writeBudget = maxVoiceWriteTime
+			}
+			batch, err = e.writeRealtimeDatagram(ctx, conn, batch, writeBudget)
 			if len(batch.Datagrams) > 0 {
 				pendingRealtime[selected] = batch
 			}
@@ -573,20 +558,10 @@ func (e *Endpoint) stopAcceptingWrites(conn *net.UDPConn) {
 	e.mu.Unlock()
 }
 
-func (e *Endpoint) writeRealtimeDatagram(ctx context.Context, conn *net.UDPConn, batch RealtimeBatch) (RealtimeBatch, error) {
+func (e *Endpoint) writeRealtimeDatagram(ctx context.Context, conn *net.UDPConn, batch RealtimeBatch, writeBudget time.Duration) (RealtimeBatch, error) {
 	if len(batch.Datagrams) == 0 {
 		return RealtimeBatch{}, nil
 	}
-	var writeBudget time.Duration
-	switch batch.Class {
-	case protocol.TrafficVoice:
-		writeBudget = maxVoiceWriteTime
-	case protocol.TrafficScreenVideo, protocol.TrafficScreenAudio:
-		writeBudget = min(maxScreenWriteTime, maxNonAudioWriteTime)
-	default:
-		return RealtimeBatch{}, nil
-	}
-
 	e.realtimeMu.Lock()
 	defer e.realtimeMu.Unlock()
 	now := time.Now()

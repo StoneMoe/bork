@@ -16,22 +16,22 @@ func (c *Client) sendLeaves() {
 	defer cancel()
 	for _, direct := range []bool{false, true} {
 		for _, remotePeer := range c.remotePeers {
-			peerSess := remotePeer.activeSession
-			if peerSess == nil || !peerSess.everAuthenticated || peerSess.path.IsDirect() != direct {
+			session := remotePeer.activeSession
+			if session == nil || !session.everAuthenticated || session.path.IsDirect() != direct {
 				continue
 			}
-			c.sendLeave(ctx, remotePeer, peerSess)
+			c.sendLeave(ctx, remotePeer, session)
 		}
 	}
 }
 
-func (c *Client) sendLeave(ctx context.Context, remotePeer *RemotePeer, peerSess *PeeringSession) {
-	sequence, err := peerSess.packetFlow.nextSendSequence()
+func (c *Client) sendLeave(ctx context.Context, remotePeer *RemotePeer, session *Session) {
+	sequence, err := session.packetFlow.nextSendSequence()
 	if err == nil {
 		var packet []byte
-		packet, err = protocol.MarshalControl(protocol.PacketLeave, c.roomTag, peerSess.sessionID, sequence, 0, peerSess.ciphers.ControlSend)
+		packet, err = protocol.MarshalControl(protocol.PacketLeave, session.id(), sequence, 0, session.ciphers.Send)
 		if err == nil {
-			err = c.writeControlOnPath(ctx, peerSess.path, packet)
+			err = c.writeControlOnPath(ctx, session.path, packet)
 		}
 	}
 	if err != nil {
@@ -41,36 +41,36 @@ func (c *Client) sendLeave(ctx context.Context, remotePeer *RemotePeer, peerSess
 
 func (c *Client) handleLeavePacketOnPath(data []byte, path Path) {
 	header, err := protocol.ParseSessionHeader(data)
+	if err != nil || header.Type != protocol.PacketLeave {
+		return
+	}
+	remotePeer, session := c.leaveSessionForHeader(header, path)
+	if session == nil {
+		return
+	}
+	_, err = protocol.ParseControl(data, session.id(), session.ciphers.Receive)
 	if err != nil {
 		return
 	}
-	remotePeer, peerSess := c.leaveSessionForHeader(header, path)
-	if peerSess == nil {
-		return
-	}
-	decoded, err := protocol.ParseControl(data, c.roomTag, peerSess.sessionID, peerSess.ciphers.ControlRecv)
-	if err != nil || decoded.Type != protocol.PacketLeave {
-		return
-	}
-	if !peerSess.packetFlow.commitReceived(header.PacketSequence) {
+	if !session.packetFlow.commitReceived(header.PacketSequence) {
 		return
 	}
 	delete(c.remotePeers, remotePeer.peerID)
-	c.markPeerGraphDirty(peerSess.path.IsDirect())
+	c.markPeerGraphDirty(session.path.IsDirect())
 	c.publishStateChange()
 	c.logger.Info("remote peer left", "count", c.authenticatedRemotePeerCount())
 }
 
-func (c *Client) leaveSessionForHeader(header protocol.SessionHeader, path Path) (*RemotePeer, *PeeringSession) {
-	remotePeer, peerSess, pending := c.sessionForHeader(header, path)
-	if peerSess == nil || pending {
+func (c *Client) leaveSessionForHeader(header protocol.SessionHeader, path Path) (*RemotePeer, *Session) {
+	remotePeer, session, pending := c.sessionForHeader(header, path)
+	if session == nil || pending {
 		return nil, nil
 	}
-	if !peerSess.everAuthenticated || !peerSess.path.SameRoute(path) {
+	if !session.everAuthenticated || !session.path.SameRoute(path) {
 		return nil, nil
 	}
-	if !peerSess.packetFlow.mayReceive(header.PacketSequence) {
+	if !session.packetFlow.mayReceive(header.PacketSequence) {
 		return nil, nil
 	}
-	return remotePeer, peerSess
+	return remotePeer, session
 }

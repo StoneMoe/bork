@@ -13,9 +13,7 @@ import (
 )
 
 const (
-	reliableChannelTopology = 1
-	topologyMessageVersion  = 1
-	topologyRefresh         = 10 * time.Second
+	topologyRefresh = 10 * time.Second
 )
 
 type topologyEntry struct {
@@ -24,38 +22,30 @@ type topologyEntry struct {
 }
 
 type topologyMessage struct {
-	generation    uint64
-	voiceStreamID [16]byte
-	candidates    []netip.AddrPort
-	neighbors     []topologyEntry
+	candidates []netip.AddrPort
+	neighbors  []topologyEntry
 }
 
 func (c *Client) queueTopologySnapshots(now time.Time, force bool) {
-	generation := c.topologyGeneration
+	revision := c.topologyRevision
 	for peerID, peer := range c.remotePeers {
 		activeSession := peer.activeSession
 		if activeSession == nil || !activeSession.authenticated || activeSession.reliable == nil {
 			continue
 		}
-		if !force && activeSession.topologySentGeneration == generation && now.Sub(activeSession.lastTopologyAt) < topologyRefresh {
+		if !force && activeSession.topologySentRevision == revision && now.Sub(activeSession.lastTopologyAt) < topologyRefresh {
 			continue
 		}
-		payload, err := c.marshalTopologyMessage(generation, peerID, activeSession.path.Address())
-		if err != nil || activeSession.reliable.queue(reliableChannelTopology, true, payload) != nil {
+		payload, err := c.marshalTopologyMessage(peerID, activeSession.path.Address())
+		if err != nil || activeSession.reliable.queue(reliableChannelTopology, payload) != nil {
 			continue
 		}
-		activeSession.topologySentGeneration = generation
+		activeSession.topologySentRevision = revision
 		activeSession.lastTopologyAt = now
 	}
 }
 
-func (c *Client) marshalTopologyMessage(generation uint64, recipientID identity.PeerID, recipientAddress netip.AddrPort) ([]byte, error) {
-	if generation == 0 {
-		return nil, errors.New("topology generation is zero")
-	}
-	if c.voiceStreamID == ([16]byte{}) {
-		return nil, errors.New("topology voice stream is zero")
-	}
+func (c *Client) marshalTopologyMessage(recipientID identity.PeerID, recipientAddress netip.AddrPort) ([]byte, error) {
 	candidates := make([]netip.AddrPort, 0, len(c.networkSnapshot.Endpoint.Candidates))
 	for _, candidateType := range []endpoint.CandidateType{endpoint.CandidatePortMapped, endpoint.CandidateSTUN, endpoint.CandidateNIC} {
 		for _, candidate := range c.networkSnapshot.Endpoint.Candidates {
@@ -84,17 +74,15 @@ func (c *Client) marshalTopologyMessage(generation uint64, recipientID identity.
 		}
 		neighbors = append(neighbors, entry)
 	}
-	return encodeTopologyMessage(topologyMessage{generation: generation, voiceStreamID: c.voiceStreamID, candidates: candidates, neighbors: neighbors})
+	return encodeTopologyMessage(topologyMessage{candidates: candidates, neighbors: neighbors})
 }
 
 func encodeTopologyMessage(message topologyMessage) ([]byte, error) {
-	if message.generation == 0 || message.voiceStreamID == ([16]byte{}) || len(message.candidates) > int(^uint16(0)) || uint64(len(message.neighbors)) > uint64(^uint32(0)) {
+	if len(message.candidates) > int(^uint16(0)) {
 		return nil, errors.New("topology message fields are invalid")
 	}
-	payload := make([]byte, 0, 31+len(message.candidates)*19+len(message.neighbors)*52)
-	payload = append(payload, topologyMessageVersion)
-	payload = binary.BigEndian.AppendUint64(payload, message.generation)
-	payload = append(payload, message.voiceStreamID[:]...)
+	peerIDSize := len(identity.PeerID{})
+	payload := make([]byte, 0, 2+len(message.candidates)*19+len(message.neighbors)*(peerIDSize+20))
 	payload = binary.BigEndian.AppendUint16(payload, uint16(len(message.candidates)))
 	for _, address := range message.candidates {
 		var err error
@@ -103,7 +91,6 @@ func encodeTopologyMessage(message topologyMessage) ([]byte, error) {
 			return nil, err
 		}
 	}
-	payload = binary.BigEndian.AppendUint32(payload, uint32(len(message.neighbors)))
 	for _, neighbor := range message.neighbors {
 		if neighbor.peerID.IsZero() || len(neighbor.addresses) > int(^uint16(0)) {
 			return nil, errors.New("topology neighbor is invalid")
@@ -140,19 +127,12 @@ func appendTopologyAddress(payload []byte, address netip.AddrPort) ([]byte, erro
 }
 
 func decodeTopologyMessage(payload []byte) (topologyMessage, error) {
-	if len(payload) < 31 || payload[0] != topologyMessageVersion {
+	if len(payload) < 2 {
 		return topologyMessage{}, errors.New("topology message header is invalid")
 	}
-	message := topologyMessage{generation: binary.BigEndian.Uint64(payload[1:9])}
-	if message.generation == 0 {
-		return topologyMessage{}, errors.New("topology generation is zero")
-	}
-	copy(message.voiceStreamID[:], payload[9:25])
-	if message.voiceStreamID == ([16]byte{}) {
-		return topologyMessage{}, errors.New("topology voice stream is zero")
-	}
-	offset := 27
-	candidateCount := int(binary.BigEndian.Uint16(payload[25:27]))
+	message := topologyMessage{}
+	offset := 2
+	candidateCount := int(binary.BigEndian.Uint16(payload[0:2]))
 	message.candidates = make([]netip.AddrPort, 0, candidateCount)
 	for range candidateCount {
 		address, next, err := parseTopologyAddress(payload, offset)
@@ -162,22 +142,14 @@ func decodeTopologyMessage(payload []byte) (topologyMessage, error) {
 		offset = next
 		message.candidates = append(message.candidates, address)
 	}
-	if len(payload)-offset < 4 {
-		return topologyMessage{}, errors.New("topology neighbor count is truncated")
-	}
-	neighborCount := uint64(binary.BigEndian.Uint32(payload[offset : offset+4]))
-	offset += 4
-	if neighborCount > uint64((len(payload)-offset)/34) {
-		return topologyMessage{}, errors.New("topology neighbor count is invalid")
-	}
-	message.neighbors = make([]topologyEntry, 0, int(neighborCount))
-	for range neighborCount {
-		if len(payload)-offset < 34 {
+	peerIDSize := len(identity.PeerID{})
+	for offset < len(payload) {
+		if len(payload)-offset < peerIDSize+2 {
 			return topologyMessage{}, errors.New("topology neighbor is truncated")
 		}
 		var entry topologyEntry
-		copy(entry.peerID[:], payload[offset:offset+32])
-		offset += 32
+		copy(entry.peerID[:], payload[offset:offset+peerIDSize])
+		offset += peerIDSize
 		if entry.peerID.IsZero() {
 			return topologyMessage{}, errors.New("topology neighbor peer ID is zero")
 		}
@@ -193,9 +165,6 @@ func decodeTopologyMessage(payload []byte) (topologyMessage, error) {
 			entry.addresses = append(entry.addresses, address)
 		}
 		message.neighbors = append(message.neighbors, entry)
-	}
-	if offset != len(payload) {
-		return topologyMessage{}, errors.New("topology message has trailing data")
 	}
 	return message, nil
 }
@@ -234,12 +203,8 @@ func (c *Client) handleTopologySnapshot(sender *RemotePeer, payload []byte) {
 
 func (c *Client) handleTopologySnapshotAt(sender *RemotePeer, payload []byte, now time.Time) {
 	message, err := decodeTopologyMessage(payload)
-	if err != nil || sender == nil || sender.activeSession == nil || message.generation < sender.activeSession.topologyReceivedGeneration {
+	if err != nil || sender == nil || sender.activeSession == nil {
 		return
-	}
-	if message.generation > sender.activeSession.topologyReceivedGeneration {
-		sender.activeSession.topologyReceivedGeneration = message.generation
-		sender.activeSession.voiceStreamID = message.voiceStreamID
 	}
 	c.recordTopologyClaims(sender.peerID, message.neighbors, now)
 	for _, address := range message.candidates {
@@ -248,7 +213,7 @@ func (c *Client) handleTopologySnapshotAt(sender *RemotePeer, payload []byte, no
 		}
 	}
 	for _, entry := range message.neighbors {
-		if entry.peerID == c.localIdentity.PeerID {
+		if entry.peerID == c.localPeerID {
 			continue
 		}
 		for _, address := range entry.addresses {

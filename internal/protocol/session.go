@@ -12,76 +12,78 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-type SessionMaterial struct {
-	SessionID [16]byte
-	Ciphers   SessionCiphers
-}
-
 type SessionCiphers struct {
-	ControlSend cipher.AEAD
-	ControlRecv cipher.AEAD
+	Send    cipher.AEAD
+	Receive cipher.AEAD
 }
 
-func DeriveSession(privateKey *ecdh.PrivateKey, localHello, remoteHello HelloPacket) (SessionMaterial, error) {
-	if privateKey == nil {
-		return SessionMaterial{}, errors.New("local X25519 key is nil")
-	}
-	if localHello.PeerID.IsZero() || remoteHello.PeerID.IsZero() {
-		return SessionMaterial{}, errors.New("session peer ID is invalid")
-	}
-	if localHello.PeerID == remoteHello.PeerID {
-		return SessionMaterial{}, errors.New("session peer IDs are equal")
-	}
-	if localHello.IsProbe() || remoteHello.IsProbe() || localHello.HandshakeID != remoteHello.HandshakeID {
-		return SessionMaterial{}, errors.New("session hello handshake IDs do not match")
-	}
-	if localHello.RoomTag != remoteHello.RoomTag {
-		return SessionMaterial{}, errors.New("session room tags do not match")
-	}
-	if !bytes.Equal(privateKey.PublicKey().Bytes(), localHello.EphemeralKey[:]) {
-		return SessionMaterial{}, errors.New("local X25519 key does not match hello")
-	}
-	remotePublic, err := ecdh.X25519().NewPublicKey(remoteHello.EphemeralKey[:])
+func DeriveSession(privateKey *ecdh.PrivateKey, localHello, remoteHello SessionHello) (SessionCiphers, error) {
+	remotePublic, err := validateSessionInputs(privateKey, localHello, remoteHello)
 	if err != nil {
-		return SessionMaterial{}, fmt.Errorf("parse remote X25519 key: %w", err)
+		return SessionCiphers{}, err
 	}
 	sharedSecret, err := privateKey.ECDH(remotePublic)
 	if err != nil {
-		return SessionMaterial{}, fmt.Errorf("derive X25519 secret: %w", err)
+		return SessionCiphers{}, fmt.Errorf("derive X25519 secret: %w", err)
 	}
 
+	transcriptHash, localFirst := sessionTranscript(localHello, remoteHello)
+
+	packetsAB, err := deriveSessionCipher(sharedSecret, transcriptHash, wireDomain+"chacha20poly1305/session-packets/a-to-b")
+	if err != nil {
+		return SessionCiphers{}, err
+	}
+	packetsBA, err := deriveSessionCipher(sharedSecret, transcriptHash, wireDomain+"chacha20poly1305/session-packets/b-to-a")
+	if err != nil {
+		return SessionCiphers{}, err
+	}
+	if localFirst {
+		return SessionCiphers{Send: packetsAB, Receive: packetsBA}, nil
+	}
+	return SessionCiphers{Send: packetsBA, Receive: packetsAB}, nil
+}
+
+func validateSessionInputs(privateKey *ecdh.PrivateKey, localHello, remoteHello SessionHello) (*ecdh.PublicKey, error) {
+	if privateKey == nil {
+		return nil, errors.New("local X25519 key is nil")
+	}
+	if !validSessionPeers(localHello, remoteHello) {
+		return nil, errors.New("session peer IDs are invalid")
+	}
+	if !validSessionIDPair(localHello.SessionID, remoteHello.SessionID) {
+		return nil, errors.New("session hello session IDs do not match")
+	}
+	if !bytes.Equal(privateKey.PublicKey().Bytes(), localHello.EphemeralKey[:]) {
+		return nil, errors.New("local X25519 key does not match hello")
+	}
+	remotePublic, err := ecdh.X25519().NewPublicKey(remoteHello.EphemeralKey[:])
+	if err != nil {
+		return nil, fmt.Errorf("parse remote X25519 key: %w", err)
+	}
+	return remotePublic, nil
+}
+
+func validSessionPeers(localHello, remoteHello SessionHello) bool {
+	return !localHello.PeerID.IsZero() && !remoteHello.PeerID.IsZero() && localHello.PeerID != remoteHello.PeerID
+}
+
+func validSessionIDPair(local, remote [16]byte) bool {
+	return local != ([16]byte{}) && local == remote
+}
+
+func sessionTranscript(localHello, remoteHello SessionHello) ([32]byte, bool) {
 	first, second := localHello, remoteHello
 	localFirst := bytes.Compare(localHello.PeerID[:], remoteHello.PeerID[:]) < 0
 	if !localFirst {
 		first, second = second, first
 	}
 	hash := sha256.New()
-	_, _ = hash.Write([]byte(wireDomain + "handshake-transcript\x00"))
+	_, _ = hash.Write([]byte(wireDomain + "session-transcript\x00"))
 	_, _ = hash.Write(first.wire[:])
 	_, _ = hash.Write(second.wire[:])
 	var transcriptHash [32]byte
 	copy(transcriptHash[:], hash.Sum(nil))
-
-	sessionID, err := hkdf.Key(sha256.New, sharedSecret, transcriptHash[:], wireDomain+"session-id", 16)
-	if err != nil {
-		return SessionMaterial{}, err
-	}
-	var material SessionMaterial
-	copy(material.SessionID[:], sessionID)
-	controlAB, err := deriveSessionCipher(sharedSecret, transcriptHash, wireDomain+"chacha20poly1305/control/a-to-b")
-	if err != nil {
-		return SessionMaterial{}, err
-	}
-	controlBA, err := deriveSessionCipher(sharedSecret, transcriptHash, wireDomain+"chacha20poly1305/control/b-to-a")
-	if err != nil {
-		return SessionMaterial{}, err
-	}
-	if localFirst {
-		material.Ciphers = SessionCiphers{ControlSend: controlAB, ControlRecv: controlBA}
-	} else {
-		material.Ciphers = SessionCiphers{ControlSend: controlBA, ControlRecv: controlAB}
-	}
-	return material, nil
+	return transcriptHash, localFirst
 }
 
 func deriveSessionCipher(sharedSecret []byte, transcriptHash [32]byte, info string) (cipher.AEAD, error) {

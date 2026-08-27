@@ -38,21 +38,21 @@ func TestHandleLeaveRemovesPeerDuringReconnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	sessionID := [16]byte{2}
-	client.remotePeers[remoteIdentity.PeerID] = &RemotePeer{
-		peerID: remoteIdentity.PeerID,
-		activeSession: &PeeringSession{
-			path: path, sessionID: sessionID, everAuthenticated: true,
-			ciphers: protocol.SessionCiphers{ControlSend: protector, ControlRecv: protector},
+	client.remotePeers[remoteIdentity] = &RemotePeer{
+		peerID: remoteIdentity,
+		activeSession: &Session{
+			path: path, localHello: protocol.SessionHello{SessionID: sessionID}, everAuthenticated: true,
+			ciphers: protocol.SessionCiphers{Send: protector, Receive: protector},
 		},
 	}
-	packet, err := protocol.MarshalControl(protocol.PacketLeave, client.roomTag, sessionID, 1, 0, protector)
+	packet, err := protocol.MarshalControl(protocol.PacketLeave, sessionID, 1, 0, protector)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	client.handleLeavePacketOnPath(packet, path)
 
-	if _, exists := client.remotePeers[remoteIdentity.PeerID]; exists {
+	if _, exists := client.remotePeers[remoteIdentity]; exists {
 		t.Fatal("authenticated Leave did not remove the remote peer")
 	}
 	select {

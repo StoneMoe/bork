@@ -167,13 +167,12 @@ export default function Room(props: RoomProps) {
 
   const removeScreenListener = EventsOn("bork:screen-video-chunk", (chunk: ScreenVideoChunkEvent) => {
     if (!validScreenVideoChunkEvent(chunk)) return;
-    const peer = remotePeers().find((candidate) => candidate.peerId === chunk.peerId && candidate.sessionId === chunk.sessionId);
-    const currentStream = peer?.screenSharing && peer.screenGeneration === chunk.generation && peer.screenStreamId === chunk.streamId;
+    const peer = remotePeers().find((candidate) => candidate.peerId === chunk.peerId);
+    const currentStream = peer?.screenSharing && peer.screenStreamId === chunk.streamId;
     if (!currentStream) {
-      if (peer?.screenSharing && chunk.generation <= peer.screenGeneration) return;
       if (chunk.keyFrame) {
         if (pendingScreenKeyframes.size >= 64) pendingScreenKeyframes.delete(pendingScreenKeyframes.keys().next().value!);
-        pendingScreenKeyframes.set(`${chunk.peerId}:${chunk.sessionId}`, chunk);
+        pendingScreenKeyframes.set(`${chunk.peerId}:${chunk.streamId}`, chunk);
       }
       return;
     }
@@ -199,7 +198,7 @@ export default function Room(props: RoomProps) {
     const sharerIDs = screenSharerIDs();
     if (!sharerIDs.includes(selectedSharer())) selectSharer(sharerIDs[0] || "");
     const selected = sharers.find((peer) => peer.peerId === selectedSharer());
-    const streamIdentity = selected ? `${selected.peerId}:${selected.sessionId}:${selected.screenGeneration}:${selected.screenStreamId}` : "";
+    const streamIdentity = selected ? `${selected.peerId}:${selected.screenStreamId}` : "";
     if (streamIdentity !== selectedStreamIdentity) {
       // A replacement stream from the selected peer keeps the old canvas until
       // its new decoder produces a frame. A peer switch still clears the view.
@@ -209,11 +208,7 @@ export default function Room(props: RoomProps) {
     }
     for (const [key, chunk] of pendingScreenKeyframes) {
       const current = remotePeers().find((peer) => peer.peerId === chunk.peerId);
-      if (current && current.sessionId !== chunk.sessionId) {
-        pendingScreenKeyframes.delete(key);
-        continue;
-      }
-      if (!current?.screenSharing || current.screenGeneration !== chunk.generation || current.screenStreamId !== chunk.streamId) continue;
+      if (!current?.screenSharing || current.screenStreamId !== chunk.streamId) continue;
       pendingScreenKeyframes.delete(key);
       if (!selectedSharer()) selectSharer(chunk.peerId);
       if (selectedSharer() === chunk.peerId) void receiveScreenVideoChunk(chunk);
@@ -551,7 +546,7 @@ export default function Room(props: RoomProps) {
   }
 
   async function receiveScreenVideoChunk(chunk: ScreenVideoChunkEvent) {
-    const identity = `${chunk.peerId}:${chunk.sessionId}:${chunk.generation}:${chunk.streamId}:${chunk.codec}:${chunk.width}x${chunk.height}`;
+    const identity = `${chunk.peerId}:${chunk.streamId}:${chunk.codec}:${chunk.width}x${chunk.height}`;
     if (identity !== remoteVideoIdentity) {
       const preserveFrame = Boolean(remoteVideoIdentity) && selectedSharer() === chunk.peerId;
       resetRemoteScreenVideo(!preserveFrame);
@@ -848,8 +843,6 @@ interface LocalScreenVideoChunkEvent extends EncodedScreenVideo {
 
 interface ScreenVideoChunkEvent extends EncodedScreenVideo {
   peerId: string;
-  sessionId: string;
-  generation: number;
   streamId: string;
   chunkId: number;
 }
@@ -894,8 +887,6 @@ function validScreenVideoChunkEvent(value: unknown): value is ScreenVideoChunkEv
   if (!value || typeof value !== "object") return false;
   const chunk = value as Partial<ScreenVideoChunkEvent>;
   return typeof chunk.peerId === "string" && chunk.peerId.length > 0
-    && typeof chunk.sessionId === "string" && /^[0-9a-f]{32}$/.test(chunk.sessionId)
-    && Number.isSafeInteger(chunk.generation) && Number(chunk.generation) > 0
     && typeof chunk.streamId === "string" && /^[0-9a-f]{32}$/.test(chunk.streamId)
     && Number.isInteger(chunk.chunkId) && Number(chunk.chunkId) > 0 && Number(chunk.chunkId) <= 0xffffffff
     && validEncodedScreenVideo(chunk);

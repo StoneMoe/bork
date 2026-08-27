@@ -13,7 +13,7 @@ func TestPeerIDTextAndJSONRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if parsed != peerID {
-		t.Fatal("peer ID text did not preserve the public key")
+		t.Fatal("peer ID text did not preserve the ID")
 	}
 
 	encoded, err := json.Marshal(peerID)
@@ -25,6 +25,6 @@ func TestPeerIDTextAndJSONRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if decoded != peerID {
-		t.Fatal("peer ID JSON did not preserve the public key")
+		t.Fatal("peer ID JSON did not preserve the ID")
 	}
 }
