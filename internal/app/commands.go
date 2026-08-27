@@ -268,7 +268,12 @@ func (a *App) StartScreenShare(sourceID string) (uint32, error) {
 	if room.screenVideo != nil {
 		return 0, errors.New("screen sharing is already active")
 	}
-	capture, err := screenshare.StartVideoCapture(sourceID, peer.MaxScreenVideoChunkBytes)
+	capture, err := screenshare.StartVideoCapture(
+		sourceID,
+		peer.MaxScreenVideoChunkBytes,
+		peer.MaxScreenVideoWidth,
+		peer.MaxScreenVideoHeight,
+	)
 	if err != nil {
 		return 0, err
 	}

@@ -7,7 +7,7 @@ import { nativePopoverOpen, nativePopoverSupported } from "./popover";
 import type { IssueInput } from "./issues";
 import type { ActionProps, AppState, FriendlyStatus, PushToTalkPreference } from "./types";
 
-const screenVideoCodecs = ["avc1.42E01F", "avc1.4D401F"] as const;
+const screenVideoCodecs = ["avc1.42E032", "avc1.4D4032"] as const;
 const maxScreenVideoChunkBytes = 256 * 1024;
 const screenVideoCanvasOptions: CanvasRenderingContext2DSettings = { alpha: false, colorSpace: "srgb" };
 // Native capture produces SDR H.264. Tell WebCodecs not to infer HDR metadata
@@ -95,10 +95,17 @@ export default function Room(props: RoomProps) {
   let sourceDialog: HTMLDialogElement | undefined;
   let localCanvas: HTMLCanvasElement | undefined;
   let localDecoder: VideoDecoder | undefined;
+  // Decoder output is asynchronous, so callbacks read the newest display size
+  // instead of keeping the dimensions from their first chunk.
+  let localDisplayWidth = 0;
+  let localDisplayHeight = 0;
+  let localVideoIdentity = "";
   let localNeedsKeyframe = true;
   let pendingEndedCaptureID = 0;
   let remoteCanvas: HTMLCanvasElement | undefined;
   let remoteDecoder: VideoDecoder | undefined;
+  let remoteDisplayWidth = 0;
+  let remoteDisplayHeight = 0;
   let remoteDecoderSetup: Promise<void> | undefined;
   let remoteVideoIdentity = "";
   let selectedStreamIdentity = "";
@@ -194,8 +201,11 @@ export default function Room(props: RoomProps) {
     const selected = sharers.find((peer) => peer.peerId === selectedSharer());
     const streamIdentity = selected ? `${selected.peerId}:${selected.sessionId}:${selected.screenGeneration}:${selected.screenStreamId}` : "";
     if (streamIdentity !== selectedStreamIdentity) {
+      // A replacement stream from the selected peer keeps the old canvas until
+      // its new decoder produces a frame. A peer switch still clears the view.
+      const preserveFrame = Boolean(selected && remoteVideoIdentity);
       selectedStreamIdentity = streamIdentity;
-      resetRemoteScreenVideo();
+      resetRemoteScreenVideo(!preserveFrame);
     }
     for (const [key, chunk] of pendingScreenKeyframes) {
       const current = remotePeers().find((peer) => peer.peerId === chunk.peerId);
@@ -478,14 +488,22 @@ export default function Room(props: RoomProps) {
   }
 
   function receiveLocalScreenVideoChunk(chunk: LocalScreenVideoChunkEvent) {
-    setScreenAspectRatio(chunk.width / chunk.height);
+    const identity = `${chunk.captureId}:${chunk.codec}:${chunk.width}x${chunk.height}`;
+    if (identity !== localVideoIdentity) {
+      // WebCodecs needs a new decoder configuration, but the canvas can keep
+      // showing the last frame while the replacement waits for a keyframe.
+      resetLocalScreenVideo(false);
+      localVideoIdentity = identity;
+    }
+    localDisplayWidth = chunk.displayWidth;
+    localDisplayHeight = chunk.displayHeight;
     if (localNeedsKeyframe && !chunk.keyFrame) return;
     try {
       let decoder = localDecoder;
       if (!decoder) {
         if (typeof VideoDecoder !== "function" || typeof EncodedVideoChunk !== "function") return;
         decoder = new VideoDecoder({
-          output: (frame) => renderLocalVideoFrame(frame, chunk.captureId, chunk.width, chunk.height),
+          output: (frame) => renderLocalVideoFrame(frame, chunk.captureId),
           error: () => resetLocalScreenVideo(false),
         });
         decoder.configure(screenVideoDecoderConfig(chunk));
@@ -503,10 +521,11 @@ export default function Room(props: RoomProps) {
     }
   }
 
-  function renderLocalVideoFrame(frame: VideoFrame, captureID: number, width: number, height: number) {
+  function renderLocalVideoFrame(frame: VideoFrame, captureID: number) {
     try {
-      if (captureID !== currentCaptureID() || !localCanvas) return;
-      drawScreenVideoFrame(frame, localCanvas, width, height);
+      if (captureID !== currentCaptureID() || !selectedLocalScreen() || !localCanvas) return;
+      drawScreenVideoFrame(frame, localCanvas, localDisplayWidth, localDisplayHeight);
+      setScreenAspectRatio(localDisplayWidth / localDisplayHeight);
       setLocalVideoReady(true);
     } catch {
       resetLocalScreenVideo(false);
@@ -523,19 +542,24 @@ export default function Room(props: RoomProps) {
     }
     localNeedsKeyframe = true;
     if (!clearFrame) return;
+    localVideoIdentity = "";
+    localDisplayWidth = 0;
+    localDisplayHeight = 0;
     setLocalVideoReady(false);
     const context = localCanvas?.getContext("2d");
     if (context && localCanvas) context.clearRect(0, 0, localCanvas.width, localCanvas.height);
   }
 
   async function receiveScreenVideoChunk(chunk: ScreenVideoChunkEvent) {
-    setScreenAspectRatio(chunk.width / chunk.height);
     const identity = `${chunk.peerId}:${chunk.sessionId}:${chunk.generation}:${chunk.streamId}:${chunk.codec}:${chunk.width}x${chunk.height}`;
     if (identity !== remoteVideoIdentity) {
-      resetRemoteScreenVideo();
+      const preserveFrame = Boolean(remoteVideoIdentity) && selectedSharer() === chunk.peerId;
+      resetRemoteScreenVideo(!preserveFrame);
       remoteVideoIdentity = identity;
     }
     if (remoteLastChunkID && chunk.chunkId !== remoteLastChunkID + 1) resetRemoteScreenVideo(false);
+    remoteDisplayWidth = chunk.displayWidth;
+    remoteDisplayHeight = chunk.displayHeight;
     remoteLastChunkID = chunk.chunkId;
     if (remoteNeedsKeyframe && !chunk.keyFrame) return;
     let encodedChunk: EncodedVideoChunk;
@@ -580,7 +604,7 @@ export default function Room(props: RoomProps) {
         if (!support.supported) throw new Error("当前系统暂不支持播放此屏幕分享");
         if (run !== remoteVideoRun || identity !== remoteVideoIdentity) return;
         const decoder = new VideoDecoder({
-          output: (frame) => renderRemoteVideoFrame(frame, chunk, identity, run),
+          output: (frame) => renderRemoteVideoFrame(frame, chunk.peerId, identity, run),
           error: (cause) => {
             if (run !== remoteVideoRun || identity !== remoteVideoIdentity) return;
             reportScreenError(new Error(`屏幕视频解码失败: ${cause.message}`));
@@ -603,12 +627,13 @@ export default function Room(props: RoomProps) {
     }
   }
 
-  function renderRemoteVideoFrame(frame: VideoFrame, chunk: ScreenVideoChunkEvent, identity: string, run: number) {
+  function renderRemoteVideoFrame(frame: VideoFrame, peerID: string, identity: string, run: number) {
     try {
-      if (run !== remoteVideoRun || identity !== remoteVideoIdentity || selectedSharer() !== chunk.peerId) return;
+      if (run !== remoteVideoRun || identity !== remoteVideoIdentity || selectedSharer() !== peerID) return;
       const canvas = remoteCanvas;
       if (!canvas) throw new Error("当前 WebView 无法渲染屏幕视频");
-      drawScreenVideoFrame(frame, canvas, chunk.width, chunk.height);
+      drawScreenVideoFrame(frame, canvas, remoteDisplayWidth, remoteDisplayHeight);
+      setScreenAspectRatio(remoteDisplayWidth / remoteDisplayHeight);
       setRemoteVideoReady(true);
       setRemoteVideoRecovering(false);
     } catch (cause) {
@@ -640,6 +665,8 @@ export default function Room(props: RoomProps) {
     remoteLastChunkID = 0;
     setRemoteVideoRecovering(preserveFrame);
     if (!preserveFrame) {
+      remoteDisplayWidth = 0;
+      remoteDisplayHeight = 0;
       setRemoteVideoReady(false);
       const context = remoteCanvas?.getContext("2d");
       if (context && remoteCanvas) context.clearRect(0, 0, remoteCanvas.width, remoteCanvas.height);
@@ -846,17 +873,21 @@ function encodedScreenVideoChunk(chunk: EncodedScreenVideo): EncodedVideoChunk {
   });
 }
 
-function drawScreenVideoFrame(frame: VideoFrame, canvas: HTMLCanvasElement, width: number, height: number) {
-  if (frame.displayWidth <= 0 || frame.displayHeight <= 0 || frame.displayWidth > 1280 || frame.displayHeight > 720) {
+function drawScreenVideoFrame(frame: VideoFrame, canvas: HTMLCanvasElement, displayWidth: number, displayHeight: number) {
+  if (frame.displayWidth <= 0 || frame.displayHeight <= 0 || frame.displayWidth > 2560 || frame.displayHeight > 1440) {
     throw new Error("屏幕视频帧尺寸无效");
   }
+  if (displayWidth > frame.displayWidth || displayHeight > frame.displayHeight) throw new Error("屏幕视频显示尺寸无效");
   const context = canvas.getContext("2d", screenVideoCanvasOptions);
   if (!context) throw new Error("当前 WebView 无法渲染屏幕视频");
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
+  if (canvas.width !== displayWidth || canvas.height !== displayHeight) {
+    canvas.width = displayWidth;
+    canvas.height = displayHeight;
   }
-  context.drawImage(frame, 0, 0, width, height);
+  // Match the native XVP destination rectangle's centered, even offsets.
+  const sourceX = Math.floor((frame.displayWidth - displayWidth) / 2) & ~1;
+  const sourceY = Math.floor((frame.displayHeight - displayHeight) / 2) & ~1;
+  context.drawImage(frame, sourceX, sourceY, displayWidth, displayHeight, 0, 0, displayWidth, displayHeight);
 }
 
 function validScreenVideoChunkEvent(value: unknown): value is ScreenVideoChunkEvent {
@@ -874,6 +905,8 @@ interface EncodedScreenVideo {
   codec: string;
   width: number;
   height: number;
+  displayWidth: number;
+  displayHeight: number;
   timestamp: number;
   duration: number;
   keyFrame: boolean;
@@ -882,8 +915,10 @@ interface EncodedScreenVideo {
 
 function validEncodedScreenVideo(chunk: Partial<EncodedScreenVideo>): chunk is EncodedScreenVideo {
   return typeof chunk.codec === "string" && (screenVideoCodecs as readonly string[]).includes(chunk.codec)
-    && Number.isInteger(chunk.width) && Number(chunk.width) >= 2 && Number(chunk.width) <= 1280 && Number(chunk.width) % 2 === 0
-    && Number.isInteger(chunk.height) && Number(chunk.height) >= 2 && Number(chunk.height) <= 720 && Number(chunk.height) % 2 === 0
+    && Number.isInteger(chunk.width) && Number(chunk.width) >= 2 && Number(chunk.width) <= 2560 && Number(chunk.width) % 2 === 0
+    && Number.isInteger(chunk.height) && Number(chunk.height) >= 2 && Number(chunk.height) <= 1440 && Number(chunk.height) % 2 === 0
+    && Number.isInteger(chunk.displayWidth) && Number(chunk.displayWidth) >= 2 && Number(chunk.displayWidth) <= Number(chunk.width) && Number(chunk.displayWidth) % 2 === 0
+    && Number.isInteger(chunk.displayHeight) && Number(chunk.displayHeight) >= 2 && Number(chunk.displayHeight) <= Number(chunk.height) && Number(chunk.displayHeight) % 2 === 0
     && Number.isSafeInteger(chunk.timestamp) && Number(chunk.timestamp) >= 0
     && Number.isInteger(chunk.duration) && Number(chunk.duration) > 0 && Number(chunk.duration) <= 1_000_000
     && Number(chunk.timestamp) + Number(chunk.duration) <= Number.MAX_SAFE_INTEGER

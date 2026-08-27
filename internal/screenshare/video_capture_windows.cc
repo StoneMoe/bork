@@ -68,6 +68,11 @@ struct BorkGraphicsCaptureSession : IInspectable {
     virtual HRESULT STDMETHODCALLTYPE StartCapture() = 0;
 };
 
+struct BorkGraphicsCaptureSession5 : IInspectable {
+    virtual HRESULT STDMETHODCALLTYPE get_MinUpdateInterval(BorkTimeSpan *) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_MinUpdateInterval(BorkTimeSpan) = 0;
+};
+
 struct BorkDirect3D11CaptureFramePool : IInspectable {
     virtual HRESULT STDMETHODCALLTYPE Recreate(
         IInspectable *, INT32, INT32, BorkSizeInt32) = 0;
@@ -117,6 +122,8 @@ static const GUID bork_iid_capture_item_interop = {
     0x3628e81b, 0x3cac, 0x4c60, {0xb7, 0xf4, 0x23, 0xce, 0x0e, 0x0c, 0x33, 0x56}};
 static const GUID bork_iid_frame_pool_statics = {
     0x589b103f, 0x6bbc, 0x5df5, {0xa9, 0x91, 0x02, 0xe2, 0x8b, 0x3b, 0x66, 0xd5}};
+static const GUID bork_iid_capture_session5 = {
+    0x67c0ea62, 0x1f85, 0x5061, {0x92, 0x5a, 0x23, 0x9b, 0xe0, 0xac, 0x09, 0xcb}};
 static const GUID bork_iid_frame_handler = {
     0x51a947f7, 0x79cf, 0x5a3e, {0xa3, 0xa5, 0x12, 0x89, 0xcf, 0xa6, 0xdf, 0xe8}};
 static const GUID bork_iid_closed_handler = {
@@ -144,12 +151,39 @@ static const GUID bork_xvp_disable_frc = {
     0x2c0afa19, 0x7a97, 0x4d5a, {0x9e, 0xe8, 0x16, 0xd4, 0xfc, 0x51, 0x8d, 0x8c}};
 
 static constexpr INT32 bork_pixel_format_fp16 = 10;
-static constexpr UINT32 bork_frame_rate = 15;
-static constexpr UINT32 bork_frame_duration_us = 66667;
-static constexpr LONGLONG bork_frame_duration_hns = 666667;
+static constexpr UINT32 bork_frame_rate = 30;
+static constexpr UINT32 bork_frame_duration_us = 1000000 / bork_frame_rate;
+static constexpr LONGLONG bork_frame_duration_hns = 10000000 / bork_frame_rate;
 static constexpr LONGLONG bork_key_frame_interval_hns = 20000000;
-static constexpr UINT32 bork_video_bitrate = 3000000;
+static constexpr UINT32 bork_min_video_bitrate = 3000000;
+static constexpr UINT32 bork_max_video_bitrate = 8000000;
+static constexpr UINT64 bork_min_video_pixels = 1280ULL * 720;
+static constexpr UINT64 bork_max_video_pixels = 2560ULL * 1440;
 static constexpr UINT32 bork_output_luminance_nits = 80;
+
+static constexpr UINT32 bork_video_bitrate(UINT32 width, UINT32 height) {
+    UINT64 pixels = static_cast<UINT64>(width) * height;
+    if (pixels <= bork_min_video_pixels) return bork_min_video_bitrate;
+    if (pixels >= bork_max_video_pixels) return bork_max_video_bitrate;
+    return bork_min_video_bitrate + static_cast<UINT32>(
+        (pixels - bork_min_video_pixels) *
+        (bork_max_video_bitrate - bork_min_video_bitrate) /
+        (bork_max_video_pixels - bork_min_video_pixels));
+}
+
+static_assert(bork_video_bitrate(1280, 720) == 3000000);
+static_assert(bork_video_bitrate(2560, 1440) == 8000000);
+
+static constexpr bool bork_screen_promotion_worthwhile(
+    UINT32 current, UINT32 expanded) {
+    // Promotion lasts for the rest of the share. Ignore small resizes that are
+    // cheaper to scale inside the current coded frame.
+    return static_cast<UINT64>(expanded) * 5 >=
+        static_cast<UINT64>(current) * 6;
+}
+
+static_assert(!bork_screen_promotion_worthwhile(800, 802));
+static_assert(bork_screen_promotion_worthwhile(800, 960));
 
 template <typename T>
 static void bork_release(T *&value) {
@@ -172,6 +206,21 @@ static void bork_shutdown_transform(IMFTransform *transform) {
 static HRESULT bork_hresult_from_last_error() {
     DWORD error = GetLastError();
     return HRESULT_FROM_WIN32(error == ERROR_SUCCESS ? ERROR_INVALID_FUNCTION : error);
+}
+
+static HRESULT bork_set_capture_frame_interval(
+    BorkGraphicsCaptureSession *session) {
+    BorkGraphicsCaptureSession5 *session5 = nullptr;
+    HRESULT result = session->QueryInterface(
+        bork_iid_capture_session5, reinterpret_cast<void **>(&session5));
+    // Windows before build 26100 has no upstream frame-rate control. Keep the
+    // existing timestamp filter as the compatible fallback on those systems.
+    if (result == E_NOINTERFACE) return S_OK;
+    if (SUCCEEDED(result)) {
+        result = session5->put_MinUpdateInterval({bork_frame_duration_hns});
+    }
+    bork_release(session5);
+    return result;
 }
 
 static HRESULT bork_set_common_video_type(
@@ -297,7 +346,8 @@ class BorkScreenVideoCapture {
 public:
     HRESULT Initialize(
         int32_t source_kind, uintptr_t source_handle,
-        uint32_t max_frame_bytes, bork_screen_video_info *info);
+        uint32_t max_frame_bytes, uint32_t max_width, uint32_t max_height,
+        bool full_output, bork_screen_video_info *info);
     HRESULT Read(bork_screen_video_frame *frame);
     HRESULT ForceKeyFrame();
     HRESULT Stop();
@@ -337,6 +387,7 @@ private:
     void ReleaseFrame(BorkNativeFrame *frame);
     HRESULT RefreshVideoInput(BorkSizeInt32 size, bool recreate_frame_pool);
     bool VideoInputChanged(const BorkNativeFrame *frame, bool *resized) const;
+    bool ShouldPromote(BorkSizeInt32 size) const;
     bool ShouldEncode(INT64 time_hns);
 
     HRESULT PumpOnce(bork_screen_video_frame *output, bool *produced);
@@ -353,8 +404,11 @@ private:
 
     HMONITOR CurrentMonitor() const;
     UINT32 MonitorLuminance(HMONITOR monitor) const;
-    static void FitOutput(BorkSizeInt32 input, UINT32 *width, UINT32 *height);
-    RECT AspectFitRectangle(BorkSizeInt32 input) const;
+    static void FitOutput(
+        BorkSizeInt32 input, UINT32 max_width, UINT32 max_height,
+        UINT32 *width, UINT32 *height);
+    static RECT AspectFitRectangle(
+        BorkSizeInt32 input, UINT32 output_width, UINT32 output_height);
 
     bool ro_initialized_ = false;
     bool mf_started_ = false;
@@ -393,7 +447,12 @@ private:
 
     UINT32 output_width_ = 0;
     UINT32 output_height_ = 0;
+    UINT32 max_output_width_ = 0;
+    UINT32 max_output_height_ = 0;
+    UINT32 display_width_ = 0;
+    UINT32 display_height_ = 0;
     UINT32 max_frame_bytes_ = 0;
+    bool full_output_ = false;
     std::atomic<bool> force_key_frame_{true};
     INT64 next_key_frame_hns_ = 0;
     INT64 first_time_hns_ = -1;
@@ -494,7 +553,14 @@ HRESULT BorkScreenVideoCapture::InitializeCaptureItem(
     if (input_size_.Width < 2 || input_size_.Height < 2) return E_INVALIDARG;
     source_kind_ = source_kind;
     source_handle_ = source_handle;
-    FitOutput(input_size_, &output_width_, &output_height_);
+    if (full_output_) {
+        output_width_ = max_output_width_;
+        output_height_ = max_output_height_;
+    } else {
+        FitOutput(
+            input_size_, max_output_width_, max_output_height_,
+            &output_width_, &output_height_);
+    }
     return S_OK;
 }
 
@@ -603,8 +669,6 @@ HRESULT BorkScreenVideoCapture::InitializeVideoProcessor() {
         MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
     if (SUCCEEDED(result)) result = output->SetUINT32(
         MF_MT_VIDEO_CHROMA_SITING, MFVideoChromaSubsampling_MPEG2);
-    if (SUCCEEDED(result)) result = output->SetUINT32(
-        MF_SA_D3D11_BINDFLAGS, D3D11_BIND_VIDEO_ENCODER);
     if (SUCCEEDED(result)) result = video_processor_->SetOutputType(0, output, 0);
     bork_release(output);
     if (FAILED(result)) return result;
@@ -612,53 +676,94 @@ HRESULT BorkScreenVideoCapture::InitializeVideoProcessor() {
 }
 
 void BorkScreenVideoCapture::FitOutput(
-    BorkSizeInt32 input, UINT32 *width, UINT32 *height) {
-    UINT32 source_width = static_cast<UINT32>(input.Width);
-    UINT32 source_height = static_cast<UINT32>(input.Height);
-    UINT64 scaled_width = static_cast<UINT64>(source_width) * 720;
-    UINT64 scaled_height = static_cast<UINT64>(source_height) * 1280;
-    if (source_width > 1280 || source_height > 720) {
+    BorkSizeInt32 input, UINT32 max_width, UINT32 max_height,
+    UINT32 *width, UINT32 *height) {
+    UINT32 source_width = static_cast<UINT32>(input.Width) & ~1U;
+    UINT32 source_height = static_cast<UINT32>(input.Height) & ~1U;
+    if (source_width > max_width || source_height > max_height) {
+        UINT64 scaled_width = static_cast<UINT64>(source_width) * max_height;
+        UINT64 scaled_height = static_cast<UINT64>(source_height) * max_width;
         if (scaled_width <= scaled_height) {
-            source_width = static_cast<UINT32>(scaled_width / source_height);
-            source_height = 720;
+            source_width = static_cast<UINT32>(scaled_width / source_height) & ~1U;
+            source_height = max_height;
         } else {
-            source_height = static_cast<UINT32>(scaled_height / source_width);
-            source_width = 1280;
+            source_height = static_cast<UINT32>(scaled_height / source_width) & ~1U;
+            source_width = max_width;
         }
     }
-    *width = source_width & ~1U;
-    *height = source_height & ~1U;
+    *width = source_width;
+    *height = source_height;
     if (*width < 2) *width = 2;
     if (*height < 2) *height = 2;
 }
 
-RECT BorkScreenVideoCapture::AspectFitRectangle(BorkSizeInt32 input) const {
-    UINT32 width = output_width_;
-    UINT32 height = output_height_;
+RECT BorkScreenVideoCapture::AspectFitRectangle(
+    BorkSizeInt32 input, UINT32 output_width, UINT32 output_height) {
     UINT64 input_width = static_cast<UINT32>(input.Width);
     UINT64 input_height = static_cast<UINT32>(input.Height);
-    if (input_width * output_height_ > static_cast<UINT64>(output_width_) * input_height) {
-        height = static_cast<UINT32>(input_height * output_width_ / input_width);
-    } else {
-        width = static_cast<UINT32>(input_width * output_height_ / input_height);
+    UINT32 width = static_cast<UINT32>(input_width);
+    UINT32 height = static_cast<UINT32>(input_height);
+    // Keep small windows at native size. The decoded canvas performs the only
+    // enlargement needed for the viewer's chosen preview size.
+    if (input_width > output_width || input_height > output_height) {
+        width = output_width;
+        height = output_height;
+        if (input_width * output_height > static_cast<UINT64>(output_width) * input_height) {
+            height = static_cast<UINT32>(input_height * output_width / input_width);
+        } else {
+            width = static_cast<UINT32>(input_width * output_height / input_height);
+        }
     }
     width &= ~1U;
     height &= ~1U;
     if (width < 2) width = 2;
     if (height < 2) height = 2;
-    LONG left = static_cast<LONG>(((output_width_ - width) / 2) & ~1U);
-    LONG top = static_cast<LONG>(((output_height_ - height) / 2) & ~1U);
+    LONG left = static_cast<LONG>(((output_width - width) / 2) & ~1U);
+    LONG top = static_cast<LONG>(((output_height - height) / 2) & ~1U);
     return {left, top, left + static_cast<LONG>(width), top + static_cast<LONG>(height)};
 }
 
+bool BorkScreenVideoCapture::ShouldPromote(BorkSizeInt32 size) const {
+    if (source_kind_ != BORK_SCREEN_VIDEO_SOURCE_WINDOW || full_output_) {
+        return false;
+    }
+    BorkSizeInt32 source{
+        static_cast<INT32>(static_cast<UINT32>(size.Width) & ~1U),
+        static_cast<INT32>(static_cast<UINT32>(size.Height) & ~1U)};
+    RECT current = AspectFitRectangle(source, output_width_, output_height_);
+    RECT full = AspectFitRectangle(source, max_output_width_, max_output_height_);
+    return bork_screen_promotion_worthwhile(
+               static_cast<UINT32>(current.right - current.left),
+               static_cast<UINT32>(full.right - full.left)) ||
+        bork_screen_promotion_worthwhile(
+               static_cast<UINT32>(current.bottom - current.top),
+               static_cast<UINT32>(full.bottom - full.top));
+}
+
 HRESULT BorkScreenVideoCapture::ConfigureVideoProcessorGeometry(BorkSizeInt32 size) {
-    // XVP otherwise stretches every input to the fixed encoder size. Keep the
-    // source ratio and let it fill the remaining area with opaque black.
+    // Preserve the source ratio inside the fixed coded frame. The WebView uses
+    // the destination dimensions to crop away the black border.
     MFARGB black{0, 0, 0, 255};
     HRESULT result = video_processor_control_->SetBorderColor(&black);
-    RECT destination = AspectFitRectangle(size);
+    RECT source{
+        0, 0,
+        static_cast<LONG>(static_cast<UINT32>(size.Width) & ~1U),
+        static_cast<LONG>(static_cast<UINT32>(size.Height) & ~1U)};
+    // XVP can duplicate a horizontal strip when scaling an odd-sized FP16
+    // source. Cropping the right and bottom edges by at most one pixel avoids
+    // that driver path and also matches NV12's even dimensions.
+    if (SUCCEEDED(result)) {
+        result = video_processor_control_->SetSourceRectangle(&source);
+    }
+    BorkSizeInt32 source_size{source.right, source.bottom};
+    RECT destination = AspectFitRectangle(
+        source_size, output_width_, output_height_);
     if (SUCCEEDED(result)) {
         result = video_processor_control_->SetDestinationRectangle(&destination);
+    }
+    if (SUCCEEDED(result)) {
+        display_width_ = static_cast<UINT32>(destination.right - destination.left);
+        display_height_ = static_cast<UINT32>(destination.bottom - destination.top);
     }
     return result;
 }
@@ -747,9 +852,10 @@ HRESULT BorkScreenVideoCapture::CreateEncoderTypes(
         result = bork_set_common_video_type(
             output_type, MFVideoFormat_H264, output_width_, output_height_);
     }
-    if (SUCCEEDED(result)) result = output_type->SetUINT32(MF_MT_AVG_BITRATE, bork_video_bitrate);
+    if (SUCCEEDED(result)) result = output_type->SetUINT32(
+        MF_MT_AVG_BITRATE, bork_video_bitrate(output_width_, output_height_));
     if (SUCCEEDED(result)) result = output_type->SetUINT32(MF_MT_MPEG2_PROFILE, profile);
-    if (SUCCEEDED(result)) result = output_type->SetUINT32(MF_MT_MPEG2_LEVEL, eAVEncH264VLevel3_1);
+    if (SUCCEEDED(result)) result = output_type->SetUINT32(MF_MT_MPEG2_LEVEL, eAVEncH264VLevel5);
     if (FAILED(result)) {
         bork_release(input_type);
         bork_release(output_type);
@@ -822,7 +928,8 @@ HRESULT BorkScreenVideoCapture::ConfigureEncoderCodec() {
         codec_api_, CODECAPI_AVEncCommonRateControlMode,
         eAVEncCommonRateControlMode_CBR);
     bork_try_set_codec_uint32(
-        codec_api_, CODECAPI_AVEncCommonMeanBitRate, bork_video_bitrate);
+        codec_api_, CODECAPI_AVEncCommonMeanBitRate,
+        bork_video_bitrate(output_width_, output_height_));
     bork_try_set_codec_uint32(
         codec_api_, CODECAPI_AVEncMPVGOPSize, bork_frame_rate * 2);
     bork_try_set_codec_uint32(
@@ -901,9 +1008,16 @@ HRESULT BorkScreenVideoCapture::StartTransforms() {
 
 HRESULT BorkScreenVideoCapture::Initialize(
     int32_t source_kind, uintptr_t source_handle,
-    uint32_t max_frame_bytes, bork_screen_video_info *info) {
-    if (info == nullptr || max_frame_bytes == 0) return E_INVALIDARG;
+    uint32_t max_frame_bytes, uint32_t max_width, uint32_t max_height,
+    bool full_output, bork_screen_video_info *info) {
+    if (info == nullptr || max_frame_bytes == 0 ||
+        max_width < 2 || max_height < 2) {
+        return E_INVALIDARG;
+    }
     max_frame_bytes_ = max_frame_bytes;
+    max_output_width_ = max_width & ~1U;
+    max_output_height_ = max_height & ~1U;
+    full_output_ = full_output;
 
     HRESULT result = InitializeRuntime();
     if (SUCCEEDED(result)) result = InitializeEvents();
@@ -914,6 +1028,7 @@ HRESULT BorkScreenVideoCapture::Initialize(
     int32_t codec = BORK_SCREEN_VIDEO_CODEC_H264_BASELINE;
     if (SUCCEEDED(result)) result = InitializeEncoder(&codec);
     if (SUCCEEDED(result)) result = StartTransforms();
+    if (SUCCEEDED(result)) result = bork_set_capture_frame_interval(capture_session_);
     if (SUCCEEDED(result)) result = capture_session_->StartCapture();
     if (FAILED(result)) return result;
 
@@ -1074,6 +1189,9 @@ HRESULT BorkScreenVideoCapture::TakeReadyFrame(
         // displays. Refresh the input type so XVP uses the new white level.
         BorkSizeInt32 size = frame->size;
         ReleaseFrame(frame);
+        if (resized && ShouldPromote(size)) {
+            return static_cast<HRESULT>(BORK_SCREEN_VIDEO_READ_RECONFIGURE);
+        }
         return RefreshVideoInput(size, resized);
     }
     if (!ShouldEncode(frame->time_hns)) {
@@ -1336,6 +1454,8 @@ HRESULT BorkScreenVideoCapture::ReadEncoderOutput(
     if (time < 0) return E_UNEXPECTED;
     output->data = encoded_frame_.data();
     output->length = static_cast<UINT32>(encoded_frame_.size());
+    output->display_width = display_width_;
+    output->display_height = display_height_;
     output->timestamp_us = static_cast<UINT64>(time / 10);
     output->duration_us = bork_frame_duration_us;
     output->key_frame = key_frame ? 1 : 0;
@@ -1440,6 +1560,7 @@ BorkScreenVideoCapture::~BorkScreenVideoCapture() {
 
 extern "C" bork_screen_video_capture *bork_screen_video_capture_start(
     int32_t source_kind, uintptr_t source_handle, uint32_t max_frame_bytes,
+    uint32_t max_width, uint32_t max_height, int32_t full_output,
     bork_screen_video_info *info_out, int32_t *result_out) {
     if (result_out == nullptr) return nullptr;
     BorkScreenVideoCapture *capture = new (std::nothrow) BorkScreenVideoCapture();
@@ -1448,7 +1569,8 @@ extern "C" bork_screen_video_capture *bork_screen_video_capture_start(
         return nullptr;
     }
     HRESULT result = capture->Initialize(
-        source_kind, source_handle, max_frame_bytes, info_out);
+        source_kind, source_handle, max_frame_bytes,
+        max_width, max_height, full_output != 0, info_out);
     if (FAILED(result)) {
         delete capture;
         capture = nullptr;

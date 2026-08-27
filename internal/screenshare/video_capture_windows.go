@@ -25,11 +25,12 @@ const hresultScreenSourceClosed = 0x80070026
 var errScreenSourceClosed = errors.New("screen capture source closed")
 
 type videoSource struct {
-	mu      sync.Mutex
-	capture *C.bork_screen_video_capture
-	frames  chan VideoFrame
-	done    chan struct{}
-	readErr error
+	mu       sync.Mutex
+	capture  *C.bork_screen_video_capture
+	frames   chan VideoFrame
+	done     chan struct{}
+	readErr  error
+	stopping bool
 }
 
 type videoStartResult struct {
@@ -37,7 +38,7 @@ type videoStartResult struct {
 	err  error
 }
 
-func startVideoSource(sourceID string, maxFrameBytes int) (*videoSource, VideoInfo, error) {
+func startVideoSource(sourceID string, maxFrameBytes, maxWidth, maxHeight int) (*videoSource, VideoInfo, error) {
 	kind, handle, err := parseVideoSource(sourceID)
 	if err != nil {
 		return nil, VideoInfo{}, err
@@ -48,7 +49,7 @@ func startVideoSource(sourceID string, maxFrameBytes int) (*videoSource, VideoIn
 		done:   make(chan struct{}),
 	}
 	ready := make(chan videoStartResult, 1)
-	go source.run(kind, handle, maxFrameBytes, ready)
+	go source.run(kind, handle, maxFrameBytes, maxWidth, maxHeight, ready)
 	result := <-ready
 	if result.err != nil {
 		return nil, VideoInfo{}, result.err
@@ -75,7 +76,12 @@ func parseVideoSource(sourceID string) (C.int32_t, uintptr, error) {
 	}
 }
 
-func (s *videoSource) run(kind C.int32_t, handle uintptr, maxFrameBytes int, ready chan<- videoStartResult) {
+func (s *videoSource) run(
+	kind C.int32_t,
+	handle uintptr,
+	maxFrameBytes, maxWidth, maxHeight int,
+	ready chan<- videoStartResult,
+) {
 	// Windows Graphics Capture, D3D, and Media Foundation objects are created,
 	// used, and destroyed on this one OS thread. Close only signals native work.
 	runtime.LockOSThread()
@@ -83,36 +89,70 @@ func (s *videoSource) run(kind C.int32_t, handle uintptr, maxFrameBytes int, rea
 	defer close(s.done)
 	defer close(s.frames)
 
+	capture, info, err := startNativeVideoCapture(
+		kind, handle, maxFrameBytes, maxWidth, maxHeight, false,
+	)
+	if err != nil {
+		ready <- videoStartResult{err: err}
+		return
+	}
+	s.installCapture(capture)
+	ready <- videoStartResult{info: info}
+
+	reconfigure := s.readCapture(capture, info)
+	stopping := s.destroyCapture(capture)
+	if !reconfigure || stopping {
+		return
+	}
+
+	capture, info, err = startNativeVideoCapture(
+		kind, handle, maxFrameBytes, maxWidth, maxHeight, true,
+	)
+	if err != nil {
+		s.setReadError(err)
+		return
+	}
+	if !s.installCapture(capture) {
+		C.bork_screen_video_capture_destroy(capture)
+		return
+	}
+	s.readCapture(capture, info)
+	s.destroyCapture(capture)
+}
+
+func startNativeVideoCapture(
+	kind C.int32_t,
+	handle uintptr,
+	maxFrameBytes, maxWidth, maxHeight int,
+	fullOutput bool,
+) (*C.bork_screen_video_capture, VideoInfo, error) {
 	var nativeInfo C.bork_screen_video_info
 	var result C.int32_t
+	var full C.int32_t
+	if fullOutput {
+		full = 1
+	}
 	capture := C.bork_screen_video_capture_start(
 		kind,
 		C.uintptr_t(handle),
 		C.uint32_t(maxFrameBytes),
+		C.uint32_t(maxWidth),
+		C.uint32_t(maxHeight),
+		full,
 		&nativeInfo,
 		&result,
 	)
 	if capture == nil {
-		ready <- videoStartResult{err: videoError("start Windows screen capture", result)}
-		return
+		return nil, VideoInfo{}, videoError("start Windows screen capture", result)
 	}
 	codec, err := videoCodec(nativeInfo.codec)
 	if err != nil {
 		C.bork_screen_video_capture_destroy(capture)
-		ready <- videoStartResult{err: err}
-		return
+		return nil, VideoInfo{}, err
 	}
-
-	s.mu.Lock()
-	s.capture = capture
-	s.mu.Unlock()
-	ready <- videoStartResult{info: VideoInfo{Codec: codec, Width: int(nativeInfo.width), Height: int(nativeInfo.height)}}
-
-	s.readLoop(capture)
-	s.mu.Lock()
-	s.capture = nil
-	s.mu.Unlock()
-	C.bork_screen_video_capture_destroy(capture)
+	return capture, VideoInfo{
+		Codec: codec, Width: int(nativeInfo.width), Height: int(nativeInfo.height),
+	}, nil
 }
 
 func videoCodec(codec C.int32_t) (string, error) {
@@ -126,40 +166,92 @@ func videoCodec(codec C.int32_t) (string, error) {
 	}
 }
 
-func (s *videoSource) readLoop(capture *C.bork_screen_video_capture) {
+type nativeVideoReadStatus uint8
+
+const (
+	nativeVideoReadFrame nativeVideoReadStatus = iota
+	nativeVideoReadStopped
+	nativeVideoReadReconfigure
+)
+
+func (s *videoSource) readCapture(capture *C.bork_screen_video_capture, info VideoInfo) bool {
+	reconfigure, err := s.readLoop(capture, info)
+	if err != nil {
+		s.setReadError(err)
+	}
+	return reconfigure
+}
+
+func (s *videoSource) readLoop(capture *C.bork_screen_video_capture, info VideoInfo) (bool, error) {
 	for {
-		frame, stopped, err := readNativeVideoFrame(capture)
-		if stopped {
-			return
-		}
+		frame, status, err := readNativeVideoFrame(capture, info)
 		if err != nil {
-			s.mu.Lock()
-			s.readErr = err
-			s.mu.Unlock()
-			return
+			return false, err
+		}
+		switch status {
+		case nativeVideoReadStopped:
+			return false, nil
+		case nativeVideoReadReconfigure:
+			return true, nil
 		}
 		s.deliver(capture, frame)
 	}
 }
 
-func readNativeVideoFrame(capture *C.bork_screen_video_capture) (VideoFrame, bool, error) {
+func readNativeVideoFrame(
+	capture *C.bork_screen_video_capture,
+	info VideoInfo,
+) (VideoFrame, nativeVideoReadStatus, error) {
 	var frame C.bork_screen_video_frame
 	result := C.bork_screen_video_capture_read(capture, &frame)
 	if result == 1 { // S_FALSE means Close stopped the native reader.
-		return VideoFrame{}, true, nil
+		return VideoFrame{}, nativeVideoReadStopped, nil
+	}
+	if result == C.BORK_SCREEN_VIDEO_READ_RECONFIGURE {
+		return VideoFrame{}, nativeVideoReadReconfigure, nil
 	}
 	if uint32(result) == hresultScreenSourceClosed {
-		return VideoFrame{}, false, errScreenSourceClosed
+		return VideoFrame{}, nativeVideoReadStopped, errScreenSourceClosed
 	}
 	if result < 0 {
-		return VideoFrame{}, false, videoError("read Windows screen capture", result)
+		return VideoFrame{}, nativeVideoReadStopped, videoError("read Windows screen capture", result)
 	}
 	return VideoFrame{
-		Timestamp: uint64(frame.timestamp_us),
-		Duration:  uint32(frame.duration_us),
-		KeyFrame:  frame.key_frame != 0,
-		Payload:   C.GoBytes(unsafe.Pointer(frame.data), C.int(frame.length)),
-	}, false, nil
+		Info:          info,
+		DisplayWidth:  int(frame.display_width),
+		DisplayHeight: int(frame.display_height),
+		Timestamp:     uint64(frame.timestamp_us),
+		Duration:      uint32(frame.duration_us),
+		KeyFrame:      frame.key_frame != 0,
+		Payload:       C.GoBytes(unsafe.Pointer(frame.data), C.int(frame.length)),
+	}, nativeVideoReadFrame, nil
+}
+
+func (s *videoSource) installCapture(capture *C.bork_screen_video_capture) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopping {
+		return false
+	}
+	s.capture = capture
+	return true
+}
+
+func (s *videoSource) destroyCapture(capture *C.bork_screen_video_capture) bool {
+	s.mu.Lock()
+	if s.capture == capture {
+		s.capture = nil
+	}
+	stopping := s.stopping
+	s.mu.Unlock()
+	C.bork_screen_video_capture_destroy(capture)
+	return stopping
+}
+
+func (s *videoSource) setReadError(err error) {
+	s.mu.Lock()
+	s.readErr = err
+	s.mu.Unlock()
 }
 
 func (s *videoSource) deliver(capture *C.bork_screen_video_capture, frame VideoFrame) {
@@ -207,6 +299,7 @@ func (s *videoSource) forceKeyFrame() error {
 
 func (s *videoSource) close() error {
 	s.mu.Lock()
+	s.stopping = true
 	var stopErr error
 	if s.capture != nil {
 		result := C.bork_screen_video_capture_stop(s.capture)

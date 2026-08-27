@@ -14,12 +14,12 @@ import (
 )
 
 const (
-	ScreenVideoCodecH264Baseline = "avc1.42E01F"
-	ScreenVideoCodecH264Main     = "avc1.4D401F"
+	ScreenVideoCodecH264Baseline = "avc1.42E032"
+	ScreenVideoCodecH264Main     = "avc1.4D4032"
 
 	MaxScreenVideoChunkBytes = 256 << 10
-	MaxScreenVideoWidth      = 1280
-	MaxScreenVideoHeight     = 720
+	MaxScreenVideoWidth      = 2560
+	MaxScreenVideoHeight     = 1440
 
 	reliableChannelScreenState         = 4
 	screenStateVersion                 = 1
@@ -50,6 +50,7 @@ type screenCommandKind byte
 
 const (
 	screenCommandStart screenCommandKind = iota + 1
+	screenCommandReplace
 	screenCommandSendVideo
 	screenCommandSendAudio
 	screenCommandStop
@@ -79,22 +80,26 @@ type ScreenVideoChunk struct {
 	StreamID   [16]byte
 	ChunkID    uint32
 	Codec      string
-	Width      uint16
-	Height     uint16
-	Timestamp  uint64
-	Duration   uint32
-	KeyFrame   bool
-	Bytes      []byte
+	// Width and Height are the fixed H.264 coded size. DisplayWidth and
+	// DisplayHeight identify the current content area within that frame.
+	Width         uint16
+	Height        uint16
+	DisplayWidth  uint16
+	DisplayHeight uint16
+	Timestamp     uint64
+	Duration      uint32
+	KeyFrame      bool
+	Bytes         []byte
 }
 
 type screenVideoMetadata struct {
-	generation uint64
-	codec      string
-	width      uint16
-	height     uint16
-	timestamp  uint64
-	duration   uint32
-	keyFrame   bool
+	generation    uint64
+	codec         string
+	displayWidth  uint16
+	displayHeight uint16
+	timestamp     uint64
+	duration      uint32
+	keyFrame      bool
 }
 
 type decodedScreenVideoFragment struct {
@@ -198,10 +203,7 @@ func validateScreenVideoConfig(codec string, width, height int) error {
 	if _, ok := screenVideoCodecCode(codec); !ok {
 		return errors.New("screen video codec is not supported")
 	}
-	if width < 2 || height < 2 || width > MaxScreenVideoWidth || height > MaxScreenVideoHeight || width%2 != 0 || height%2 != 0 {
-		return fmt.Errorf("screen video dimensions must be even and at most %dx%d", MaxScreenVideoWidth, MaxScreenVideoHeight)
-	}
-	return nil
+	return validateScreenVideoSize(width, height)
 }
 
 func screenVideoCodecCode(codec string) (byte, bool) {
@@ -237,10 +239,20 @@ func validateScreenVideoMetadata(metadata screenVideoMetadata) error {
 	if metadata.generation == 0 {
 		return errors.New("screen video generation is zero")
 	}
-	if err := validateScreenVideoConfig(metadata.codec, int(metadata.width), int(metadata.height)); err != nil {
+	if _, ok := screenVideoCodecCode(metadata.codec); !ok {
+		return errors.New("screen video codec is not supported")
+	}
+	if err := validateScreenVideoSize(int(metadata.displayWidth), int(metadata.displayHeight)); err != nil {
 		return err
 	}
 	return validateScreenVideoTiming(metadata.timestamp, metadata.duration)
+}
+
+func validateScreenVideoSize(width, height int) error {
+	if width < 2 || height < 2 || width > MaxScreenVideoWidth || height > MaxScreenVideoHeight || width%2 != 0 || height%2 != 0 {
+		return fmt.Errorf("screen video dimensions must be even and at most %dx%d", MaxScreenVideoWidth, MaxScreenVideoHeight)
+	}
+	return nil
 }
 
 func encodeScreenVideoFragments(metadata screenVideoMetadata, data []byte) ([][]byte, error) {
@@ -271,8 +283,8 @@ func encodeScreenVideoFragments(metadata screenVideoMetadata, data []byte) ([][]
 		binary.BigEndian.PutUint64(payload[15:23], metadata.timestamp)
 		binary.BigEndian.PutUint32(payload[23:27], metadata.duration)
 		binary.BigEndian.PutUint32(payload[27:31], uint32(len(data)))
-		binary.BigEndian.PutUint16(payload[31:33], metadata.width)
-		binary.BigEndian.PutUint16(payload[33:35], metadata.height)
+		binary.BigEndian.PutUint16(payload[31:33], metadata.displayWidth)
+		binary.BigEndian.PutUint16(payload[33:35], metadata.displayHeight)
 		copy(payload[screenVideoFragmentHeaderSize:], data[start:end])
 		fragments[index] = payload
 	}
@@ -289,13 +301,13 @@ func decodeScreenVideoFragment(payload []byte) (decodedScreenVideoFragment, erro
 	}
 	fragment := decodedScreenVideoFragment{
 		metadata: screenVideoMetadata{
-			generation: binary.BigEndian.Uint64(payload[7:15]),
-			codec:      codec,
-			width:      binary.BigEndian.Uint16(payload[31:33]),
-			height:     binary.BigEndian.Uint16(payload[33:35]),
-			timestamp:  binary.BigEndian.Uint64(payload[15:23]),
-			duration:   binary.BigEndian.Uint32(payload[23:27]),
-			keyFrame:   payload[1]&screenVideoFlagKeyFrame != 0,
+			generation:    binary.BigEndian.Uint64(payload[7:15]),
+			codec:         codec,
+			displayWidth:  binary.BigEndian.Uint16(payload[31:33]),
+			displayHeight: binary.BigEndian.Uint16(payload[33:35]),
+			timestamp:     binary.BigEndian.Uint64(payload[15:23]),
+			duration:      binary.BigEndian.Uint32(payload[23:27]),
+			keyFrame:      payload[1]&screenVideoFlagKeyFrame != 0,
 		},
 		index:     binary.BigEndian.Uint16(payload[3:5]),
 		count:     binary.BigEndian.Uint16(payload[5:7]),
@@ -322,8 +334,9 @@ func decodeScreenVideoFragment(payload []byte) (decodedScreenVideoFragment, erro
 	return fragment, nil
 }
 
-func screenVideoFragmentMatchesState(fragment decodedScreenVideoFragment, state screenState) bool {
-	return state.active && fragment.metadata.generation == state.generation && fragment.metadata.codec == state.codec && fragment.metadata.width == state.width && fragment.metadata.height == state.height
+func screenVideoMetadataMatchesState(metadata screenVideoMetadata, state screenState) bool {
+	return state.active && metadata.generation == state.generation && metadata.codec == state.codec &&
+		metadata.displayWidth <= state.width && metadata.displayHeight <= state.height
 }
 
 func (c *Client) ScreenVideoChunks() <-chan ScreenVideoChunk { return c.screenVideoChunks }
@@ -337,15 +350,28 @@ func (c *Client) StartScreenShare(codec string, width, height int) error {
 	}).err
 }
 
-func (c *Client) SendScreenVideoChunk(timestamp uint64, duration uint32, keyFrame bool, data []byte) (bool, error) {
+func (c *Client) ReplaceScreenShare(codec string, width, height int) error {
+	if err := validateScreenVideoConfig(codec, width, height); err != nil {
+		return err
+	}
+	return c.requestScreenCommand(screenCommand{
+		kind: screenCommandReplace, codec: codec, width: uint16(width), height: uint16(height), result: make(chan screenCommandResult, 1),
+	}).err
+}
+
+func (c *Client) SendScreenVideoChunk(timestamp uint64, duration uint32, keyFrame bool, displayWidth, displayHeight int, data []byte) (bool, error) {
 	if err := validateScreenVideoTiming(timestamp, duration); err != nil {
+		return false, err
+	}
+	if err := validateScreenVideoSize(displayWidth, displayHeight); err != nil {
 		return false, err
 	}
 	if len(data) == 0 || len(data) > MaxScreenVideoChunkBytes {
 		return false, errors.New("screen video chunk size is invalid")
 	}
 	result := c.requestScreenCommand(screenCommand{
-		kind: screenCommandSendVideo, timestamp: timestamp, duration: duration, keyFrame: keyFrame, bytes: data, result: make(chan screenCommandResult, 1),
+		kind: screenCommandSendVideo, width: uint16(displayWidth), height: uint16(displayHeight),
+		timestamp: timestamp, duration: duration, keyFrame: keyFrame, bytes: data, result: make(chan screenCommandResult, 1),
 	})
 	return result.sent, result.err
 }
@@ -389,8 +415,10 @@ func (c *Client) handleScreenCommand(command screenCommand) {
 	switch command.kind {
 	case screenCommandStart:
 		result.err = c.startScreenShare(command.codec, command.width, command.height)
+	case screenCommandReplace:
+		result.err = c.replaceScreenShare(command.codec, command.width, command.height)
 	case screenCommandSendVideo:
-		result.sent, result.err = c.sendScreenVideoChunk(command.timestamp, command.duration, command.keyFrame, command.bytes)
+		result.sent, result.err = c.sendScreenVideoChunk(command.timestamp, command.duration, command.keyFrame, command.width, command.height, command.bytes)
 	case screenCommandSendAudio:
 		result.err = c.sendScreenAudioFrame(uint32(command.timestamp), command.bytes)
 	case screenCommandStop:
@@ -405,6 +433,17 @@ func (c *Client) startScreenShare(codec string, width, height uint16) error {
 	if c.localScreenState.active {
 		return errors.New("screen sharing is already active")
 	}
+	return c.activateScreenShare(codec, width, height)
+}
+
+func (c *Client) replaceScreenShare(codec string, width, height uint16) error {
+	if !c.localScreenState.active {
+		return errors.New("screen sharing is not active")
+	}
+	return c.activateScreenShare(codec, width, height)
+}
+
+func (c *Client) activateScreenShare(codec string, width, height uint16) error {
 	if c.localScreenState.generation == math.MaxUint64 {
 		return errors.New("screen state generation is exhausted")
 	}
@@ -478,18 +517,21 @@ func (c *Client) handleScreenState(sender *RemotePeer, payload []byte) {
 	c.publishStateChange()
 }
 
-func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFrame bool, data []byte) (bool, error) {
+func (c *Client) sendScreenVideoChunk(timestamp uint64, duration uint32, keyFrame bool, displayWidth, displayHeight uint16, data []byte) (bool, error) {
 	if !c.localScreenState.active {
 		return false, errors.New("screen sharing is not active")
 	}
 	metadata := screenVideoMetadata{
-		generation: c.localScreenState.generation,
-		codec:      c.localScreenState.codec,
-		width:      c.localScreenState.width,
-		height:     c.localScreenState.height,
-		timestamp:  timestamp,
-		duration:   duration,
-		keyFrame:   keyFrame,
+		generation:    c.localScreenState.generation,
+		codec:         c.localScreenState.codec,
+		displayWidth:  displayWidth,
+		displayHeight: displayHeight,
+		timestamp:     timestamp,
+		duration:      duration,
+		keyFrame:      keyFrame,
+	}
+	if !screenVideoMetadataMatchesState(metadata, c.localScreenState) {
+		return false, errors.New("screen video display dimensions do not fit the coded frame")
 	}
 	fragments, err := encodeScreenVideoFragments(metadata, data)
 	if err != nil {

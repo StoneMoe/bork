@@ -4,7 +4,7 @@ package screenshare
 
 type videoSource struct{}
 
-func startVideoSource(string, int) (*videoSource, VideoInfo, error) {
+func startVideoSource(string, int, int, int) (*videoSource, VideoInfo, error) {
 	return nil, VideoInfo{}, ErrUnsupported
 }
 

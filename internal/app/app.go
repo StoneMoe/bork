@@ -356,6 +356,7 @@ func (a *App) publishScreenVideoChunk(room *roomSession, chunk peer.ScreenVideoC
 			PeerID: chunk.PeerID, SessionID: hex.EncodeToString(chunk.SessionID[:]), Generation: chunk.Generation, StreamID: hex.EncodeToString(chunk.StreamID[:]),
 			ChunkID: chunk.ChunkID,
 			Codec:   chunk.Codec, Width: chunk.Width, Height: chunk.Height,
+			DisplayWidth: chunk.DisplayWidth, DisplayHeight: chunk.DisplayHeight,
 			Timestamp: chunk.Timestamp, Duration: chunk.Duration, KeyFrame: chunk.KeyFrame, Bytes: chunk.Bytes,
 		})
 	}
@@ -393,17 +394,32 @@ func (a *App) runScreenVideo(room *roomSession, run *screenVideoRun) {
 			runErr = err
 			return
 		}
+		if frame.Info != info {
+			// A larger native coded frame is a new H.264 stream, but the user is
+			// still sharing the same source. Replace the active stream without
+			// publishing an intermediate stopped state.
+			if err := room.client.ReplaceScreenShare(frame.Info.Codec, frame.Info.Width, frame.Info.Height); err != nil {
+				runErr = err
+				return
+			}
+			info = frame.Info
+		}
 		a.emit(ctx, screenPreviewChunkEvent, ScreenPreviewChunkEvent{
-			CaptureID: run.id,
-			Codec:     info.Codec,
-			Width:     info.Width,
-			Height:    info.Height,
-			Timestamp: frame.Timestamp,
-			Duration:  frame.Duration,
-			KeyFrame:  frame.KeyFrame,
-			Bytes:     frame.Payload,
+			CaptureID:     run.id,
+			Codec:         info.Codec,
+			Width:         info.Width,
+			Height:        info.Height,
+			DisplayWidth:  frame.DisplayWidth,
+			DisplayHeight: frame.DisplayHeight,
+			Timestamp:     frame.Timestamp,
+			Duration:      frame.Duration,
+			KeyFrame:      frame.KeyFrame,
+			Bytes:         frame.Payload,
 		})
-		sent, err := room.client.SendScreenVideoChunk(frame.Timestamp, frame.Duration, frame.KeyFrame, frame.Payload)
+		sent, err := room.client.SendScreenVideoChunk(
+			frame.Timestamp, frame.Duration, frame.KeyFrame,
+			frame.DisplayWidth, frame.DisplayHeight, frame.Payload,
+		)
 		if err != nil {
 			runErr = err
 			return

@@ -129,7 +129,7 @@ func (c *Client) handleRoomDatagram(packet endpoint.Datagram, mediaPort media.Pe
 			return
 		}
 		fragment, err = decodeScreenVideoFragment(decoded.Payload)
-		if err != nil || !screenVideoFragmentMatchesState(fragment, remote.activeSession.remoteScreenState) {
+		if err != nil || !screenVideoMetadataMatchesState(fragment.metadata, remote.activeSession.remoteScreenState) {
 			return
 		}
 	}
@@ -176,7 +176,8 @@ func (c *Client) handleRoomDatagram(packet endpoint.Datagram, mediaPort media.Pe
 		c.deliverScreenVideoChunk(ScreenVideoChunk{
 			PeerID: remoteIdentity.PeerID(), SessionID: remote.activeSession.sessionID, Generation: complete.metadata.generation, StreamID: header.StreamID,
 			ChunkID: complete.chunkID,
-			Codec:   complete.metadata.codec, Width: complete.metadata.width, Height: complete.metadata.height,
+			Codec:   complete.metadata.codec, Width: remote.activeSession.remoteScreenState.width, Height: remote.activeSession.remoteScreenState.height,
+			DisplayWidth: complete.metadata.displayWidth, DisplayHeight: complete.metadata.displayHeight,
 			Timestamp: complete.metadata.timestamp, Duration: complete.metadata.duration,
 			KeyFrame: complete.metadata.keyFrame, Bytes: complete.bytes,
 		})

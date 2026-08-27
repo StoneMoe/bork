@@ -5,25 +5,30 @@ import (
 )
 
 const (
-	VideoCodecH264Baseline = "avc1.42E01F"
-	VideoCodecH264Main     = "avc1.4D401F"
+	VideoCodecH264Baseline = "avc1.42E032"
+	VideoCodecH264Main     = "avc1.4D4032"
 )
 
-// VideoInfo is fixed for one capture. A window may resize while sharing, but
-// frames keep this encoded size so receivers do not need a second start event.
+// VideoInfo describes the H.264 stream containing a frame. It changes once if
+// a shared window grows beyond its initial coded size.
 type VideoInfo struct {
 	Codec  string
 	Width  int
 	Height int
 }
 
-// VideoFrame is one H.264 Annex-B access unit. Timestamp and Duration use
-// microseconds, matching the screen-video wire protocol and WebCodecs.
+// VideoFrame is one H.264 Annex-B access unit. DisplayWidth and DisplayHeight
+// describe the centered content area inside the fixed coded frame. Timestamp
+// and Duration use microseconds, matching the screen-video wire protocol and
+// WebCodecs.
 type VideoFrame struct {
-	Timestamp uint64
-	Duration  uint32
-	KeyFrame  bool
-	Payload   []byte
+	Info          VideoInfo
+	DisplayWidth  int
+	DisplayHeight int
+	Timestamp     uint64
+	Duration      uint32
+	KeyFrame      bool
+	Payload       []byte
 }
 
 // VideoCapture captures, tone maps, resizes, and encodes one native source.
@@ -33,17 +38,22 @@ type VideoCapture struct {
 	info   VideoInfo
 }
 
-func StartVideoCapture(sourceID string, maxFrameBytes int) (*VideoCapture, error) {
+func StartVideoCapture(sourceID string, maxFrameBytes, maxWidth, maxHeight int) (*VideoCapture, error) {
 	if maxFrameBytes <= 0 {
 		return nil, fmt.Errorf("screen video frame limit must be positive")
 	}
-	source, info, err := startVideoSource(sourceID, maxFrameBytes)
+	if maxWidth < 2 || maxHeight < 2 {
+		return nil, fmt.Errorf("screen video dimensions must be at least 2x2")
+	}
+	source, info, err := startVideoSource(sourceID, maxFrameBytes, maxWidth, maxHeight)
 	if err != nil {
 		return nil, err
 	}
 	return &VideoCapture{source: source, info: info}, nil
 }
 
+// Info returns the initial stream configuration. ReadFrame carries the active
+// configuration in case a growing window promotes to the full coded size.
 func (c *VideoCapture) Info() VideoInfo {
 	return c.info
 }

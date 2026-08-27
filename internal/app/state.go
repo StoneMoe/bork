@@ -53,30 +53,37 @@ type FileTransfer struct {
 	SavedPath    string `json:"savedPath,omitempty"`
 }
 
+// Width and Height are the fixed coded size. DisplayWidth and DisplayHeight
+// describe the centered visible area after the captured window changes size.
 type ScreenVideoChunkEvent struct {
-	PeerID     string `json:"peerId"`
-	SessionID  string `json:"sessionId"`
-	Generation uint64 `json:"generation"`
-	StreamID   string `json:"streamId"`
-	ChunkID    uint32 `json:"chunkId"`
-	Codec      string `json:"codec"`
-	Width      uint16 `json:"width"`
-	Height     uint16 `json:"height"`
-	Timestamp  uint64 `json:"timestamp"`
-	Duration   uint32 `json:"duration"`
-	KeyFrame   bool   `json:"keyFrame"`
-	Bytes      []byte `json:"bytes"`
+	PeerID        string `json:"peerId"`
+	SessionID     string `json:"sessionId"`
+	Generation    uint64 `json:"generation"`
+	StreamID      string `json:"streamId"`
+	ChunkID       uint32 `json:"chunkId"`
+	Codec         string `json:"codec"`
+	Width         uint16 `json:"width"`
+	Height        uint16 `json:"height"`
+	DisplayWidth  uint16 `json:"displayWidth"`
+	DisplayHeight uint16 `json:"displayHeight"`
+	Timestamp     uint64 `json:"timestamp"`
+	Duration      uint32 `json:"duration"`
+	KeyFrame      bool   `json:"keyFrame"`
+	Bytes         []byte `json:"bytes"`
 }
 
+// ScreenPreviewChunkEvent uses the same coded and display size split.
 type ScreenPreviewChunkEvent struct {
-	CaptureID uint32 `json:"captureId"`
-	Codec     string `json:"codec"`
-	Width     int    `json:"width"`
-	Height    int    `json:"height"`
-	Timestamp uint64 `json:"timestamp"`
-	Duration  uint32 `json:"duration"`
-	KeyFrame  bool   `json:"keyFrame"`
-	Bytes     []byte `json:"bytes"`
+	CaptureID     uint32 `json:"captureId"`
+	Codec         string `json:"codec"`
+	Width         int    `json:"width"`
+	Height        int    `json:"height"`
+	DisplayWidth  int    `json:"displayWidth"`
+	DisplayHeight int    `json:"displayHeight"`
+	Timestamp     uint64 `json:"timestamp"`
+	Duration      uint32 `json:"duration"`
+	KeyFrame      bool   `json:"keyFrame"`
+	Bytes         []byte `json:"bytes"`
 }
 
 type AppIssueType string

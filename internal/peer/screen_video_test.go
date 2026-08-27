@@ -35,7 +35,7 @@ func TestScreenMediaDoesNotReuseNonceAcrossAudioAndVideo(t *testing.T) {
 	recorder := &recordingAEAD{AEAD: client.roomDatagramProtector}
 	client.roomDatagramProtector = recorder
 
-	if _, err := client.sendScreenVideoChunk(1, 10_000, true, []byte{1}); err != nil {
+	if _, err := client.sendScreenVideoChunk(1, 10_000, true, 640, 360, []byte{1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := client.sendScreenAudioFrame(480, []byte{2}); err != nil {
@@ -43,5 +43,33 @@ func TestScreenMediaDoesNotReuseNonceAcrossAudioAndVideo(t *testing.T) {
 	}
 	if len(recorder.nonces) != 2 || bytes.Equal(recorder.nonces[0], recorder.nonces[1]) {
 		t.Fatalf("screen video and audio nonces = %x", recorder.nonces)
+	}
+}
+
+func TestScreenVideoDisplaySizeMatchesCodedFrame(t *testing.T) {
+	state := screenState{
+		generation: 2, active: true, streamID: [16]byte{1},
+		codec: ScreenVideoCodecH264Baseline, width: 640, height: 360,
+	}
+	metadata := screenVideoMetadata{
+		generation: 2, codec: ScreenVideoCodecH264Baseline,
+		displayWidth: 320, displayHeight: 360,
+		timestamp: 1, duration: 10_000, keyFrame: true,
+	}
+	fragments, err := encodeScreenVideoFragments(metadata, []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragment, err := decodeScreenVideoFragment(fragments[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !screenVideoMetadataMatchesState(fragment.metadata, state) {
+		t.Fatal("resized display should fit the coded frame")
+	}
+
+	fragment.metadata.displayWidth = 642
+	if screenVideoMetadataMatchesState(fragment.metadata, state) {
+		t.Fatal("display wider than the coded frame should be rejected")
 	}
 }
