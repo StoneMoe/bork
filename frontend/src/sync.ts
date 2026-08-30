@@ -1,7 +1,7 @@
-import { createSignal, onCleanup, onMount } from "solid-js";
 import { GetSnapshot } from "@wailsjs/go/app/App";
 import { app } from "@wailsjs/go/models";
 import { EventsOn } from "@wailsjs/runtime/runtime";
+import { createSignal, onCleanup, onMount } from "solid-js";
 import type { IssueInput } from "./issues";
 import type { AppState } from "./types";
 
@@ -33,6 +33,26 @@ const emptyState = new app.AppSnapshot({
     tracker: [],
     connectivity: {
       discoveryHints: [],
+    },
+  },
+  gameProxy: {
+    config: {
+      directory: "",
+      node: {
+        server: "",
+        port: 4567,
+        username: "",
+        password: "",
+        mtu: 1400,
+        dns: "1.1.1.1",
+      },
+    },
+    status: {
+      supported: false,
+      state: "unsupported",
+      generation: 0,
+      executableCount: 0,
+      directory: "",
     },
   },
 });
