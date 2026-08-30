@@ -1,6 +1,7 @@
 # Wails-generated workspace: bindings, packaging assets, dev and release binaries.
 /build/
 /internal/webassets/dist/
+/internal/gameproxy/netfilter/sdk/
 
 /frontend/node_modules/
 /frontend/package.json.md5
