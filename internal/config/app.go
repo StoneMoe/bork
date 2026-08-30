@@ -20,8 +20,9 @@ import (
 )
 
 type AppConfig struct {
-	FilePath string        `yaml:"-"`
-	Network  NetworkConfig `yaml:"network"`
+	FilePath  string          `yaml:"-"`
+	Network   NetworkConfig   `yaml:"network"`
+	GameProxy GameProxyConfig `yaml:"game_proxy"`
 }
 
 type NetworkConfig struct {
@@ -59,6 +60,7 @@ func loadAppConfigFile(path string) (AppConfig, error) {
 			TrackerURLs: []string{"https://bork-pex.iii.moe/announce"},
 			PortMapping: true,
 		},
+		GameProxy: defaultGameProxyConfig(),
 	}
 	contents, exists, err := readAppConfig(path)
 	if err != nil {
@@ -88,6 +90,10 @@ func loadAppConfigFile(path string) (AppConfig, error) {
 		return AppConfig{}, fmt.Errorf("validate client config %q: %w", path, err)
 	}
 	config.Network.TrackerURLs, err = validateTrackerURLs(config.Network.TrackerURLs)
+	if err != nil {
+		return AppConfig{}, fmt.Errorf("validate client config %q: %w", path, err)
+	}
+	config.GameProxy.Node, err = validateStoredGameProxyNode(config.GameProxy.Node)
 	if err != nil {
 		return AppConfig{}, fmt.Errorf("validate client config %q: %w", path, err)
 	}
