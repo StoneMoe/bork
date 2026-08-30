@@ -29,12 +29,16 @@ $(error BUILD_FLAGS must not contain -platform; use PLATFORMS instead)
 endif
 
 TAG_FLAGS := $(if $(strip $(TAGS)),-tags "$(strip $(TAGS))")
+NETFILTER_SDK_PREREQUISITE := $(if $(filter netfilter_sdk,$(strip $(TAGS))),verify-netfilter-sdk)
 
 ifneq ($(strip $(PLATFORMS)),)
 PLATFORM_FLAGS := -platform "$(PLATFORMS)"
 endif
 
-.PHONY: build dev bindings frontend-deps typecheck-frontend prepare-packaging
+.PHONY: build dev bindings frontend-deps typecheck-frontend prepare-packaging verify-netfilter-sdk
+
+verify-netfilter-sdk:
+	go run ./tools/netfiltersdk verify
 
 bindings:
 	$(WAILS_CMD) generate module
@@ -52,9 +56,9 @@ prepare-packaging:
 	cp frontend/packaging/darwin/Info.plist build/darwin/Info.plist
 	cp frontend/packaging/darwin/Info.dev.plist build/darwin/Info.dev.plist
 
-build: prepare-packaging
+build: $(NETFILTER_SDK_PREREQUISITE) prepare-packaging
 	$(CHECK_BUILD_VERSION)
 	$(WAILS_CMD) build -clean -trimpath -ldflags "-s -w -X bork/internal/app.BuildVersion=$(VERSION)" $(PLATFORM_FLAGS) $(TAG_FLAGS) $(BUILD_FLAGS)
 
-dev: prepare-packaging
+dev: $(NETFILTER_SDK_PREREQUISITE) prepare-packaging
 	$(WAILS_CMD) dev $(TAG_FLAGS) $(DEV_FLAGS)
