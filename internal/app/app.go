@@ -10,6 +10,8 @@ import (
 
 	"bork/internal/audio"
 	"bork/internal/config"
+	"bork/internal/gameproxy"
+	"bork/internal/gameproxy/netfilter"
 	"bork/internal/globalkey"
 	"bork/internal/identity"
 	"bork/internal/media"
@@ -30,11 +32,13 @@ const (
 var BuildVersion = "dev"
 
 type App struct {
-	config         config.AppConfig
-	logger         *slog.Logger
-	emit           func(context.Context, string, ...interface{})
-	openFileDialog func(context.Context, wailsruntime.OpenDialogOptions) (string, error)
-	saveFileDialog func(context.Context, wailsruntime.SaveDialogOptions) (string, error)
+	config                   config.AppConfig
+	logger                   *slog.Logger
+	emit                     func(context.Context, string, ...interface{})
+	openFileDialog           func(context.Context, wailsruntime.OpenDialogOptions) (string, error)
+	saveFileDialog           func(context.Context, wailsruntime.SaveDialogOptions) (string, error)
+	selectGameProxyDirectory func(context.Context, wailsruntime.OpenDialogOptions) (string, error)
+	gameProxyManager         gameProxyManager
 
 	commandMu sync.Mutex
 	stateMu   sync.RWMutex
@@ -47,18 +51,22 @@ type App struct {
 	stateNotifierStopped chan struct{}
 	notificationsClosed  bool
 
-	nickname            string
-	room                *roomSession
-	audioEngine         *audio.Engine
-	audioInitError      string
-	stopAudioWatcher    context.CancelFunc
-	audioWatcherDone    chan struct{}
-	lastDiagnostics     Diagnostics
-	nextScreenCaptureID uint32
-	pushToTalk          *globalkey.Listener
-	pushToTalkEnabled   bool
-	pushToTalkKey       string
-	shuttingDown        bool
+	nickname                 string
+	room                     *roomSession
+	audioEngine              *audio.Engine
+	audioInitError           string
+	stopAudioWatcher         context.CancelFunc
+	audioWatcherDone         chan struct{}
+	stopGameProxyWatcherFunc context.CancelFunc
+	gameProxyWatcherDone     chan struct{}
+	gameProxyRunContext      context.Context
+	cancelGameProxyRuns      context.CancelFunc
+	lastDiagnostics          Diagnostics
+	nextScreenCaptureID      uint32
+	pushToTalk               *globalkey.Listener
+	pushToTalkEnabled        bool
+	pushToTalkKey            string
+	shuttingDown             bool
 }
 
 type roomSession struct {
@@ -94,24 +102,30 @@ func NewApp(cfg config.AppConfig, logger *slog.Logger) *App {
 		logger = slog.Default()
 	}
 	return &App{
-		config:          cfg,
-		logger:          logger,
-		emit:            wailsruntime.EventsEmit,
-		openFileDialog:  wailsruntime.OpenFileDialog,
-		saveFileDialog:  wailsruntime.SaveFileDialog,
-		startupDone:     make(chan struct{}),
-		statePending:    make(chan struct{}, 1),
-		lastDiagnostics: emptyDiagnostics(),
-		pushToTalk:      globalkey.New(),
-		pushToTalkKey:   globalkey.DefaultCode,
+		config:                   cfg,
+		logger:                   logger,
+		emit:                     wailsruntime.EventsEmit,
+		openFileDialog:           wailsruntime.OpenFileDialog,
+		saveFileDialog:           wailsruntime.SaveFileDialog,
+		selectGameProxyDirectory: wailsruntime.OpenDirectoryDialog,
+		gameProxyManager:         gameproxy.NewManager(netfilter.NewFactory()),
+		startupDone:              make(chan struct{}),
+		statePending:             make(chan struct{}, 1),
+		lastDiagnostics:          emptyDiagnostics(),
+		pushToTalk:               globalkey.New(),
+		pushToTalkKey:            globalkey.DefaultCode,
 	}
 }
 
 func (a *App) startup(ctx context.Context) {
+	gameProxyRunContext, cancelGameProxyRuns := context.WithCancel(ctx)
 	a.stateMu.Lock()
 	a.appContext = ctx
+	a.gameProxyRunContext = gameProxyRunContext
+	a.cancelGameProxyRuns = cancelGameProxyRuns
 	a.stateMu.Unlock()
 	a.startStateNotifier(ctx)
+	a.startGameProxyWatcher(ctx)
 
 	a.commandMu.Lock()
 	if err := a.initializeAudio(); err != nil {
@@ -635,6 +649,7 @@ func (a *App) snapshot() AppSnapshot {
 	}
 	audioEngine := a.audioEngine
 	audioInitError := a.audioInitError
+	gameProxyConfig := projectGameProxyConfig(a.config.GameProxy)
 	var diagnostics Diagnostics
 	if room == nil {
 		diagnostics = cloneDiagnostics(a.lastDiagnostics)
@@ -646,6 +661,10 @@ func (a *App) snapshot() AppSnapshot {
 		Nickname:    nickname,
 		Audio:       emptyAudioStatus(),
 		Diagnostics: diagnostics,
+		GameProxy: GameProxySnapshot{
+			Config: gameProxyConfig,
+			Status: projectGameProxyStatus(a.gameProxyManager.Status()),
+		},
 	}
 	if audioEngine != nil {
 		state.Audio = audioEngine.Status()
@@ -704,6 +723,9 @@ func (a *App) shutdown(context.Context) {
 		return
 	}
 	a.shuttingDown = true
+	cancelGameProxyRuns := a.cancelGameProxyRuns
+	a.gameProxyRunContext = nil
+	a.cancelGameProxyRuns = nil
 	room := a.room
 	if room != nil {
 		room.stopping = true
@@ -721,7 +743,12 @@ func (a *App) shutdown(context.Context) {
 		audioEngine.Stop()
 	}
 	a.commandMu.Unlock()
+	if cancelGameProxyRuns != nil {
+		cancelGameProxyRuns()
+	}
+	a.gameProxyManager.Stop()
 	a.stopRoom(room)
+	a.stopGameProxyWatcher()
 
 	a.stateMu.Lock()
 	stopAudioWatcher, audioWatcherDone := a.stopAudioWatcher, a.audioWatcherDone

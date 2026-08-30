@@ -106,11 +106,12 @@ type AppIssue struct {
 }
 
 type AppSnapshot struct {
-	Version     string       `json:"version"`
-	Nickname    string       `json:"nickname"`
-	Room        *RoomState   `json:"room,omitempty"`
-	Audio       audio.Status `json:"audio"`
-	Diagnostics Diagnostics  `json:"diagnostics"`
+	Version     string            `json:"version"`
+	Nickname    string            `json:"nickname"`
+	Room        *RoomState        `json:"room,omitempty"`
+	Audio       audio.Status      `json:"audio"`
+	Diagnostics Diagnostics       `json:"diagnostics"`
+	GameProxy   GameProxySnapshot `json:"gameProxy"`
 }
 
 type Diagnostics struct {
