@@ -30,7 +30,7 @@
 
 .settings-tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   border-bottom: 1px solid var(--line);
   background: var(--page-background);
 }
@@ -193,6 +193,43 @@
 .nickname-form input:hover:not(:disabled):not(:focus) { border-color: rgba(var(--accent-rgb), 0.34); }
 .nickname-form input:disabled { cursor: default; opacity: 0.5; }
 .nickname-form small { color: var(--text-faint); font-size: 11px; line-height: 1.45; }
+
+.game-proxy-settings,
+.game-proxy-form,
+.game-proxy-field,
+.game-proxy-node-grid,
+.game-proxy-runtime { display: grid; }
+.game-proxy-settings { gap: 24px; }
+.game-proxy-form { gap: 16px; }
+.game-proxy-field { min-width: 0; gap: 7px; }
+.game-proxy-field > label { color: var(--text-muted); font-size: 12px; }
+.game-proxy-field:focus-within > label { color: var(--accent-muted); }
+.game-proxy-field > small { color: var(--text-faint); font-size: 11px; line-height: 1.45; }
+.game-proxy-field input { height: 38px; border-radius: 7px; padding: 0 10px; font: 12px/1 var(--font-ui); }
+.game-proxy-field input:hover:not(:disabled):not(:focus) { border-color: rgba(var(--accent-rgb), 0.34); }
+.game-proxy-field input:disabled { cursor: default; opacity: 0.5; }
+.game-proxy-directory-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.game-proxy-node-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.game-proxy-field-wide { grid-column: 1 / -1; }
+.game-proxy-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.game-proxy-actions output { color: var(--text-faint); font-size: 11px; }
+.game-proxy-runtime { gap: 22px; padding-top: 20px; border-top: 1px solid rgba(var(--contrast-rgb), 0.055); }
+.game-proxy-runtime .diagnostic-section + .diagnostic-section { margin-top: 0; }
+.game-proxy-runtime-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.game-proxy-status { color: var(--text-default); font: 600 12px/1.5 var(--font-ui); }
+.game-proxy-status.running { color: var(--success); }
+.game-proxy-status.transitioning { color: var(--warning); }
+.game-proxy-status.failed,
+.game-proxy-error .diagnostic-note { color: var(--danger); }
+.game-proxy-error .diagnostic-note { word-break: keep-all; overflow-wrap: anywhere; user-select: text; }
+.game-proxy-unsupported { margin-top: 14px; }
+
+@media (max-width: 400px) {
+  .game-proxy-directory-control,
+  .game-proxy-node-grid,
+  .game-proxy-runtime-grid { grid-template-columns: minmax(0, 1fr); }
+  .game-proxy-directory-control .push-to-talk-key-button { justify-self: start; }
+}
 
 .diagnostic-heading {
   min-height: 22px;
