@@ -10,6 +10,7 @@ require (
 	github.com/huin/goupnp v1.3.0
 	github.com/jackpal/gateway v1.2.0
 	github.com/jackpal/go-nat-pmp v1.0.2
+	github.com/sagernet/gvisor v0.0.0-20250811.0-sing-box-mod.1
 	github.com/thesyncim/gopus v0.1.1
 	github.com/wailsapp/wails/v2 v2.11.0
 	golang.org/x/crypto v0.48.0
@@ -22,6 +23,7 @@ require (
 	github.com/bep/debounce v1.2.1 // indirect
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
+	github.com/google/btree v1.1.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/jchv/go-winloader v0.0.0-20210711035445-715c2860da7e // indirect
@@ -45,4 +47,5 @@ require (
 	github.com/wailsapp/mimetype v1.4.1 // indirect
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
+	golang.org/x/time v0.8.0 // indirect
 )
