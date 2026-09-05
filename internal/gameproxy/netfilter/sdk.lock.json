@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "version": "1.7.6.7",
+  "source_url": "https://netfiltersdk.com/download/nfsdk/demo/nfsdk-demo-1.7.6.7.zip",
+  "archive": {
+    "name": "nfsdk-demo-1.7.6.7.zip",
+    "sha256": "7211839444cec3d83f531a882ea837cf17a0f003ff0aec036786e882906e817b"
+  },
+  "platform": "windows/amd64",
+  "files": [
+    {
+      "path": "nfsdk/include/nfdriver_data.h",
+      "sha256": "5cf8263e816eb179dfa9644e0b3c6455497df36ae7ae31f7d9f793039ae78c3e"
+    },
+    {
+      "path": "nfsdk/include/nfevents.h",
+      "sha256": "ae3117af8ff067095b907807532d5975183f44f391b66506c6c1e13cc5d80684"
+    },
+    {
+      "path": "nfsdk/wfp/include/nfapi.h",
+      "sha256": "be868cfe554f889675f90776f53081bdbabcea54ce85f214aa306a2996b6fc3f"
+    },
+    {
+      "path": "nfsdk/wfp/bin/release_c_api/x64/nfapi.dll",
+      "sha256": "f944b933d948c6ea51b89e790accff07bd9a48f9a9e235abd50a6f40ac7c54b0"
+    },
+    {
+      "path": "nfsdk/wfp/bin/release_c_api/x64/nfregdrv.exe",
+      "sha256": "88e265a125c6318079fb8aa56ae5a9aebdc8733dd0c77f7e004b383528e85e97"
+    },
+    {
+      "path": "nfsdk/wfp/bin/driver/x64/netfilter2.sys",
+      "sha256": "ba886de5cbd275c8c20ccc852ef18395118e2f7d54183685f4ab9b44bcb8b48c"
+    },
+    {
+      "path": "nfsdk/wfp/samples/nfsdk/C_C++/PassThrough_c/PassThrough.c",
+      "sha256": "eea5e444e68232e48db3a105c642eb713b65d0de5bbe72d3c2ebdbfb76da2096"
+    }
+  ]
+}

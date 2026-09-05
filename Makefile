@@ -39,12 +39,16 @@ $(error BUILD_FLAGS must not contain -platform; use PLATFORMS instead)
 endif
 
 TAG_FLAGS := $(if $(strip $(TAGS)),-tags "$(strip $(TAGS))")
+NETFILTER_SDK_PREREQUISITE := $(if $(filter netfilter_sdk,$(strip $(TAGS))),verify-netfilter-sdk)
 
 ifneq ($(strip $(PLATFORMS)),)
 PLATFORM_FLAGS := -platform "$(PLATFORMS)"
 endif
 
-.PHONY: build dev bindings frontend-deps typecheck-frontend prepare-packaging package-msix
+.PHONY: build dev bindings frontend-deps typecheck-frontend prepare-packaging package-msix verify-netfilter-sdk
+
+verify-netfilter-sdk:
+	go run ./tools/netfiltersdk verify
 
 bindings:
 	$(WAILS_CMD) generate module
@@ -62,7 +66,7 @@ prepare-packaging:
 	cp frontend/packaging/darwin/Info.plist build/darwin/Info.plist
 	cp frontend/packaging/darwin/Info.dev.plist build/darwin/Info.dev.plist
 
-build: prepare-packaging
+build: $(NETFILTER_SDK_PREREQUISITE) prepare-packaging
 	$(CHECK_BUILD_VERSION)
 	$(WAILS_CMD) build -clean -trimpath -ldflags "-s -w -X bork/internal/app.BuildVersion=$(VERSION)" $(PLATFORM_FLAGS) $(TAG_FLAGS) $(BUILD_FLAGS)
 
@@ -76,5 +80,5 @@ package-msix: build
 	MSIX_VERSION="$(MSIX_VERSION)" powershell.exe -NoProfile -Command '$$manifest = [xml](Get-Content -Raw "frontend/packaging/windows/AppxManifest.xml"); $$manifest.Package.Identity.Version = $$env:MSIX_VERSION; $$manifest.Save([IO.Path]::GetFullPath("$(MSIX_STAGE)/AppxManifest.xml"))'
 	powershell.exe -NoProfile -Command '& "$(MAKEAPPX)" pack /d "$(MSIX_STAGE)" /p "$(MSIX_OUTPUT)" /o; exit $$LASTEXITCODE'
 
-dev: prepare-packaging
+dev: $(NETFILTER_SDK_PREREQUISITE) prepare-packaging
 	$(WAILS_CMD) dev $(TAG_FLAGS) $(DEV_FLAGS)
