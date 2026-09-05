@@ -4,8 +4,10 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"testing"
 )
@@ -104,12 +106,18 @@ func TestScanExecutableRulesRejectsCanonicalPathOutsideRoot(t *testing.T) {
 	}
 }
 
-func TestScanExecutableRulesDoesNotTraverseDirectorySymlinks(t *testing.T) {
+func TestScanExecutableRulesSkipsDirectoryLinksWithoutSkippingSiblings(t *testing.T) {
 	root := t.TempDir()
-	inside := writeTestFile(t, filepath.Join(root, "inside.exe"))
+	inside := writeTestFile(t, filepath.Join(root, "game.exe"))
 	externalRoot := t.TempDir()
 	writeTestFile(t, filepath.Join(externalRoot, "outside.exe"))
-	if err := os.Symlink(externalRoot, filepath.Join(root, "linked")); err != nil {
+	link := filepath.Join(root, "00-linked")
+	if runtime.GOOS == "windows" {
+		// Junctions exercise directory reparse points without symlink privileges.
+		if output, err := exec.Command("cmd.exe", "/d", "/c", "mklink", "/J", link, externalRoot).CombinedOutput(); err != nil {
+			t.Fatalf("create directory junction: %v: %s", err, output)
+		}
+	} else if err := os.Symlink(externalRoot, link); err != nil {
 		t.Skipf("directory symlinks unavailable: %v", err)
 	}
 

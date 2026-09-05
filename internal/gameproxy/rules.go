@@ -53,7 +53,11 @@ func scanExecutableRules(root string, canonicalize pathCanonicalizer) (Executabl
 			return fmt.Errorf("inspect path %q: %w", path, err)
 		}
 		if reparseDirectory {
-			return fs.SkipDir
+			// SkipDir on a non-directory entry would skip its remaining siblings.
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".exe") {
 			return nil

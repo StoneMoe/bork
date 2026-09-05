@@ -250,13 +250,17 @@ func TestBridge_UDP_rejects_not_ready_and_admission_error(t *testing.T) {
 		backend := &udpTestBackend{}
 		callbacks := &udpTestCallbacks{
 			state: intercept.GenerationState{Generation: 2, Ready: true}, admissionErr: admissionErr,
-			accepted: make(chan udpCallbackRecord, 1),
+			accepted: make(chan udpCallbackRecord, 1), endpointErrors: make(chan error, 1),
 		}
 		bridge := startUDPTestBridge(t, backend, callbacks)
 		bridge.udpCreated(validUDPEvent(222))
 
 		bridge.udpSend(validUDPSend(222, netip.MustParseAddrPort("8.8.8.8:53"), []byte("query")))
 		endpoint := (<-callbacks.accepted).endpoint
+		// EndpointError is reported only after the asynchronous rejection finishes Reset.
+		if err := <-callbacks.endpointErrors; !errors.Is(err, admissionErr) {
+			t.Fatalf("EndpointError = %v, want admission error", err)
+		}
 		_, readErr := endpoint.ReadDatagram(context.Background())
 
 		if !errors.Is(readErr, admissionErr) {
