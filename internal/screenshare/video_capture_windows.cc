@@ -13,6 +13,7 @@
 #include <mferror.h>
 #include <mfidl.h>
 #include <mftransform.h>
+#include <strmif.h>
 #include <codecapi.h>
 #include <propvarutil.h>
 
