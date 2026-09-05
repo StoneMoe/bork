@@ -54,6 +54,16 @@ network:
   tracker_urls:
     - https://bork-pex.iii.moe/announce
   port_mapping: true
+game_proxy:
+  directories: []
+  node:
+    server: ""
+    port: 4567
+    username: ""
+    password: ""
+    mtu: 1400
+    dns: 1.1.1.1
+    encrypt: false
 ```
 
 各平台配置路径：
@@ -65,6 +75,8 @@ network:
 - 空的 `stun_servers` 列表会禁用公共 STUN 服务。
 - 空的 `tracker_urls` 列表会禁用公共 Tracker 服务。
 - 将 `port_mapping` 设为 `false` 会禁用网关端口映射。
+- `game_proxy.directories` 是 Windows 游戏可执行文件的递归扫描根目录列表；空列表表示尚未配置游戏代理。
+- `game_proxy.node.encrypt` 默认关闭；开启后请求服务器使用 iWAN XOR 数据混淆，最终模式以服务器 `OPENACK` 为准。
 - 默认 Tracker 可看到派生的 tracker hash、派生的 20 字节 tracker `peer_id`、候选地址和源地址，但无法获取 `RoomSeed`、房间状态或媒体明文；tracker `peer_id` 由本次入房的 `PeerID` 派生。
 
 ### 构建与验证
