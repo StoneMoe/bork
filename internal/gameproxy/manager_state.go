@@ -1,8 +1,11 @@
+//go:build game_proxy
+
 package gameproxy
 
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"bork/internal/gameproxy/intercept"
 	"bork/internal/gameproxy/iwan"
@@ -19,18 +22,28 @@ func (manager *Manager) updateExecutableCount(run *managerRun, count int) {
 	manager.publishLocked(status)
 }
 
-func (manager *Manager) updateTraffic(run *managerRun, traffic TrafficStats) {
+func (manager *Manager) updateTraffic(run *managerRun, traffic TrafficStats, runtimeStatus iwan.Status) {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	if manager.current != run || run.ctx.Err() != nil {
 		return
 	}
 	status := manager.status
+	if status.State != StateRunning || runtimeStatus.State != iwan.StateReady || runtimeStatus.Generation != status.Generation {
+		traffic.UploadRate = 0
+		traffic.DownloadRate = 0
+	} else {
+		status.TrafficHistory = append(slices.Clone(status.TrafficHistory), TrafficSample{
+			At: runtimeStatus.Quality.ObservedAt, Generation: runtimeStatus.Generation,
+			UploadRate: traffic.UploadRate, DownloadRate: traffic.DownloadRate,
+		})
+	}
 	status.Traffic = traffic
+	status.Quality = runtimeStatus.Quality
 	manager.publishLocked(status)
 }
 
-func (manager *Manager) publishRunning(run *managerRun, generation uint64) bool {
+func (manager *Manager) publishRunning(run *managerRun, runtimeStatus iwan.Status) bool {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	if manager.current != run || run.ctx.Err() != nil {
@@ -39,7 +52,8 @@ func (manager *Manager) publishRunning(run *managerRun, generation uint64) bool 
 	manager.appendEventLocked(run, "info", "Game proxy is running")
 	status := manager.status
 	status.State = StateRunning
-	status.Generation = generation
+	status.Generation = runtimeStatus.Generation
+	status.Quality = runtimeStatus.Quality
 	status.Error = ""
 	manager.publishLocked(status)
 	return true
@@ -54,6 +68,7 @@ func (manager *Manager) updateRuntime(run *managerRun, state State, runtimeStatu
 	status := manager.status
 	status.State = state
 	status.Generation = runtimeStatus.Generation
+	status.Quality = runtimeStatus.Quality
 	status.Error = run.sanitize(errorString(runtimeStatus.Err))
 	manager.publishLocked(status)
 }
@@ -131,6 +146,14 @@ func (manager *Manager) cleanup(run *managerRun, failure error) error {
 
 func (manager *Manager) finish(run *managerRun, state State, err error) State {
 	run.cancel()
+	var runtimeStatus iwan.Status
+	if run.supervisor != nil {
+		runtimeStatus = run.supervisor.Status()
+	}
+	var traffic TrafficStats
+	if run.relay != nil {
+		traffic = run.relay.Traffic()
+	}
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	if manager.current != run {
@@ -142,6 +165,8 @@ func (manager *Manager) finish(run *managerRun, state State, err error) State {
 		err = nil
 	}
 	status.State = state
+	status.Quality = runtimeStatus.Quality
+	status.Traffic = traffic
 	status.Error = run.sanitize(errorString(err))
 	manager.current = nil
 	manager.publishLocked(status)

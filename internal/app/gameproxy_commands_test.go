@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package app
 
 import (
@@ -279,10 +281,10 @@ func startedGameProxyTestApp(cfg config.AppConfig) *App {
 
 func startedGameProxyTestAppWithContext(cfg config.AppConfig, ctx context.Context) *App {
 	application := NewApp(cfg, nil)
-	gameProxyRunContext, cancelGameProxyRuns := context.WithCancel(ctx)
+	application.stateMu.Lock()
 	application.appContext = ctx
-	application.gameProxyRunContext = gameProxyRunContext
-	application.cancelGameProxyRuns = cancelGameProxyRuns
+	application.initGameProxyRunContextLocked(ctx)
+	application.stateMu.Unlock()
 	close(application.startupDone)
 	return application
 }

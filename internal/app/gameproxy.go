@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package app
 
 import (
@@ -9,14 +11,64 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"bork/internal/config"
 	"bork/internal/gameproxy"
 	"bork/internal/gameproxy/iwan"
+	"bork/internal/gameproxy/netfilter"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
+
+type gameProxyAppState struct {
+	selectGameProxyDirectory func(context.Context, wailsruntime.OpenDialogOptions) (string, error)
+	gameProxyManager         gameProxyManager
+
+	// Proxy I/O must not hold commandMu, which also gates microphone/PTT changes.
+	gameProxyMu        sync.Mutex
+	gameProxyStartDone <-chan struct{}
+
+	stopGameProxyWatcherFunc context.CancelFunc
+	gameProxyWatcherDone     chan struct{}
+	gameProxyRunContext      context.Context
+	cancelGameProxyRuns      context.CancelFunc
+}
+
+func newGameProxyAppState() gameProxyAppState {
+	return gameProxyAppState{
+		selectGameProxyDirectory: wailsruntime.OpenDirectoryDialog,
+		gameProxyManager:         gameproxy.NewManager(netfilter.NewFactory()),
+	}
+}
+
+func (a *App) initGameProxyRunContextLocked(ctx context.Context) {
+	a.gameProxyRunContext, a.cancelGameProxyRuns = context.WithCancel(ctx)
+}
+
+func (a *App) snapshotGameProxyConfigLocked(state *AppSnapshot) {
+	state.GameProxy.Config = projectGameProxyConfig(a.config.GameProxy)
+	_, err := config.ValidateGameProxyNode(a.config.GameProxy.Node)
+	state.GameProxy.NodeConfigured = err == nil
+}
+
+func (a *App) snapshotGameProxyStatus(state *AppSnapshot) {
+	state.GameProxy.Status = projectGameProxyStatus(a.gameProxyManager.Status())
+}
+
+func (a *App) detachGameProxyRunContextLocked() context.CancelFunc {
+	cancel := a.cancelGameProxyRuns
+	a.gameProxyRunContext = nil
+	a.cancelGameProxyRuns = nil
+	return cancel
+}
+
+func (a *App) shutdownGameProxy() {
+	a.gameProxyMu.Lock()
+	defer a.gameProxyMu.Unlock()
+	a.stopGameProxyLocked()
+}
 
 type gameProxyManager interface {
 	Start(context.Context, gameproxy.StartInput) error
@@ -41,20 +93,48 @@ type GameProxyConfigInput struct {
 	Node        GameProxyNodeInput `json:"node"`
 }
 
+type GameProxyLinkSampleSnapshot struct {
+	At          string   `json:"at"`
+	Generation  uint64   `json:"generation"`
+	RTTMillis   *float64 `json:"rttMs"`
+	LossPercent float64  `json:"lossPercent"`
+}
+
+type GameProxyQualitySnapshot struct {
+	ObservedAt  string                        `json:"observedAt"`
+	RTTMillis   *float64                      `json:"rttMs"`
+	LossPercent *float64                      `json:"lossPercent"`
+	History     []GameProxyLinkSampleSnapshot `json:"history"`
+}
+
+type GameProxyTrafficSampleSnapshot struct {
+	At           string `json:"at"`
+	Generation   uint64 `json:"generation"`
+	UploadRate   uint64 `json:"uploadRate"`
+	DownloadRate uint64 `json:"downloadRate"`
+}
+
 type GameProxyStatusSnapshot struct {
-	Supported       bool                        `json:"supported"`
-	State           string                      `json:"state"`
-	Generation      uint64                      `json:"generation"`
-	ExecutableCount int                         `json:"executableCount"`
-	Directories     []string                    `json:"directories"`
-	Events          []gameproxy.ConnectionEvent `json:"events"`
-	Error           string                      `json:"error,omitempty"`
-	Traffic         gameproxy.TrafficStats      `json:"traffic"`
+	Supported       bool                             `json:"supported"`
+	State           string                           `json:"state"`
+	Generation      uint64                           `json:"generation"`
+	ExecutableCount int                              `json:"executableCount"`
+	Directories     []string                         `json:"directories"`
+	Events          []gameproxy.ConnectionEvent      `json:"events"`
+	Error           string                           `json:"error,omitempty"`
+	Traffic         gameproxy.TrafficStats           `json:"traffic"`
+	TrafficHistory  []GameProxyTrafficSampleSnapshot `json:"trafficHistory"`
+	Quality         GameProxyQualitySnapshot         `json:"quality"`
 }
 
 type GameProxySnapshot struct {
-	Config GameProxyConfigInput    `json:"config"`
-	Status GameProxyStatusSnapshot `json:"status"`
+	Config         GameProxyConfigInput    `json:"config"`
+	Status         GameProxyStatusSnapshot `json:"status"`
+	NodeConfigured bool                    `json:"nodeConfigured"`
+}
+
+func (a *App) GetGameProxyLicense() (string, error) {
+	return netfilter.License()
 }
 
 func (a *App) SelectGameProxyDirectory() (string, error) {
@@ -145,6 +225,23 @@ func (a *App) SaveGameProxyConfig(input GameProxyConfigInput) error {
 	a.stateMu.Unlock()
 	a.markStateChanged()
 	return nil
+}
+
+func (a *App) ExportGameProxyNode() (string, error) {
+	a.waitForStartup()
+	a.stateMu.RLock()
+	stored := a.config.GameProxy
+	a.stateMu.RUnlock()
+	return stored.ExportNodeBase64()
+}
+
+func (a *App) DecodeGameProxyNode(encoded string) (GameProxyNodeInput, error) {
+	var candidate config.GameProxyConfig
+	if err := candidate.ImportNodeBase64(strings.TrimSpace(encoded)); err != nil {
+		// Decoder errors may quote untrusted JSON keys containing credentials.
+		return GameProxyNodeInput{}, errors.New("invalid Base64 JSON node configuration")
+	}
+	return projectGameProxyConfig(candidate).Node, nil
 }
 
 func (a *App) StartGameProxy() error {
@@ -353,9 +450,29 @@ func projectGameProxyStatus(value gameproxy.Status) GameProxyStatusSnapshot {
 	if events == nil {
 		events = []gameproxy.ConnectionEvent{}
 	}
+	// Keep monotonic times inside iWAN; expose explicit ISO strings to Wails.
+	quality := value.Quality.Clone()
+	history := make([]GameProxyLinkSampleSnapshot, len(quality.History))
+	for index, sample := range quality.History {
+		history[index] = GameProxyLinkSampleSnapshot{
+			At: sample.At.Format(time.RFC3339Nano), Generation: sample.Generation,
+			RTTMillis: sample.RTTMillis, LossPercent: sample.LossPercent,
+		}
+	}
+	trafficHistory := make([]GameProxyTrafficSampleSnapshot, len(value.TrafficHistory))
+	for index, sample := range value.TrafficHistory {
+		trafficHistory[index] = GameProxyTrafficSampleSnapshot{
+			At: sample.At.Format(time.RFC3339Nano), Generation: sample.Generation,
+			UploadRate: sample.UploadRate, DownloadRate: sample.DownloadRate,
+		}
+	}
 	return GameProxyStatusSnapshot{
 		Supported: value.Supported, State: string(value.State), Generation: value.Generation,
 		ExecutableCount: value.ExecutableCount, Directories: directories,
-		Events: events, Error: value.Error, Traffic: value.Traffic,
+		Events: events, Error: value.Error, Traffic: value.Traffic, TrafficHistory: trafficHistory,
+		Quality: GameProxyQualitySnapshot{
+			ObservedAt: quality.ObservedAt.Format(time.RFC3339Nano), RTTMillis: quality.RTTMillis,
+			LossPercent: quality.LossPercent, History: history,
+		},
 	}
 }

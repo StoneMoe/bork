@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit"
+    "build": "npm run typecheck && vite build",
+    "typecheck": "node typecheck.mjs"
   },
   "dependencies": {
     "solid-js": "^1.9.14"

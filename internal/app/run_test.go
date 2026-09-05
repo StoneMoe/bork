@@ -24,7 +24,8 @@ func (logger *recordingWailsLogger) Info(message string) {
 }
 
 func TestPrivateWailsLogger_drops_snapshot_payload_traces(t *testing.T) {
-	application := NewApp(config.AppConfig{GameProxy: validConfigGameProxy("/games")}, nil)
+	application := NewApp(config.AppConfig{}, nil)
+	application.nickname = "private-nickname"
 	contents, err := json.Marshal(application.snapshot())
 	if err != nil {
 		t.Fatal(err)

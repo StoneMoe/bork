@@ -1,12 +1,26 @@
 package app
 
 import (
+	"reflect"
 	"testing"
 
 	"bork/internal/config"
 	"bork/internal/invite"
 	"bork/internal/peer"
 )
+
+func TestAppSnapshot_has_flat_common_fields(t *testing.T) {
+	snapshotType := reflect.TypeFor[AppSnapshot]()
+	if snapshotType.Name() != "AppSnapshot" {
+		t.Fatalf("snapshot concrete name = %q", snapshotType.Name())
+	}
+	for _, name := range []string{"Version", "Nickname", "Room", "Audio", "Diagnostics"} {
+		field, ok := snapshotType.FieldByName(name)
+		if !ok || field.Anonymous || len(field.Index) != 1 {
+			t.Errorf("snapshot field %s must be flat for Wails binding collection", name)
+		}
+	}
+}
 
 func TestSnapshotScopesPeerIDToRoom(t *testing.T) {
 	application := NewApp(config.AppConfig{}, nil)

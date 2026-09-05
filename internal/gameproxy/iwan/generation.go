@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package iwan
 
 import (
@@ -7,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
 	"bork/internal/gameproxy/netstack"
 )
@@ -25,6 +28,7 @@ type generation struct {
 	reassembler *Reassembler
 	dataPath    *dataPathCounters
 	echo        Echo
+	echoSent    time.Time
 	readEvents  chan datagramEvent
 	workers     sync.WaitGroup
 	cancelRead  context.CancelFunc

@@ -2,6 +2,7 @@
 /build/
 /internal/webassets/dist/
 /internal/gameproxy/netfilter/sdk/
+/internal/gameproxy/netfilter/helper/bork-driver-helper.exe
 
 /frontend/node_modules/
 /frontend/package.json.md5

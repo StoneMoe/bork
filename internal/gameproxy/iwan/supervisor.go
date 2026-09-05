@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package iwan
 
 import (
@@ -26,6 +28,7 @@ type Supervisor struct {
 	status          Status
 	active          *netstack.Stack
 	dataPath        *dataPathCounters
+	linkHistory     []LinkSample
 	dataPathEvents  []DataPathEvent
 	droppedDataPath uint64
 	nextID          uint64
@@ -70,6 +73,7 @@ func (supervisor *Supervisor) Start(ctx context.Context) error {
 	supervisor.desired = true
 	supervisor.everReady = false
 	supervisor.dataPath = nil
+	supervisor.linkHistory = nil
 	supervisor.cancel = cancel
 	supervisor.runDone = done
 	supervisor.publishLocked(Status{State: StateConnecting, Generation: supervisor.nextID})
@@ -113,6 +117,7 @@ func (supervisor *Supervisor) statusLocked() Status {
 	if supervisor.dataPath != nil {
 		status.DataPath = supervisor.dataPath.snapshot()
 	}
+	status.Quality = supervisor.linkQualityLocked(time.Now())
 	return status
 }
 

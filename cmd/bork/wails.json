@@ -16,6 +16,7 @@
   "info": {
     "productName": "Bork",
     "productVersion": "0.0.1",
+    "copyright": "Copyright (c) 2026 Bork contributors.",
     "comments": "Low-latency voice-first chat"
   }
 }

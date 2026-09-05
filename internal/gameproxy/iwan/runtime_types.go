@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package iwan
 
 import (
@@ -73,6 +75,7 @@ type Status struct {
 	MTU        uint16
 	Err        error
 	DataPath   DataPathStats
+	Quality    LinkQuality `json:"quality"`
 }
 
 type DataPathEventPhase string

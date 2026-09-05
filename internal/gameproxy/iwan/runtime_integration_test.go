@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package iwan
 
 import (
@@ -248,11 +250,15 @@ func TestGeneration_respondsToEchoRequestAndSendsPeriodicEcho(t *testing.T) {
 
 func TestGeneration_echoRequestsCarryTrackedRTT(t *testing.T) {
 	session := goldenSession(t)
-	current := generation{session: session, echo: Echo{MinimumDelay: ^uint32(0)}}
+	current := generation{
+		id: 1, session: session, echo: Echo{MinimumDelay: ^uint32(0)}, timings: defaultRuntimeTimings(),
+		owner: &Supervisor{desired: true, status: Status{State: StateReady, Generation: 1}},
+	}
 	now := time.Unix(100, 500_000)
-	current.recordEchoResponse(now.Add(-12*time.Millisecond), now)
-	current.recordEchoResponse(now.Add(-20*time.Millisecond), now)
-	current.recordEchoResponse(now.Add(-5*time.Millisecond), now)
+	for _, delay := range []time.Duration{12 * time.Millisecond, 20 * time.Millisecond, 5 * time.Millisecond} {
+		current.echoSent = now.Add(-delay)
+		current.recordEchoResponse(current.echoSent, now)
+	}
 	control, err := ParseControl(current.buildEchoRequest(now), session)
 	if err != nil {
 		t.Fatal(err)

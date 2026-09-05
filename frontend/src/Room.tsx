@@ -327,19 +327,28 @@ export default function Room(props: RoomProps) {
     if (screenStage) screenStageObserver.unobserve(screenStage);
     screenStage = stage;
     screenStageObserver.observe(stage);
-    if (nativePopoverSupported) {
-      queueMicrotask(() => {
-        if (screenStage === stage && stage.isConnected && !nativePopoverOpen(stage)) stage.showPopover();
-      });
-    }
+    // Solid binds refs before insertion; ancestors are only available afterward.
+    queueMicrotask(() => {
+      if (screenStage !== stage || !stage.isConnected) return;
+      const mainView = stage.closest(".main-view");
+      if (mainView) screenStageObserver.observe(mainView);
+      if (nativePopoverSupported && !nativePopoverOpen(stage)) stage.showPopover();
+      clampScreenStage(stage);
+    });
   }
 
   function clampScreenStage(stage: HTMLElement) {
     if (props.screenFullscreen) return;
     const aspectRatio = screenAspectRatio();
+    const defaultPosition = !stage.style.left && !stage.style.top;
+    // Reserve the in-flow proxy footer for the default viewer placement.
+    // Explicitly dragged viewers remain under the user's control.
+    const bottomInset = defaultPosition ? Math.max(screenStageDefaultInset,
+      window.innerHeight - (stage.closest(".main-view")?.getBoundingClientRect().bottom ?? window.innerHeight) + screenViewportMargin,
+    ) : screenViewportMargin;
     const maxWidth = Math.max(1, Math.min(
       window.innerWidth - screenViewportMargin * 2,
-      (window.innerHeight - screenViewportMargin * 2) * aspectRatio,
+      (window.innerHeight - bottomInset - screenViewportMargin) * aspectRatio,
     ));
     const minWidth = Math.min(maxWidth, Math.max(screenStageMinWidth, screenStageMinHeight * aspectRatio));
     const currentWidth = stage.getBoundingClientRect().width;
@@ -347,12 +356,11 @@ export default function Room(props: RoomProps) {
     if (Math.abs(width - currentWidth) > 0.5) {
       stage.style.width = `${width}px`;
     }
-    const defaultPosition = !stage.style.left && !stage.style.top;
     if (defaultPosition) {
       const right = stage.offsetWidth + screenStageDefaultInset <= window.innerWidth - screenViewportMargin
         ? screenStageDefaultInset : screenViewportMargin;
-      const bottom = stage.offsetHeight + screenStageDefaultInset <= window.innerHeight - screenViewportMargin
-        ? screenStageDefaultInset : screenViewportMargin;
+      const bottom = stage.offsetHeight + bottomInset <= window.innerHeight - screenViewportMargin
+        ? bottomInset : screenViewportMargin;
       stage.style.right = `${right}px`;
       stage.style.bottom = `${bottom}px`;
       return;

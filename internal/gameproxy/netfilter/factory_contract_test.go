@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package netfilter
 
 import (
@@ -22,8 +24,8 @@ var _ bridgeFactoryContract = NewFactory()
 func TestFactoryWindowsSource_has_exact_build_and_embed_contract(t *testing.T) {
 	// Given
 	const filename = "factory_windows.go"
-	const buildConstraint = "//go:build windows && amd64 && cgo && netfilter_sdk"
-	const embedDirective = "//go:embed sdk/nfsdk/wfp/bin/release_c_api/x64/nfapi.dll"
+	const buildConstraint = "//go:build windows && amd64 && cgo && game_proxy"
+	const embedDirective = "//go:embed helper/bork-driver-helper.exe"
 
 	// When
 	contents, err := os.ReadFile(filename)
@@ -52,13 +54,12 @@ func TestFactoryWindowsSource_has_exact_build_and_embed_contract(t *testing.T) {
 	if len(embeds) != 1 || embeds[0] != embedDirective {
 		t.Fatalf("embed directives = %q, want [%q]", embeds, embedDirective)
 	}
-	assertFactorySourceHasNoDriverPayload(t, string(contents))
 }
 
 func TestFactoryUnsupportedSource_has_exact_complement_without_native_references(t *testing.T) {
 	// Given
 	const filename = "factory_unsupported.go"
-	const buildConstraint = "//go:build !windows || !amd64 || !cgo || !netfilter_sdk"
+	const buildConstraint = "//go:build game_proxy && (!windows || !amd64 || !cgo)"
 
 	// When
 	contents, err := os.ReadFile(filename)
@@ -73,20 +74,9 @@ func TestFactoryUnsupportedSource_has_exact_complement_without_native_references
 		t.Fatalf("build constraint = %q, want %q", firstLine, buildConstraint)
 	}
 	source := strings.ToLower(string(contents))
-	for _, forbidden := range []string{"go:embed", `"embed"`, "sdk/", "newnativebackend", "newbridge"} {
+	for _, forbidden := range []string{"go:embed", `"embed"`, "sdk/", "newnativebackend", "newbridge", ".sys", "nfregdrv"} {
 		if strings.Contains(source, forbidden) {
 			t.Errorf("unsupported factory source contains forbidden reference %q", forbidden)
-		}
-	}
-	assertFactorySourceHasNoDriverPayload(t, source)
-}
-
-func assertFactorySourceHasNoDriverPayload(t *testing.T, source string) {
-	t.Helper()
-	source = strings.ToLower(source)
-	for _, forbidden := range []string{".sys", "nfregdrv"} {
-		if strings.Contains(source, forbidden) {
-			t.Errorf("factory source contains forbidden payload reference %q", forbidden)
 		}
 	}
 }

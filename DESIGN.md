@@ -99,7 +99,7 @@ Half-step and legacy values (`3`, `5`, `6`, `7`, `9`, `10`, `11`, `13`, `14`, `1
 
 ### Shell, Grid, and Scroll Ownership
 
-- `--content-max-width: 1280px`; `.shell` is full-size with `70px 1fr` rows and `12px` inset, dropping to `58px` and `7px` below `640px`. Maximized windows remove the outer inset.
+- `--content-max-width: 1280px`; `.shell` is full-size with `70px minmax(0, 1fr) auto` rows for the topbar, main view and optional acceleration footer, plus `12px` inset. The topbar drops to `58px` and the inset to `7px` below `640px`. Maximized windows remove the outer inset.
 - `.topbar` and `.main-view` share the content maximum. The topbar is a Wails drag region; buttons opt out.
 - The room centers a vertical `.room-peers` stack up to `900px` wide and `560px` high. Lists own their internal vertical scroll.
 - The settings layer is fixed. `.settings-drawer` is `min(480px, 92vw)`, full-height, and a two-row grid: tabs plus `minmax(0, 1fr)`. The drawer itself stays `overflow: hidden`; `.settings-content` is the only panel scroll owner, with `overflow-y: auto`, `overscroll-behavior: contain`, and stable scrollbar gutter. Tabs and issue overlay do not scroll with panel content.
@@ -108,7 +108,7 @@ Half-step and legacy values (`3`, `5`, `6`, `7`, `9`, `10`, `11`, `13`, `14`, `1
 
 ## 5. Components
 
-The following existing primitives and states are the contract for the upcoming game-proxy Settings tab.
+The following existing primitives and states also apply to the game-proxy Settings tab.
 
 ### Application Shell and Topbar
 
@@ -185,9 +185,23 @@ The following existing primitives and states are the contract for the upcoming g
 - **Accessibility**: descriptive trigger count, expanded state, labelled dismiss action, Escape close, live alert announcement, and focus recovery.
 - **Motion/depth**: 120ms popover reveal; warning/danger border, raised surface, and shadow distinguish it without a new palette.
 
-### Fourth Settings Tab Integration Contract
+### Game Proxy Settings
 
-Add the future tab to the existing `settingsTabs` model and use the same tab/tabpanel IDs, ARIA linkage, roving keyboard behavior, `.settings-section` inset, and `.settings-content` scroll owner. Compose setting rows, existing form controls, diagnostic groups, and attention/error items as applicable. The current three-column CSS coupling must be changed when the fourth tab is implemented; it is not changed by this extraction.
+The game-proxy tab is compiled only with `TAGS=game_proxy`; default builds omit its components, bindings and CSS entirely. It uses the shared tab/tabpanel IDs, ARIA linkage, roving keyboard behavior, `.settings-section` inset, and `.settings-content` scroll owner. Its form composes directory rows, node fields, compact actions, runtime diagnostics, and bounded logs. The settings tab strip uses equal-width automatic columns: three by default, four with the feature enabled. Switching tabs preserves the proxy draft.
+
+Server fields and node transfer actions default to a collapsed disclosure opened by Configure Server. Successful Save or import collapses it and restores focus to the trigger; failure preserves the draft. Import still requires explicit Save, with the unsaved warning and Save action visible outside the disclosure. Directory and runtime controls remain visible. Within the editor, import expands a labelled textarea with adjacent validation errors. Export copies only the saved node as Base64 JSON and is disabled while edits are unsaved. Helper text warns that this contains credentials and Base64 is not encryption; notices and errors never repeat the payload.
+
+The settings page omits the duplicate live-traffic and current-run-directory sections, persistent first-start explanation and embedded-demo disclaimer. Editable game directories, runtime state, executable count, generation, errors and logs remain. Configure Server and Add Directory share one row. Export NetFilter License sits alongside Save/Start/Stop; Stop and license export stay together when the action row wraps on narrow windows. The license action still downloads the original RTF and its tooltip identifies the format. A short Start tooltip covers possible UAC consent without adding another paragraph.
+
+### Game Proxy Status Bar
+
+The status bar and its styles are also compiled only with `TAGS=game_proxy`; default builds leave no empty footer row.
+
+The shared shell reserves an in-flow bottom row for acceleration state, upstream/downstream rates, node RTT and probe timeout percentage. Starting, running and reconnecting offer Stop Acceleration; stopping disables repeated commands. Failure retains a clearly frozen last-run view and offers Start again. Inactive with a valid saved node shows a compact Start Acceleration row without charts; missing game directories disable Start with an explanation. Unsupported, unconfigured inactive and fullscreen screen viewing hide it. Commands use saved configuration and their own pending state rather than blocking voice controls. The default floating screen viewer stays above it; manually dragged viewers remain user-controlled. Desktop uses a connection/action column and four chart columns; below 760px the connection/actions span two chart columns. Voice content retains its own bounded scrolling rather than being overlaid.
+
+The connection heading is a green (running) or red (not connected) dot followed by Game Acceleration, with the Start/Stop button below it on desktop and beside it in compact layouts. There is no separate Connected label, node-connection subtitle or persistent sampling footnote. Detailed connection state remains in the heading tooltip and a visually hidden live region; metric definitions move to caption tooltips. Only missing-directory and frozen-failure help remains visible when applicable.
+
+Upload, download, RTT and loss each use a small SVG graph with the same three-minute time domain and current numeric value. Loss has a fixed 0-100% scale; rates and RTT have labelled adaptive scales. Upload uses a dashed muted-accent line, download a solid success line; labels distinguish them without relying on color. Generation changes, timeouts in RTT and unsampled intervals remain gaps; valid idle rates plot at zero. Values come from timestamped backend history, not frontend snapshot arrival frequency. Rates sample once per second, with at most 180 retained samples. Probe loss means the trailing 30-second proportion of iWAN ECHO requests not answered within two seconds, not game packet loss. Unknown RTT/loss values show `--`; only connection-state transitions use a live region, not every sample. No chart dependency or persistent history storage is added.
 
 ## 6. Motion & Interaction
 
@@ -232,9 +246,8 @@ Interaction motion communicates entry, open/closed state, confirmation, waiting,
 
 | Item | Location | Why accepted in this extraction | Owner / Exit |
 | --- | --- | --- | --- |
-| `Settings.tsx` is 565 lines and combines modal focus management, three tabs, preferences, device sync, diagnostics, tooltip positioning, and formatting helpers. | `frontend/src/Settings.tsx` | This task documents the existing system and does not refactor behavior before the game-proxy edit. | Frontend / split only with behavior-preserving coverage when Settings is next structurally refactored. |
+| `Settings.tsx` combines modal focus management, tabs, preferences, device sync, diagnostics, tooltip positioning, and formatting helpers; the optional proxy form is in `GameProxySettings.tsx`. | `frontend/src/Settings.tsx` | No navigation refactor is needed for node import/export. | Frontend / split only with behavior-preserving coverage when Settings is next structurally refactored. |
 | No frontend test framework or test script exists. | `frontend/package.json` | Current scripts are only `dev`, `build`, and `typecheck`; adding infrastructure is outside extraction scope. | Frontend / establish tests when interactive Settings logic is changed with an approved test task. |
 | Wails bindings are generated and ignored rather than reviewed source. | `build/` imports such as `@wailsjs/go/app/App`; `AGENTS.md` | This is the repository's existing build contract. | Build tooling / regenerate through the native build workflow; never hand-edit generated bindings. |
-| Spacing is based on 4px but not tokenized, with many legacy non-4px values. | All five `frontend/src/*.css` files | Normalizing values would be a redesign and could alter compact desktop geometry. | Frontend/design / consolidate only during an approved visual-system refactor. |
-| The settings tab track count is hard-coded to three while tab data lives in TSX. | `settings.css` `.settings-tabs`; `Settings.tsx` `settingsTabs` | Existing UI has exactly three tabs; no generic abstraction is needed yet. | Upcoming game-proxy tab / update the CSS track count together with the fourth tab. |
+| Spacing is based on 4px but not tokenized, with many legacy non-4px values. | `frontend/src/*.css` files | Normalizing values would be a redesign and could alter compact desktop geometry. | Frontend/design / consolidate only during an approved visual-system refactor. |
 | Dense metadata reaches 7-11px and typography sizes/weights are not named tokens. | `room-controls.css`, `settings.css`, `app.css` | These values are current command-center density, and this task has no measured accessibility or redesign mandate. | Frontend/design / evaluate contrast and legibility before changing dense metadata surfaces. |

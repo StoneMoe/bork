@@ -9,6 +9,10 @@
   "platform": "windows/amd64",
   "files": [
     {
+      "path": "nfsdk/license.rtf",
+      "sha256": "e5c922f776e1e9eb4c31393ec275b4474a4e04d8aeccd7a1e49d35c7e7655840"
+    },
+    {
       "path": "nfsdk/include/nfdriver_data.h",
       "sha256": "5cf8263e816eb179dfa9644e0b3c6455497df36ae7ae31f7d9f793039ae78c3e"
     },

@@ -1,6 +1,6 @@
 import * as Backend from "@wailsjs/go/app/App";
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { GameProxySettings } from "./GameProxySettings";
+import { SettingsPanel, settingsTabs as gameProxyTabs } from "@game-proxy";
 import type { IssueRecord } from "./issues";
 import { MicrophoneIcon, SpeakerIcon } from "./RoomControls";
 import Select, { type SelectOption } from "./Select";
@@ -22,7 +22,7 @@ const themeStorageKey = "bork.theme";
 const settingsTabs = [
   { id: "audio", label: "语音" },
   { id: "device", label: "偏好" },
-  { id: "game", label: "游戏代理" },
+  ...gameProxyTabs,
   { id: "network", label: "诊断" },
 ] as const;
 
@@ -392,19 +392,13 @@ export default function Settings(props: SettingsProps) {
             </div>
           </div>
           </section>
-          <section
-          id="settings-panel-game"
-          class="settings-section settings-panel"
-          role="tabpanel"
-          aria-labelledby="settings-tab-game"
-          hidden={activeTab() !== "game"}
-        >
-          <GameProxySettings
-            gameProxy={props.state.gameProxy}
+          <SettingsPanel
+            state={props.state}
+            activeTab={activeTab()}
             busy={props.busy}
+            ready={props.ready}
             runAction={props.runAction}
           />
-          </section>
           <section
           id="settings-panel-network"
           class="settings-section settings-panel"

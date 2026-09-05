@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package gameproxy
 
 import (
@@ -23,7 +25,11 @@ type Manager struct {
 	eventHead int
 }
 
-const maxConnectionEvents = 4096
+const (
+	maxConnectionEvents  = 4096
+	trafficHistoryWindow = 3 * time.Minute
+	maxTrafficSamples    = 180
+)
 
 type managerRun struct {
 	ctx         context.Context
@@ -209,9 +215,25 @@ func (manager *Manager) publish(status Status) {
 }
 
 func (manager *Manager) publishLocked(status Status) {
+	if status.State != StateRunning {
+		status.Quality.RTTMillis = nil
+		status.Quality.LossPercent = nil
+	}
+	if status.State != StateRunning || status.Generation != manager.status.Generation {
+		status.Traffic.UploadRate = 0
+		status.Traffic.DownloadRate = 0
+	}
+	first := max(0, len(status.TrafficHistory)-maxTrafficSamples)
+	for first < len(status.TrafficHistory) && status.Quality.ObservedAt.Sub(status.TrafficHistory[first].At) >= trafficHistoryWindow {
+		first++
+	}
+	// Reslice before comparing; never compact the previously published backing array.
+	status.TrafficHistory = status.TrafficHistory[first:]
 	if reflect.DeepEqual(manager.status, status) {
 		return
 	}
+	status.Quality = status.Quality.Clone()
+	status.TrafficHistory = slices.Clone(status.TrafficHistory)
 	manager.status = status
 	if len(status.Events) < maxConnectionEvents {
 		manager.eventHead = 0
@@ -263,6 +285,8 @@ func (manager *Manager) appendEventValueLocked(run *managerRun, level, message s
 }
 
 func cloneStatus(status Status, eventHead int) Status {
+	status.Quality = status.Quality.Clone()
+	status.TrafficHistory = slices.Clone(status.TrafficHistory)
 	status.Directories = slices.Clone(status.Directories)
 	if len(status.Events) == maxConnectionEvents && eventHead != 0 {
 		events := make([]ConnectionEvent, len(status.Events))
@@ -277,6 +301,9 @@ func cloneStatus(status Status, eventHead int) Status {
 	}
 	if status.Events == nil {
 		status.Events = []ConnectionEvent{}
+	}
+	if status.TrafficHistory == nil {
+		status.TrafficHistory = []TrafficSample{}
 	}
 	return status
 }

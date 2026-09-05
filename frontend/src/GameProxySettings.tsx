@@ -1,6 +1,7 @@
 import * as Backend from "@wailsjs/go/app/App";
 import { app } from "@wailsjs/go/models";
-import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
+import { ClipboardSetText } from "@wailsjs/runtime/runtime";
+import { batch, createEffect, createMemo, createSignal, For, Show } from "solid-js";
 import type { ActionProps, AppState } from "./types";
 
 interface GameProxySettingsProps {
@@ -98,23 +99,19 @@ function eventTime(value: string): string {
 type LogFilter = "fatal" | "error" | "warning" | "info";
 const logRanks: Record<LogFilter, number> = { fatal: 0, error: 1, warning: 2, info: 3 };
 
-function formatBytes(value: number): string {
-  if (value < 1024) return `${value} B`;
-  const units = ["KiB", "MiB", "GiB"];
-  let amount = value;
-  let unit = "B";
-  for (const next of units) {
-    amount /= 1024;
-    unit = next;
-    if (amount < 1024 || next === units[units.length - 1]) break;
-  }
-  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${unit}`;
-}
-
 export function GameProxySettings(props: GameProxySettingsProps) {
   const [draft, setDraft] = createSignal(draftFromConfig(props.gameProxy.config));
   const [dirty, setDirty] = createSignal(false);
   const [logFilter, setLogFilter] = createSignal<LogFilter>("fatal");
+  const [editorOpen, setEditorOpen] = createSignal(false);
+  const [importOpen, setImportOpen] = createSignal(false);
+  const [importText, setImportText] = createSignal("");
+  const [importError, setImportError] = createSignal("");
+  const [nodeNotice, setNodeNotice] = createSignal("");
+  let configureButton: HTMLButtonElement | undefined;
+  let serverField: HTMLInputElement | undefined;
+  let importButton: HTMLButtonElement | undefined;
+  let importField: HTMLTextAreaElement | undefined;
   const serializedDraft = createMemo(() => serializeDraft(draft()));
   const status = () => props.gameProxy.status;
   const canConfigure = () => configurableState(status().state);
@@ -122,6 +119,8 @@ export function GameProxySettings(props: GameProxySettingsProps) {
   const canSave = () => status().supported && (canConfigure() || canUpdateDirectories()) && dirty() && Boolean(serializedDraft()) && !props.busy;
   const canEditDirectories = () => status().supported && (canConfigure() || canUpdateDirectories()) && !props.busy;
   const canStart = () => status().supported && canConfigure() && !dirty() && draft().directories.length > 0 && Boolean(serializedDraft()) && !props.busy;
+  const canImport = () => status().supported && canConfigure() && !props.busy;
+  const canExport = () => status().supported && !dirty() && Boolean(serializedDraft()) && !props.busy;
   const filteredEvents = createMemo(() => status().events.filter(
     (event) => (logRanks[event.level as LogFilter] ?? logRanks.info) <= logRanks[logFilter()],
   ));
@@ -132,18 +131,21 @@ export function GameProxySettings(props: GameProxySettingsProps) {
   });
 
   function updateDraft(field: Exclude<keyof GameProxyDraft, "directories">, value: string) {
+    setNodeNotice("");
     const next = { ...draft(), [field]: value };
     setDraft(next);
     setDirty(!draftMatchesConfig(next, props.gameProxy.config));
   }
 
   function updateDirectories(directories: readonly string[]) {
+    setNodeNotice("");
     const next = { ...draft(), directories };
     setDraft(next);
     setDirty(!draftMatchesConfig(next, props.gameProxy.config));
   }
 
   function updateEncrypt(encrypt: boolean) {
+    setNodeNotice("");
     const next = { ...draft(), encrypt };
     setDraft(next);
     setDirty(!draftMatchesConfig(next, props.gameProxy.config));
@@ -166,7 +168,85 @@ export function GameProxySettings(props: GameProxySettingsProps) {
     if (await props.runAction(
       () => Backend.SaveGameProxyConfig(input),
       { title: "保存游戏代理设置失败" },
-    )) setDirty(false);
+    )) {
+      setDirty(false);
+      setNodeNotice("");
+      changeEditor(false);
+    }
+  }
+
+  function changeEditor(open: boolean) {
+    batch(() => {
+      setEditorOpen(open);
+      setImportOpen(false);
+      setImportText("");
+      setImportError("");
+    });
+    queueMicrotask(() => {
+      const target = open ? serverField : configureButton;
+      if (target?.isConnected) target.focus();
+    });
+  }
+
+  function toggleImport() {
+    const open = !importOpen();
+    setImportText("");
+    setImportError("");
+    setNodeNotice("");
+    setImportOpen(open);
+    queueMicrotask(() => {
+      const target = open ? importField : canImport() ? importButton : configureButton;
+      if (target?.isConnected) target.focus();
+    });
+  }
+
+  async function importNode() {
+    if (!canImport() || !importText().trim()) return;
+    setImportError("");
+    let node: app.GameProxyNodeInput | undefined;
+    const completed = await props.runAction(async () => {
+      node = await Backend.DecodeGameProxyNode(importText());
+    }, { onError: () => setImportError("无法导入，请检查 Base64 JSON 格式及节点字段。") });
+    if (!completed || !node) return;
+    if (!canImport()) {
+      setImportError("代理状态已改变，请停止代理后重新导入。");
+      return;
+    }
+    const next = draftFromConfig(new app.GameProxyConfigInput({ directories: [...draft().directories], node }));
+    batch(() => {
+      setDraft(next);
+      setDirty(!draftMatchesConfig(next, props.gameProxy.config));
+      changeEditor(false);
+      setNodeNotice(dirty() ? "节点已导入，请点击保存。" : "导入节点与已保存配置一致。");
+    });
+  }
+
+  async function exportNode() {
+    if (!canExport()) return;
+    setNodeNotice("");
+    const completed = await props.runAction(async () => {
+      const encoded = await Backend.ExportGameProxyNode();
+      if (!await ClipboardSetText(encoded)) throw new Error("无法写入系统剪贴板");
+    }, { title: "导出节点配置失败" });
+    if (completed) setNodeNotice("已保存节点的 Base64 JSON 已复制到剪贴板。");
+  }
+
+  async function downloadLicense() {
+    await props.runAction(async () => {
+      const license = await Backend.GetGameProxyLicense();
+      const url = URL.createObjectURL(new Blob([license], { type: "application/rtf" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "netfilter-sdk-license.rtf";
+      document.body.append(link);
+      try {
+        link.click();
+      } finally {
+        link.remove();
+        // Let the WebView start the download before releasing its source URL.
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+    }, { title: "导出 NetFilter SDK 许可失败" });
   }
 
   return (
@@ -191,46 +271,91 @@ export function GameProxySettings(props: GameProxySettingsProps) {
                 <small class="empty-diagnostic">尚未添加游戏目录。</small>
               </Show>
             </div>
-            <button class="push-to-talk-key-button game-proxy-add-directory" type="button" disabled={!canEditDirectories()} onClick={() => void selectDirectory()}>添加目录</button>
             <small id="game-proxy-directory-help">选择一个或多个包含需要代理的游戏可执行文件的目录。</small>
           </div>
-          <div class="game-proxy-node-grid">
-            <div class="game-proxy-field game-proxy-field-wide">
-              <label for="game-proxy-server">代理服务器</label>
-              <input id="game-proxy-server" value={draft().server} required disabled={props.busy || activeState(status().state)} autocomplete="off" spellcheck={false} onInput={(event) => updateDraft("server", event.currentTarget.value)} />
+          <div class="game-proxy-field">
+            <div class="game-proxy-actions">
+              <button ref={configureButton} class="push-to-talk-key-button" type="button" disabled={props.busy} aria-expanded={editorOpen()} aria-controls="game-proxy-node-editor" onClick={() => changeEditor(!editorOpen())}>配置服务器</button>
+              <button class="push-to-talk-key-button" type="button" disabled={!canEditDirectories()} aria-describedby="game-proxy-directory-help" onClick={() => void selectDirectory()}>添加目录</button>
+              <span class="game-proxy-node-summary" classList={{ unsaved: dirty() }}>{dirty() ? "有未保存的更改" : serializedDraft() ? "服务器已配置" : "服务器未配置"}</span>
             </div>
-            <div class="game-proxy-field">
-              <label for="game-proxy-port">端口</label>
-              <input id="game-proxy-port" type="number" min="1" max="65535" step="1" value={draft().port} required disabled={props.busy || activeState(status().state)} inputmode="numeric" onInput={(event) => updateDraft("port", event.currentTarget.value)} />
-            </div>
-            <div class="game-proxy-field">
-              <label for="game-proxy-mtu">MTU</label>
-              <input id="game-proxy-mtu" type="number" min="68" max="1600" step="1" value={draft().mtu} required disabled={props.busy || activeState(status().state)} inputmode="numeric" onInput={(event) => updateDraft("mtu", event.currentTarget.value)} />
-            </div>
-            <div class="game-proxy-field">
-              <label for="game-proxy-username">用户名</label>
-              <input id="game-proxy-username" value={draft().username} required disabled={props.busy || activeState(status().state)} maxlength={253} autocomplete="username" spellcheck={false} onInput={(event) => updateDraft("username", event.currentTarget.value)} />
-            </div>
-            <div class="game-proxy-field">
-              <label for="game-proxy-password">密码</label>
-              <input id="game-proxy-password" type="password" value={draft().password} required disabled={props.busy || activeState(status().state)} maxlength={16} autocomplete="current-password" onInput={(event) => updateDraft("password", event.currentTarget.value)} />
-            </div>
-            <div class="game-proxy-field game-proxy-field-wide">
-              <label for="game-proxy-dns">DNS IPv4 地址</label>
-              <input id="game-proxy-dns" value={draft().dns} required disabled={props.busy || activeState(status().state)} inputmode="decimal" autocomplete="off" spellcheck={false} onInput={(event) => updateDraft("dns", event.currentTarget.value)} />
-            </div>
-            <label class="setting-row game-proxy-field-wide" for="game-proxy-encrypt">
-              <small>数据混淆（XOR）</small>
-              <input id="game-proxy-encrypt" type="checkbox" checked={draft().encrypt} disabled={props.busy || activeState(status().state)} onChange={(event) => updateEncrypt(event.currentTarget.checked)} />
-            </label>
+            <output class="game-proxy-node-notice" classList={{ unsaved: dirty() }} role="status">{nodeNotice()}</output>
           </div>
+          <Show when={editorOpen()}>
+            <div id="game-proxy-node-editor" class="game-proxy-node-editor">
+              <div class="game-proxy-field game-proxy-node-transfer">
+                <div class="game-proxy-actions">
+                  <button ref={importButton} class="push-to-talk-key-button" type="button" disabled={!canImport()} aria-expanded={importOpen()} aria-controls="game-proxy-node-import" onClick={toggleImport}>导入节点</button>
+                  <button class="push-to-talk-key-button" type="button" disabled={!canExport()} aria-describedby="game-proxy-node-transfer-help" onClick={() => void exportNode()}>导出节点</button>
+                </div>
+                <small id="game-proxy-node-transfer-help">导出会复制已保存的节点，不含游戏目录。Base64 包含用户名和密码，并非加密，请仅分享给可信的人。</small>
+                <Show when={importOpen()}>
+                  <div id="game-proxy-node-import" class="game-proxy-field">
+                    <label for="game-proxy-node-base64">Base64 节点配置</label>
+                    <textarea
+                      ref={importField}
+                      id="game-proxy-node-base64"
+                      rows={4}
+                      value={importText()}
+                      disabled={!canImport()}
+                      autocomplete="off"
+                      autocapitalize="off"
+                      spellcheck={false}
+                      aria-describedby="game-proxy-node-import-help game-proxy-node-transfer-help"
+                      aria-invalid={Boolean(importError())}
+                      onInput={(event) => { setImportText(event.currentTarget.value); setImportError(""); }}
+                    />
+                    <small id="game-proxy-node-import-help">粘贴节点的 Base64 JSON，确认后收起配置；不会自动保存或启动代理。</small>
+                    <Show when={importError()}><p class="game-proxy-import-error" role="alert">{importError()}</p></Show>
+                    <div class="game-proxy-actions">
+                      <button class="push-to-talk-key-button" type="button" disabled={!canImport() || !importText().trim()} onClick={() => void importNode()}>确认导入</button>
+                      <button class="push-to-talk-key-button" type="button" disabled={props.busy} onClick={toggleImport}>取消</button>
+                    </div>
+                  </div>
+                </Show>
+              </div>
+              <div class="game-proxy-node-grid">
+                <div class="game-proxy-field game-proxy-field-wide">
+                  <label for="game-proxy-server">代理服务器</label>
+                  <input ref={serverField} id="game-proxy-server" value={draft().server} required disabled={props.busy} readOnly={activeState(status().state)} autocomplete="off" spellcheck={false} onInput={(event) => updateDraft("server", event.currentTarget.value)} />
+                </div>
+                <div class="game-proxy-field">
+                  <label for="game-proxy-port">端口</label>
+                  <input id="game-proxy-port" type="number" min="1" max="65535" step="1" value={draft().port} required disabled={props.busy || activeState(status().state)} inputmode="numeric" onInput={(event) => updateDraft("port", event.currentTarget.value)} />
+                </div>
+                <div class="game-proxy-field">
+                  <label for="game-proxy-mtu">MTU</label>
+                  <input id="game-proxy-mtu" type="number" min="68" max="1600" step="1" value={draft().mtu} required disabled={props.busy || activeState(status().state)} inputmode="numeric" onInput={(event) => updateDraft("mtu", event.currentTarget.value)} />
+                </div>
+                <div class="game-proxy-field">
+                  <label for="game-proxy-username">用户名</label>
+                  <input id="game-proxy-username" value={draft().username} required disabled={props.busy || activeState(status().state)} maxlength={253} autocomplete="username" spellcheck={false} onInput={(event) => updateDraft("username", event.currentTarget.value)} />
+                </div>
+                <div class="game-proxy-field">
+                  <label for="game-proxy-password">密码</label>
+                  <input id="game-proxy-password" type="password" value={draft().password} required disabled={props.busy || activeState(status().state)} maxlength={16} autocomplete="current-password" onInput={(event) => updateDraft("password", event.currentTarget.value)} />
+                </div>
+                <div class="game-proxy-field game-proxy-field-wide">
+                  <label for="game-proxy-dns">DNS IPv4 地址</label>
+                  <input id="game-proxy-dns" value={draft().dns} required disabled={props.busy || activeState(status().state)} inputmode="decimal" autocomplete="off" spellcheck={false} onInput={(event) => updateDraft("dns", event.currentTarget.value)} />
+                </div>
+                <label class="setting-row game-proxy-field-wide" for="game-proxy-encrypt">
+                  <small>数据混淆（XOR）</small>
+                  <input id="game-proxy-encrypt" type="checkbox" checked={draft().encrypt} disabled={props.busy || activeState(status().state)} onChange={(event) => updateEncrypt(event.currentTarget.checked)} />
+                </label>
+              </div>
+            </div>
+          </Show>
           <div class="game-proxy-actions">
             <button class="push-to-talk-key-button" type="submit" disabled={!canSave()}>保存</button>
-            <button class="push-to-talk-key-button" type="button" disabled={!canStart()} onClick={() => void props.runAction(Backend.StartGameProxy, { title: "启动游戏代理失败" })}>启动</button>
-            <Show when={activeState(status().state)}>
-              <button class="push-to-talk-key-button" type="button" disabled={props.busy || status().state === "stopping"} onClick={() => void props.runAction(Backend.StopGameProxy, { title: "停止游戏代理失败" })}>停止</button>
-            </Show>
-            <Show when={dirty()}><output>有未保存的更改。请先保存更改再启动。</output></Show>
+            <button class="push-to-talk-key-button" type="button" disabled={!canStart()} title="驱动未安装或未运行时可能请求 UAC 授权" onClick={() => void props.runAction(Backend.StartGameProxy, { title: "启动游戏代理失败" })}>启动</button>
+            <div class="game-proxy-actions">
+              <Show when={activeState(status().state)}>
+                <button class="push-to-talk-key-button" type="button" disabled={props.busy || status().state === "stopping"} onClick={() => void props.runAction(Backend.StopGameProxy, { title: "停止游戏代理失败" })}>停止</button>
+              </Show>
+              <button class="push-to-talk-key-button" type="button" disabled={props.busy} title="导出 NetFilter SDK 原始许可（RTF）" onClick={() => void downloadLicense()}>导出 NetFilter 许可</button>
+            </div>
+            <Show when={dirty()}><output>有未保存的更改。请先保存再启动或导出节点。</output></Show>
           </div>
         </form>
 
@@ -253,25 +378,6 @@ export function GameProxySettings(props: GameProxySettingsProps) {
               </div>
             </Show>
           </div>
-          <div class="diagnostic-section game-proxy-traffic">
-            <div class="diagnostic-heading"><span>实时流量</span><b>每秒更新</b></div>
-            <div class="game-proxy-traffic-grid">
-              <div><small>上行</small><strong>{formatBytes(status().traffic.uploadRate)}/s</strong><code>总计 {formatBytes(status().traffic.uploadBytes)}</code></div>
-              <div><small>下行</small><strong>{formatBytes(status().traffic.downloadRate)}/s</strong><code>总计 {formatBytes(status().traffic.downloadBytes)}</code></div>
-            </div>
-          </div>
-          <Show when={activeState(status().state) && status().directories.length > 0}>
-            <div class="diagnostic-section">
-              <div class="diagnostic-heading"><span>本次运行目录</span></div>
-              <ul class="game-proxy-running-directories">
-                <For each={status().directories}>{(directory) => <li><code class="diagnostic-value">{directory}</code></li>}</For>
-              </ul>
-              <Show when={status().directories.length !== props.gameProxy.config.directories.length
-                || status().directories.some((directory, index) => directory !== props.gameProxy.config.directories[index])}>
-                <p class="diagnostic-note">当前进程仍使用与已保存设置不同的目录。</p>
-              </Show>
-            </div>
-          </Show>
           <Show when={status().error}>
             <div class="diagnostic-section game-proxy-error">
               <div class="diagnostic-heading"><span>最近错误</span></div>

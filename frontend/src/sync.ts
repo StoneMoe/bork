@@ -2,6 +2,7 @@ import { GetSnapshot } from "@wailsjs/go/app/App";
 import { app } from "@wailsjs/go/models";
 import { EventsOn } from "@wailsjs/runtime/runtime";
 import { createSignal, onCleanup, onMount } from "solid-js";
+import { initialSnapshotFields } from "@game-proxy";
 import type { IssueInput } from "./issues";
 import type { AppState } from "./types";
 
@@ -35,28 +36,7 @@ const emptyState = new app.AppSnapshot({
       discoveryHints: [],
     },
   },
-  gameProxy: {
-    config: {
-      directories: [],
-      node: {
-        server: "",
-        port: 4567,
-        username: "",
-        password: "",
-        mtu: 1400,
-        dns: "1.1.1.1",
-        encrypt: false,
-      },
-    },
-    status: {
-      supported: false,
-      state: "unsupported",
-      generation: 0,
-      executableCount: 0,
-      directories: [],
-      events: [],
-    },
-  },
+  ...initialSnapshotFields,
 });
 
 export function createRemoteState(reportIssue: (issue: IssueInput) => void) {

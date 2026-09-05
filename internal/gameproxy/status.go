@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package gameproxy
 
 import (
@@ -7,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"bork/internal/gameproxy/intercept"
 	"bork/internal/gameproxy/iwan"
@@ -43,6 +46,8 @@ type Status struct {
 	Events          []ConnectionEvent `json:"events"`
 	Error           string            `json:"error,omitempty"`
 	Traffic         TrafficStats      `json:"traffic"`
+	TrafficHistory  []TrafficSample   `json:"trafficHistory"`
+	Quality         iwan.LinkQuality  `json:"quality"`
 }
 
 type ConnectionEvent struct {
@@ -52,6 +57,13 @@ type ConnectionEvent struct {
 }
 
 type TrafficStats = intercept.TrafficStats
+
+type TrafficSample struct {
+	At           time.Time `json:"at"`
+	Generation   uint64    `json:"generation"`
+	UploadRate   uint64    `json:"uploadRate"`
+	DownloadRate uint64    `json:"downloadRate"`
+}
 
 type StartInput struct {
 	Node        iwan.Node

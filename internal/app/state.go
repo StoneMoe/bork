@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bork/internal/audio"
 	"bork/internal/identity"
 	"bork/internal/networking"
 	"bork/internal/networking/discovery/tracker"
@@ -103,15 +102,6 @@ type AppIssue struct {
 	Type    AppIssueType  `json:"type"`
 	Level   AppIssueLevel `json:"level"`
 	Message string        `json:"message"`
-}
-
-type AppSnapshot struct {
-	Version     string            `json:"version"`
-	Nickname    string            `json:"nickname"`
-	Room        *RoomState        `json:"room,omitempty"`
-	Audio       audio.Status      `json:"audio"`
-	Diagnostics Diagnostics       `json:"diagnostics"`
-	GameProxy   GameProxySnapshot `json:"gameProxy"`
 }
 
 type Diagnostics struct {

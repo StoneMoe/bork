@@ -1,5 +1,23 @@
 # 当前的工程决策
 
+## 游戏代理编译隔离
+
+- 整个游戏代理仅由 `game_proxy` build tag 启用；无标签时不编译 `internal/gameproxy`、iWAN/gVisor、驱动 helper、代理 Wails 方法/模型或代理前端。非 Windows/amd64/cgo 的启用版本使用不支持原生拦截的 factory，而非默认版本携带该 stub。
+- Make 的 `TAGS` 是完整构建的单一入口，同步传给 Go/Wails，并导出内部 `BORK_GAME_PROXY` 供 Vite 和 TypeScript 选择同一前端模块。默认模块不导入代理组件、绑定或 CSS；切换模式重新生成绑定和前端，禁止跳过这些步骤。
+- `AppSnapshot` 和 `AppConfig` 各保留两份小型平铺定义，避免 Wails 跳过匿名字段或生成无标签代理模型。公共 App 生命周期只保留私有 hooks，无标签实现为空操作。
+- 默认配置只包含网络设置；读取旧文件时不暴露其中的代理字段，保存时保留最新磁盘上的 `game_proxy` 数据及凭据。启用版本继续校验 typed 代理配置，保存代理设置时保留最新网络设置。
+
+## Windows 交付与驱动
+
+- Windows 开发、测试和正式版本统一交付单个 `bork.exe`，不分发配套 ZIP 或 MSIX；Microsoft Store 当前不是目标。其他平台继续采用各自原生格式，不把 `.exe` 要求扩展到 macOS/Linux。保留未使用的品牌和 manifest 源资产。
+- Windows 游戏代理 GUI 内嵌原始签名 NetFilter demo 驱动、API DLL、原始 RTF 许可和独立 helper；运行时释放系统所需文件不是分发 sidecar。当前 EXE 未签名，不修改驱动签名、不绕过 Windows 签名检查；已批准的贡献者 demo 分发不包含生产 SDK 授权。
+- `cmd/bork-driver-helper` 单独以 `CGO_ENABLED=0 GOOS=windows GOARCH=amd64` 和 `-tags game_proxy -trimpath -ldflags '-s -w -H=windowsgui'` 构建到忽略的 `internal/gameproxy/netfilter/helper/bork-driver-helper.exe`，再由 GUI 内嵌。`prepare-netfilter-helper` 依赖 `verify-netfilter-sdk`；`build`、`dev` 和 `bindings` 仅在 `TAGS` 包含 `game_proxy` 时依赖它，Wails 的 tag 继续仅通过 `TAGS` 传入。
+- CI 先验证不含 SDK/helper 的默认构建及依赖、绑定和前端隔离，再获取 SDK、编译 helper 并验证启用版本；最终用 `actions/upload-artifact@v7` 的 `archive: false` 直接上传启用游戏代理的 `build/bin/bork.exe`，不执行 staging。构建和测试不运行 helper、不安装或启动驱动；原生验收必须另行显式进行，不能由 CI 结果推断。
+- Start 先以普通权限探测专用服务，仅在缺失或已停止且校验为 Bork 驱动时由独立 helper 请求 UAC 安装、启动；已经运行则直接使用。主界面声明 `asInvoker`，正常启动时保持普通用户权限，不重启、不主动断开语音；通用 `nf_init` 错误不作为提权判据，不保证安全桌面上的全局按键说话。
+- helper 不读取用户节点配置或凭据，只安装、启动 `bork_netfilter_demo`，驱动路径固定为 `%WINDIR%\System32\drivers\bork_netfilter_demo.sys`，DLL 目录为受保护的 `%WINDIR%\System32\bork-netfilter-demo`。名称变化不修改原始签名字节；同名但身份或路径不符的服务/文件不得覆盖。不接管、迁移或删除手工 `netfilter2` 安装。
+- 取消 UAC 不退出主应用，迟到的授权不得恢复已取消的代理启动；系统安装一旦开始便不承诺随取消回滚。普通 Stop 仅停止代理，不停止或卸载驱动；卸载只按文档由管理员校验专用服务、停止并删除服务后清理已知 Bork 文件，不递归清除未知文件或自动重启。
+- `GetGameProxyLicense()` 返回内嵌原始 SDK RTF；设置中的游戏代理页仅在用户点击导出时通过浏览器 Blob 保存到本机，不在启动或分发时自动写入许可 sidecar。
+
 ## 网络与连接
 
 - 基础网络层始终使用单个 UDP 端点。

@@ -8,57 +8,6 @@ import (
 	"testing"
 )
 
-func TestSaveGameProxyPreservesLatestNetworkSettings(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yml")
-	initial, err := loadAppConfigFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	initial.FilePath = path
-	if err := initial.Save(); err != nil {
-		t.Fatal(err)
-	}
-	external := initial
-	external.Network = NetworkConfig{UDPListen: "127.0.0.1:4321", STUNServers: []string{}, TrackerURLs: []string{}}
-	if err := external.Save(); err != nil {
-		t.Fatal(err)
-	}
-	proxy := GameProxyConfig{Directories: []string{filepath.Clean("/new/games")}, Node: validGameProxyNode()}
-	if err := initial.SaveGameProxy(proxy); err != nil {
-		t.Fatal(err)
-	}
-	loaded, err := loadAppConfigFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(loaded.Network, external.Network) || !reflect.DeepEqual(loaded.GameProxy, proxy) {
-		t.Fatal("proxy save did not preserve the latest network settings alongside the new proxy config")
-	}
-}
-
-func TestSaveGameProxyDoesNotOverwriteInvalidExternalConfig(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yml")
-	config, err := loadAppConfigFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	config.FilePath = path
-	external := []byte("network:\n  udp_listen: invalid\n")
-	if err := os.WriteFile(path, external, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := config.SaveGameProxy(GameProxyConfig{Node: validGameProxyNode()}); err == nil {
-		t.Fatal("proxy save accepted an invalid externally edited config")
-	}
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(contents) != string(external) {
-		t.Fatal("proxy save overwrote the externally edited config")
-	}
-}
-
 func TestEnsureFileDoesNotReplaceExistingConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yml")
 	original := []byte("network:\n  tracker_urls: []\n")
@@ -70,7 +19,7 @@ func TestEnsureFileDoesNotReplaceExistingConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	config.FilePath = path
-	config.GameProxy.Directories = []string{"/changed"}
+	config.Network.UDPListen = "127.0.0.1:4321"
 
 	if err := config.EnsureFile(); err != nil {
 		t.Fatal(err)
@@ -91,7 +40,7 @@ func TestSaveCreatesMissingConfigWithPrivatePermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 	config.FilePath = path
-	config.GameProxy.Directories = []string{"/local/games"}
+	config.Network.UDPListen = "127.0.0.1:4321"
 
 	if err := config.Save(); err != nil {
 		t.Fatal(err)
@@ -100,8 +49,8 @@ func TestSaveCreatesMissingConfigWithPrivatePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.GameProxy.Directories) != 1 || loaded.GameProxy.Directories[0] != filepath.Clean("/local/games") {
-		t.Fatalf("GameProxy.Directories = %q", loaded.GameProxy.Directories)
+	if !reflect.DeepEqual(loaded.Network, config.Network) {
+		t.Fatal("saved network config did not reload with all updated fields")
 	}
 	if runtime.GOOS != "windows" {
 		info, err := os.Stat(path)
@@ -125,7 +74,9 @@ func TestSaveAtomicallyReplacesWholeExistingConfig(t *testing.T) {
 	}
 	config.FilePath = path
 	config.Network.UDPListen = "127.0.0.1:4321"
-	config.GameProxy = GameProxyConfig{Directories: []string{"/local/games"}, Node: validGameProxyNode()}
+	config.Network.STUNServers = []string{}
+	config.Network.TrackerURLs = []string{"https://tracker.example.com/announce"}
+	config.Network.PortMapping = false
 
 	if err := config.Save(); err != nil {
 		t.Fatal(err)
@@ -134,8 +85,49 @@ func TestSaveAtomicallyReplacesWholeExistingConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Network.UDPListen != "127.0.0.1:4321" || len(loaded.GameProxy.Directories) != 1 || loaded.GameProxy.Directories[0] != filepath.Clean("/local/games") || loaded.GameProxy.Node.Password != "secret" {
+	if !reflect.DeepEqual(loaded.Network, config.Network) {
 		t.Fatal("saved config did not reload with all updated fields")
+	}
+}
+
+func TestSaveDoesNotOverwriteInvalidExistingConfig(t *testing.T) {
+	for name, original := range map[string]string{
+		"syntax":            "network: [\n",
+		"unknown root":      "netwrok: {}\n",
+		"unknown network":   "network:\n  udp_litsen: '[::]:0'\n",
+		"invalid network":   "network:\n  udp_listen: invalid\n",
+		"invalid stun":      "network:\n  stun_servers: [invalid]\n",
+		"invalid tracker":   "network:\n  tracker_urls: [invalid]\n",
+		"duplicate root":    "network: {}\nnetwork: {}\n",
+		"duplicate network": "network:\n  port_mapping: true\n  port_mapping: false\n",
+		"second document":   "network: {}\n---\nnetwork: {}\n",
+		"empty second doc":  "network: {}\n---\n",
+		"invalid trailing":  "network: {}\n---\n[\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yml")
+			config, err := loadAppConfigFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			config.FilePath = path
+			if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadAppConfigFile(path); err == nil {
+				t.Fatal("load accepted an invalid config")
+			}
+			if err := config.Save(); err == nil {
+				t.Fatal("Save accepted an invalid config")
+			}
+			contents, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(contents) != original {
+				t.Fatal("Save overwrote an invalid config")
+			}
+		})
 	}
 }
 

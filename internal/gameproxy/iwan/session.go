@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package iwan
 
 import "net/netip"

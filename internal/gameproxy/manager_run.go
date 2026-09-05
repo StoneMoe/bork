@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package gameproxy
 
 import (
@@ -109,7 +111,7 @@ func (manager *Manager) run(run *managerRun, input StartInput) {
 		return
 	default:
 	}
-	if !manager.publishRunning(run, iwanStatus.Generation) {
+	if !manager.publishRunning(run, iwanStatus) {
 		manager.finishStopped(run, context.Canceled)
 		return
 	}
@@ -208,8 +210,8 @@ func (manager *Manager) watch(run *managerRun) {
 			}
 			return
 		case <-trafficTicker.C:
-			manager.updateTraffic(run, run.relay.Traffic())
 			status := manager.appendDataPathLifecycleEvents(run)
+			manager.updateTraffic(run, run.relay.Traffic(), status)
 			if status.State == iwan.StateReady {
 				manager.appendDataPathEvents(run, run.dataPath.observe(status, time.Now()))
 			}
@@ -239,6 +241,8 @@ func (manager *Manager) watch(run *managerRun) {
 				manager.finishFailure(run, ErrSupervisorStopped)
 				return
 			}
+			// SetState drains canceled flows; include their final bytes in the baseline.
+			_ = run.relay.Traffic()
 		}
 	}
 }

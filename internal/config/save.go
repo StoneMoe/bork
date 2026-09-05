@@ -5,35 +5,28 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-
-	"gopkg.in/yaml.v3"
 )
-
-// SaveGameProxy preserves network settings edited on disk while the app is open.
-func (config AppConfig) SaveGameProxy(gameProxy GameProxyConfig) error {
-	if _, err := os.Lstat(config.FilePath); err == nil {
-		latest, err := loadAppConfigFile(config.FilePath)
-		if err != nil {
-			return err
-		}
-		latest.FilePath = config.FilePath
-		config = latest
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect client config: %w", err)
-	}
-	config.GameProxy = gameProxy
-	return config.Save()
-}
 
 func (config AppConfig) Save() error {
 	if config.FilePath == "" {
 		return errors.New("client config path is empty")
 	}
+	existing, _, err := readAppConfig(config.FilePath)
+	if err != nil {
+		return fmt.Errorf("load client config %q: %w", config.FilePath, err)
+	}
+	if _, err := parseAppConfig(existing, config.FilePath); err != nil {
+		return err
+	}
+	contents, err := encodeAppConfig(config, existing)
+	if err != nil {
+		return fmt.Errorf("encode client config: %w", err)
+	}
 	parent := filepath.Dir(config.FilePath)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return fmt.Errorf("create client config directory: %w", err)
 	}
-	temporaryPath, err := writeTemporaryAppConfig(config, parent)
+	temporaryPath, err := writeTemporaryAppConfig(contents, parent)
 	if err != nil {
 		return err
 	}
@@ -58,11 +51,7 @@ func (config AppConfig) Save() error {
 	return nil
 }
 
-func writeTemporaryAppConfig(config AppConfig, parent string) (_ string, err error) {
-	contents, err := yaml.Marshal(config)
-	if err != nil {
-		return "", fmt.Errorf("encode client config: %w", err)
-	}
+func writeTemporaryAppConfig(contents []byte, parent string) (_ string, err error) {
 	temporary, err := os.CreateTemp(parent, ".config-*")
 	if err != nil {
 		return "", fmt.Errorf("create temporary client config: %w", err)

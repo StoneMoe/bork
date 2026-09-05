@@ -1,4 +1,4 @@
-//go:build windows && amd64 && cgo && netfilter_sdk
+//go:build windows && amd64 && cgo && game_proxy
 
 package netfilter
 

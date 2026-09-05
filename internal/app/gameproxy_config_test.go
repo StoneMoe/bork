@@ -1,7 +1,10 @@
+//go:build game_proxy
+
 package app
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -39,17 +42,49 @@ func TestSnapshot_projects_saved_config_separately_from_live_status(t *testing.T
 	if state.GameProxy.Config.Node.Password != " saved-secret " {
 		t.Fatalf("snapshot password = %q", state.GameProxy.Config.Node.Password)
 	}
+	if !state.GameProxy.NodeConfigured {
+		t.Fatal("valid saved node is not configured")
+	}
 	if state.GameProxy.Status.State != string(gameproxy.StateRunning) || !reflect.DeepEqual(state.GameProxy.Status.Directories, []string{"/live/games"}) {
 		t.Fatalf("snapshot status = %#v", state.GameProxy.Status)
 	}
 
 	manager.setStatus(gameproxy.Status{Supported: true, State: gameproxy.StateFailed, Error: "failed later"})
 	next := application.snapshot()
-	if !reflect.DeepEqual(next.GameProxy.Config, state.GameProxy.Config) {
+	if !reflect.DeepEqual(next.GameProxy.Config, state.GameProxy.Config) || !next.GameProxy.NodeConfigured {
 		t.Fatalf("saved config changed with manager status: before=%#v after=%#v", state.GameProxy.Config, next.GameProxy.Config)
 	}
 	if next.GameProxy.Status.State != string(gameproxy.StateFailed) || next.GameProxy.Status.Error != "failed later" {
 		t.Fatalf("next snapshot status = %#v", next.GameProxy.Status)
+	}
+}
+
+func TestSnapshot_nodeConfiguredUsesOnlySavedNodeValidity(t *testing.T) {
+	node := validConfigGameProxy("ignored").Node
+	invalidNode := node
+	invalidNode.DNS = "::1"
+	for _, test := range []struct {
+		name string
+		node config.GameProxyNodeConfig
+		want bool
+	}{
+		{name: "valid", node: node, want: true},
+		{name: "empty"},
+		{name: "invalid DNS", node: invalidNode},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, directories := range [][]string{nil, {"/saved/games"}} {
+				application := NewApp(config.AppConfig{GameProxy: config.GameProxyConfig{Node: test.node, Directories: directories}}, nil)
+				manager := newFakeGameProxyManager()
+				application.gameProxyManager = manager
+				for _, state := range []gameproxy.State{gameproxy.StateInactive, gameproxy.StateRunning, gameproxy.StateFailed, gameproxy.StateUnsupported} {
+					manager.setStatus(gameproxy.Status{State: state, Supported: state != gameproxy.StateUnsupported, Directories: []string{"/live/games"}})
+					if got := application.snapshot().GameProxy.NodeConfigured; got != test.want {
+						t.Fatalf("nodeConfigured = %v, want %v (saved directories %v, state %s)", got, test.want, directories, state)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -61,7 +96,7 @@ func TestSnapshot_projects_empty_game_proxy_collections_as_arrays(t *testing.T) 
 		t.Fatal(err)
 	}
 	encoded := string(contents)
-	for _, field := range []string{`"directories":[]`, `"events":[]`} {
+	for _, field := range []string{`"directories":[]`, `"events":[]`, `"trafficHistory":[]`, `"nodeConfigured":false`} {
 		if !strings.Contains(encoded, field) {
 			t.Fatalf("snapshot JSON = %s, want %s", encoded, field)
 		}
@@ -128,6 +163,7 @@ func TestSaveGameProxyConfig_does_not_mutate_config_when_atomic_save_fails(t *te
 		GameProxy: original,
 	})
 	input := validGameProxyConfigInput("/replacement")
+	input.Node.Server = "rejected.example"
 
 	err := application.SaveGameProxyConfig(input)
 
@@ -139,6 +175,60 @@ func TestSaveGameProxyConfig_does_not_mutate_config_when_atomic_save_fails(t *te
 	}
 	if application.config.Network.UDPListen != "127.0.0.1:1234" {
 		t.Fatalf("network config after failed save = %#v", application.config.Network)
+	}
+	exported, err := application.ExportGameProxyNode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantExport, err := original.ExportNodeBase64()
+	if err != nil || exported != wantExport {
+		t.Fatal("export did not retain the saved node after a failed save")
+	}
+}
+
+func TestDecodeGameProxyNode_returns_node_without_saving_or_changing_directories(t *testing.T) {
+	original := validConfigGameProxy("/local/games")
+	path := filepath.Join(t.TempDir(), "config.yml")
+	application := startedGameProxyTestApp(config.AppConfig{FilePath: path, GameProxy: original})
+	candidate := validConfigGameProxy("/not/shared")
+	candidate.Node.Server = "other.example"
+	candidate.Node.Username = "\u73a9\u5bb6"
+	candidate.Node.Password = " \u5bc6\u7801 "
+	candidate.Node.Encrypt = true
+	encoded, err := candidate.ExportNodeBase64()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	node, err := application.DecodeGameProxyNode(" \n" + encoded + "\n ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node != projectGameProxyConfig(candidate).Node {
+		t.Fatal("decoded node differs from the shared node")
+	}
+	if !reflect.DeepEqual(application.config.GameProxy, original) {
+		t.Fatal("decoding changed saved configuration")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("decoding wrote a configuration file: %v", err)
+	}
+}
+
+func TestDecodeGameProxyNode_rejects_invalid_input_without_echoing_secrets(t *testing.T) {
+	application := startedGameProxyTestApp(config.AppConfig{})
+	for _, encoded := range []string{
+		"not base64",
+		base64.StdEncoding.EncodeToString([]byte(`{"private-credential":"value"}`)),
+		base64.StdEncoding.EncodeToString([]byte(`{"password":"private-credential","password":"private-credential"}`)),
+	} {
+		node, err := application.DecodeGameProxyNode(encoded)
+		if err == nil || err.Error() != "invalid Base64 JSON node configuration" {
+			t.Fatal("invalid import did not return a credential-free error")
+		}
+		if node != (GameProxyNodeInput{}) {
+			t.Fatal("invalid import returned a partial node")
+		}
 	}
 }
 

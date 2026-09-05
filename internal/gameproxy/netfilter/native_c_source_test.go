@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package netfilter
 
 import (
@@ -7,7 +9,7 @@ import (
 	"testing"
 )
 
-const nativeBuildConstraint = "//go:build windows && amd64 && cgo && netfilter_sdk"
+const nativeBuildConstraint = "//go:build windows && amd64 && cgo && game_proxy"
 
 func TestNativeCFiles_share_exact_build_constraint(t *testing.T) {
 	// Given

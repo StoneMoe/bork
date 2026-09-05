@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package gameproxy_test
 
 import (

@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package iwan
 
 import (
@@ -17,27 +19,40 @@ type outboundEvent struct {
 
 func (current *generation) runEstablished(ctx context.Context) error {
 	current.echo = Echo{MinimumDelay: ^uint32(0)}
+	defer func() {
+		current.expireEcho(time.Now())
+		current.echoSent = time.Time{}
+	}()
 	workerCtx, cancelWorkers := context.WithCancel(ctx)
 	defer cancelWorkers()
 	outbound := make(chan outboundEvent, 16)
 	current.workers.Add(1)
 	go current.readStack(workerCtx, outbound)
-	echo := time.NewTicker(current.timings.echoInterval)
+	echo := time.NewTimer(current.timings.echoInterval)
 	defer echo.Stop()
 	liveness := time.NewTimer(current.timings.liveness)
 	defer liveness.Stop()
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-echo.C:
-			packet := current.buildEchoRequest(time.Now())
-			if err := current.write(packet); err != nil {
+			if err := ctx.Err(); err != nil {
 				return err
 			}
+			if err := current.sendEcho(time.Now()); err != nil {
+				return err
+			}
+			echo.Reset(current.timings.echoInterval)
 		case <-liveness.C:
 			return transientFailure("monitor liveness", ErrInactive)
 		case event := <-current.readEvents:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if event.err != nil {
 				return transientFailure("read UDP", fmt.Errorf("%w: %w", ErrSocketFailure, event.err))
 			}
@@ -144,12 +159,39 @@ func (current *generation) buildEchoRequest(now time.Time) []byte {
 	return BuildEchoRequest(current.session, echo)
 }
 
-func (current *generation) recordEchoResponse(sent, now time.Time) {
-	delay := now.UnixMicro() - sent.UnixMicro()
-	if delay < 0 {
-		delay = 0
+func (current *generation) sendEcho(now time.Time) error {
+	current.expireEcho(now)
+	if !current.echoSent.IsZero() {
+		return nil
 	}
-	current.echo.CurrentDelay = uint32(delay)
+	if err := current.write(current.buildEchoRequest(now)); err != nil {
+		return err
+	}
+	// Arm only after a successful write; retain the monotonic send instant.
+	current.echoSent = now
+	return nil
+}
+
+func (current *generation) expireEcho(now time.Time) {
+	if current.echoSent.IsZero() || now.Sub(current.echoSent) < current.timings.echoInterval {
+		return
+	}
+	current.owner.recordLinkSample(current.id, current.echoSent.Add(current.timings.echoInterval), nil)
+	current.echoSent = time.Time{}
+}
+
+func (current *generation) recordEchoResponse(sent, now time.Time) {
+	current.expireEcho(now)
+	if current.echoSent.IsZero() || sent.UnixMicro() != current.echoSent.UnixMicro() {
+		return
+	}
+	delay := now.Sub(current.echoSent)
+	if delay < 0 {
+		return
+	}
+	current.echoSent = time.Time{}
+	current.owner.recordLinkSample(current.id, now, new(float64(delay)/float64(time.Millisecond)))
+	current.echo.CurrentDelay = uint32(delay.Microseconds())
 	if current.echo.CurrentDelay < current.echo.MinimumDelay {
 		current.echo.MinimumDelay = current.echo.CurrentDelay
 	}

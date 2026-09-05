@@ -1,3 +1,5 @@
+//go:build game_proxy
+
 package iwan
 
 import "bork/internal/gameproxy/netstack"
