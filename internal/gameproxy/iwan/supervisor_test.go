@@ -98,11 +98,21 @@ func TestSupervisor_initialAuthenticationTimeoutFailsWithoutRetry(t *testing.T) 
 	if err := supervisor.WaitReady(ctx); !errors.Is(err, ErrAuthTimeout) {
 		t.Fatalf("WaitReady error = %v, want ErrAuthTimeout", err)
 	}
-	if status := supervisor.Status(); status.State != StateFailed || status.Generation != 1 {
+	// Wait for natural exit; queued authentication packets can arrive after failure.
+	supervisor.mu.Lock()
+	done := supervisor.runDone
+	supervisor.mu.Unlock()
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			t.Fatal("supervisor did not exit after initial authentication timeout")
+		}
+	}
+	if status := supervisor.Status(); status.State != StateFailed ||
+		status.Generation != 1 || !errors.Is(status.Err, ErrAuthTimeout) {
 		t.Fatalf("status after initial timeout = %#v", status)
 	}
-	server.drain()
-	server.expectNone(t, 2*testTimings().restartDelay)
 }
 
 func TestSupervisor_startResetsReadinessHistory(t *testing.T) {
