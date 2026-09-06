@@ -1,4 +1,5 @@
 import type { app } from "@wailsjs/go/models";
+import { t, translateMessage } from "./i18n";
 
 export type IssueType = "general" | "room" | "audio" | "network" | "screen";
 export type IssueLevel = "warning" | "error";
@@ -37,8 +38,9 @@ function issueRecord(input: IssueInput, id?: string): IssueRecord {
     id,
     type: input.type,
     level: input.level ?? "error",
-    title: input.title ?? defaultTitles[input.type],
-    message: input.message,
+    // Retain the source text so an existing notification follows language changes.
+    get title() { return t(input.title ?? defaultTitles[input.type]); },
+    get message() { return translateMessage(input.message); },
   };
 }
 
@@ -85,7 +87,7 @@ function collectNetworkIssues(diagnostics: app.Diagnostics): IssueRecord[] {
       type: "network",
       level: "warning",
       title: "STUN 探测全部失败",
-      message: `${stunResults.length} 条 STUN 探测均失败，请前往诊断查看详情。`,
+      message: t("{count} 条 STUN 探测均失败，请前往诊断查看详情。", { count: stunResults.length }),
     }));
   }
 
@@ -95,7 +97,7 @@ function collectNetworkIssues(diagnostics: app.Diagnostics): IssueRecord[] {
       type: "network",
       level: "warning",
       title: "Tracker 公告全部失败",
-      message: `${trackerStatuses.length} 条 Tracker 公告均失败，请前往诊断查看详情。`,
+      message: t("{count} 条 Tracker 公告均失败，请前往诊断查看详情。", { count: trackerStatuses.length }),
     }));
   }
   return issues;

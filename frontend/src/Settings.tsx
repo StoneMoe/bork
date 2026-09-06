@@ -4,6 +4,7 @@ import { SettingsPanel, settingsTabs as gameProxyTabs } from "@game-proxy";
 import type { IssueRecord } from "./issues";
 import { MicrophoneIcon, SpeakerIcon } from "./RoomControls";
 import Select, { type SelectOption } from "./Select";
+import { t, locale, languagePreference, setLanguagePreference, translateMessage } from "./i18n";
 import type { ActionProps, AppState, Candidate, PushToTalkPreference, TrackerStatus } from "./types";
 
 type ThemePreference = "system" | "dark" | "light";
@@ -39,7 +40,7 @@ const pushToTalkKeyLabels: Record<string, string> = {
 };
 
 function formatPushToTalkKey(code: string) {
-  if (pushToTalkKeyLabels[code]) return pushToTalkKeyLabels[code];
+  if (pushToTalkKeyLabels[code]) return t(pushToTalkKeyLabels[code]);
   if (code.startsWith("Key") && code.length === 4) return code.slice(3);
   if (code.startsWith("Digit") && code.length === 6) return code.slice(5);
   if (code.startsWith("Numpad")) return `Num ${code.slice(6)}`;
@@ -48,8 +49,8 @@ function formatPushToTalkKey(code: string) {
 
 function audioDeviceOptions(devices: readonly { id: string; name: string; isDefault: boolean }[]): SelectOption[] {
   return [
-    { value: "", label: "系统默认" },
-    ...devices.map((device) => ({ value: device.id, label: `${device.name}${device.isDefault ? "（默认）" : ""}` })),
+    { value: "", label: t("系统默认") },
+    ...devices.map((device) => ({ value: device.id, label: device.isDefault ? t("{name}（默认）", { name: device.name }) : device.name })),
   ];
 }
 
@@ -190,9 +191,9 @@ export default function Settings(props: SettingsProps) {
       class="settings-layer"
       onKeyDown={handleSettingsKeyDown}
     >
-      <button class="settings-backdrop" type="button" tabindex="-1" aria-label="关闭设置" onClick={props.close} />
-      <aside ref={settingsDrawer} class="settings-drawer" role="dialog" aria-modal="true" aria-label="设置">
-        <nav class="settings-tabs" role="tablist" aria-label="设置分类">
+      <button class="settings-backdrop" type="button" tabindex="-1" aria-label={t("关闭设置")} onClick={props.close} />
+      <aside ref={settingsDrawer} class="settings-drawer" role="dialog" aria-modal="true" aria-label={t("设置")}>
+        <nav class="settings-tabs" role="tablist" aria-label={t("设置分类")}>
           <For each={settingsTabs}>{(tab, index) => (
             <button
               ref={(element) => { tabButtons[tab.id] = element; }}
@@ -206,7 +207,7 @@ export default function Settings(props: SettingsProps) {
               tabindex={activeTab() === tab.id ? 0 : -1}
               onClick={() => setActiveTab(tab.id)}
               onKeyDown={(event) => moveTab(event, index())}
-            >{tab.label}</button>
+            >{t(tab.label)}</button>
           )}</For>
         </nav>
         <Show when={props.issue}>{(issue) => (
@@ -215,7 +216,7 @@ export default function Settings(props: SettingsProps) {
               <strong>{issue().title}</strong>
               <p>{issue().message}</p>
             </div>
-            <button type="button" aria-label={`关闭：${issue().title}`} onClick={dismissLatestIssue}>
+            <button type="button" aria-label={t("关闭：{title}", { title: issue().title })} onClick={dismissLatestIssue}>
               <SettingsCloseIcon />
             </button>
           </div>
@@ -231,7 +232,7 @@ export default function Settings(props: SettingsProps) {
           <div class="audio-device-field audio-device-row">
             <span id="playback-device-label" class="audio-device-icon">
               <SpeakerIcon muted={false} />
-              <span class="visually-hidden">扬声器</span>
+              <span class="visually-hidden">{t("扬声器")}</span>
             </span>
             <Select
               id="playback-device-select"
@@ -248,7 +249,7 @@ export default function Settings(props: SettingsProps) {
           <div class="audio-device-field audio-device-row">
             <span id="capture-device-label" class="audio-device-icon">
               <MicrophoneIcon muted={false} />
-              <span class="visually-hidden">麦克风</span>
+              <span class="visually-hidden">{t("麦克风")}</span>
             </span>
             <Select
               id="capture-device-select"
@@ -266,13 +267,13 @@ export default function Settings(props: SettingsProps) {
             props.state.audio.captureDevices.length === 0
             || props.state.audio.playbackDevices.length === 0
           }>
-            <p class="empty-diagnostic audio-device-empty">没有可用的麦克风或扬声器。</p>
+            <p class="empty-diagnostic audio-device-empty">{t("没有可用的麦克风或扬声器。")}</p>
           </Show>
           <div class="audio-toggles">
             <label class="setting-row audio-toggle">
               <span>
-                <strong>按键说话</strong>
-                <small>按下指定的快捷键才启用麦克风</small>
+                <strong>{t("按键说话")}</strong>
+                <small>{t("按下指定的快捷键才启用麦克风")}</small>
               </span>
               <input
                 type="checkbox"
@@ -288,32 +289,32 @@ export default function Settings(props: SettingsProps) {
             <Show when={props.pushToTalk.enabled}>
               <div class="setting-row audio-toggle">
                 <span>
-                  <strong>说话键</strong>
-                  <small>为按键说话设置一个快捷键</small>
+                  <strong>{t("说话键")}</strong>
+                  <small>{t("为按键说话设置一个快捷键")}</small>
                 </span>
                 <button
                   class="push-to-talk-key-button"
                   type="button"
                   disabled={props.busy || !props.ready}
-                  aria-label={capturingPushToTalkKey() ? "请按一个按键，按 Escape 取消" : `说话按键 ${formatPushToTalkKey(props.pushToTalk.code)}，点击更改`}
-                  title={capturingPushToTalkKey() ? "按 Escape 取消" : "更改说话按键"}
+                  aria-label={capturingPushToTalkKey() ? t("请按一个按键，按 Escape 取消") : t("说话按键 {key}，点击更改", { key: formatPushToTalkKey(props.pushToTalk.code) })}
+                  title={capturingPushToTalkKey() ? t("按 Escape 取消") : t("更改说话按键")}
                   onClick={() => setCapturingPushToTalkKey(true)}
                   onKeyDown={capturePushToTalkKey}
                   onBlur={() => setCapturingPushToTalkKey(false)}
                 >
-                  <Show when={!capturingPushToTalkKey()} fallback={<span>请按键…</span>}>
+                  <Show when={!capturingPushToTalkKey()} fallback={<span>{t("请按键…")}</span>}>
                     <kbd>{formatPushToTalkKey(props.pushToTalk.code)}</kbd>
                   </Show>
                 </button>
                 <span class="visually-hidden" role="status" aria-live="polite">
-                  {capturingPushToTalkKey() ? "请按一个非修饰键，按 Escape 取消" : ""}
+                  {capturingPushToTalkKey() ? t("请按一个非修饰键，按 Escape 取消") : ""}
                 </span>
               </div>
             </Show>
             <label class="setting-row audio-toggle">
               <span>
-                <strong>回声消除</strong>
-                <small>减少扬声器声音被麦克风再次收录的可能性</small>
+                <strong>{t("回声消除")}</strong>
+                <small>{t("减少扬声器声音被麦克风再次收录的可能性")}</small>
               </span>
               <input
                 type="checkbox"
@@ -328,8 +329,8 @@ export default function Settings(props: SettingsProps) {
             </label>
             <label class="setting-row audio-toggle">
               <span>
-                <strong>智能降噪</strong>
-                <small>抑制键盘、风扇等常见背景噪声</small>
+                <strong>{t("智能降噪")}</strong>
+                <small>{t("抑制键盘、风扇等常见背景噪声")}</small>
               </span>
               <input
                 type="checkbox"
@@ -344,8 +345,8 @@ export default function Settings(props: SettingsProps) {
             </label>
             <label class="setting-row audio-toggle">
               <span>
-                <strong>响度平衡</strong>
-                <small>自动平衡不同成员的音量大小</small>
+                <strong>{t("响度平衡")}</strong>
+                <small>{t("自动平衡不同成员的音量大小")}</small>
               </span>
               <input
                 type="checkbox"
@@ -368,14 +369,14 @@ export default function Settings(props: SettingsProps) {
           hidden={activeTab() !== "device"}
         >
           <div class="nickname-form">
-            <label for="nickname">昵称</label>
+            <label for="nickname">{t("昵称")}</label>
             <input
               id="nickname"
               autocomplete="off"
               autocapitalize="off"
               maxlength={32}
               spellcheck={false}
-                placeholder="未设置"
+                placeholder={t("未设置")}
                 value={nickname()}
                 disabled={props.busy || !props.ready}
                 onInput={(event) => setNickname(event.currentTarget.value)}
@@ -384,12 +385,26 @@ export default function Settings(props: SettingsProps) {
             />
           </div>
           <div class="audio-device-field">
-            <span id="theme-label">界面主题</span>
+            <span id="theme-label">{t("界面主题")}</span>
             <div class="theme-button-group" role="group" aria-labelledby="theme-label">
-              <button type="button" aria-pressed={theme() === "system"} onClick={() => updateTheme("system")}>跟随系统</button>
-              <button type="button" aria-pressed={theme() === "dark"} onClick={() => updateTheme("dark")}>深黑</button>
-              <button type="button" aria-pressed={theme() === "light"} onClick={() => updateTheme("light")}>浅灰</button>
+              <button type="button" aria-pressed={theme() === "system"} onClick={() => updateTheme("system")}>{t("跟随系统")}</button>
+              <button type="button" aria-pressed={theme() === "dark"} onClick={() => updateTheme("dark")}>{t("深黑")}</button>
+              <button type="button" aria-pressed={theme() === "light"} onClick={() => updateTheme("light")}>{t("浅灰")}</button>
             </div>
+          </div>
+          <div class="audio-device-field">
+            <span id="language-label">{t("界面语言")}</span>
+            <Select
+              id="language-select"
+              value={languagePreference()}
+              options={[
+                { value: "auto", label: t("自动") },
+                { value: "zh-CN", label: "简体中文" },
+                { value: "en", label: "English" },
+              ]}
+              labelledBy="language-label"
+              onChange={(value) => setLanguagePreference(value as ReturnType<typeof languagePreference>)}
+            />
           </div>
           </section>
           <SettingsPanel
@@ -407,21 +422,21 @@ export default function Settings(props: SettingsProps) {
           hidden={activeTab() !== "network"}
         >
           <div class="diagnostic-section">
-            <div class="diagnostic-heading"><span>版本</span></div>
+            <div class="diagnostic-heading"><span>{t("版本")}</span></div>
             <code class="diagnostic-value">{props.state.version}</code>
           </div>
           <div class="diagnostic-section">
-            <div class="diagnostic-heading"><span>本机端点</span></div>
+            <div class="diagnostic-heading"><span>{t("本机端点")}</span></div>
             <Show when={diagnostics().listenAddress} fallback={
-              <small class="empty-diagnostic">{props.state.room ? "正在打开本机 UDP 端点。" : "加入房间后打开 UDP 端点。"}</small>
+              <small class="empty-diagnostic">{props.state.room ? t("正在打开本机 UDP 端点。") : t("加入房间后打开 UDP 端点。")}</small>
             }>
-              <code class="diagnostic-value">{`${diagnostics().listenAddress}（UDP）`}</code>
+              <code class="diagnostic-value">{t("{address}（UDP）", { address: diagnostics().listenAddress })}</code>
             </Show>
           </div>
           <div class="diagnostic-section">
-            <div class="diagnostic-heading"><span>本机候选地址</span><b>{candidates().length}</b></div>
+            <div class="diagnostic-heading"><span>{t("本机候选地址")}</span><b>{candidates().length.toLocaleString(locale())}</b></div>
             <Show when={candidates().length > 0} fallback={
-              <small class="empty-diagnostic">{props.state.room ? "尚未发现可用的本机候选地址。" : "加入房间后开始收集本机候选地址。"}</small>
+              <small class="empty-diagnostic">{props.state.room ? t("尚未发现可用的本机候选地址。") : t("加入房间后开始收集本机候选地址。")}</small>
             }>
               <ol class="candidate-list">
                 <For each={candidates()}>{(candidate) => <CandidateRow candidate={candidate} />}</For>
@@ -429,9 +444,9 @@ export default function Settings(props: SettingsProps) {
             </Show>
           </div>
           <div class="diagnostic-section">
-            <div class="diagnostic-heading"><span>远端候选地址</span><b>{discoveryHints().length}</b></div>
+            <div class="diagnostic-heading"><span>{t("远端候选地址")}</span><b>{discoveryHints().length.toLocaleString(locale())}</b></div>
             <Show when={discoveryHints().length > 0} fallback={
-              <small class="empty-diagnostic">{props.state.room ? "尚未收到其他成员的候选地址。" : "加入房间后开始收集远端候选地址。"}</small>
+              <small class="empty-diagnostic">{props.state.room ? t("尚未收到其他成员的候选地址。") : t("加入房间后开始收集远端候选地址。")}</small>
             }>
               <ol class="candidate-list">
                 <For each={discoveryHints()}>{(hint) => (
@@ -444,31 +459,31 @@ export default function Settings(props: SettingsProps) {
             </Show>
           </div>
           <div class="diagnostic-section">
-            <div class="diagnostic-heading"><span>STUN 探测</span></div>
+            <div class="diagnostic-heading"><span>{t("STUN 探测")}</span></div>
             <Show when={stun().length > 0} fallback={
-              <small class="empty-diagnostic">{props.state.room ? "尚未获得 STUN 探测结果。" : "加入房间后开始 STUN 探测。"}</small>
+              <small class="empty-diagnostic">{props.state.room ? t("尚未获得 STUN 探测结果。") : t("加入房间后开始 STUN 探测。")}</small>
             }>
               <ol class="stun-list">
                 <For each={stun()}>{(result) => (
-                  <li classList={{ failed: !result.mappedAddress }} title={result.error || ""}>
+                  <li classList={{ failed: !result.mappedAddress }} title={translateMessage(result.error || "")}>
                     <span>{result.server}{result.family && ` · ${result.family === "ipv6" ? "IPv6" : "IPv4"}`}</span>
-                    <b>{result.mappedAddress ? `${result.rttMillis || 1} ms` : "失败"}</b>
+                    <b>{result.mappedAddress ? `${(result.rttMillis || 1).toLocaleString(locale())} ms` : t("失败")}</b>
                   </li>
                 )}</For>
               </ol>
             </Show>
           </div>
           <div class="diagnostic-section">
-            <div class="diagnostic-heading"><span>Tracker 公告</span></div>
+            <div class="diagnostic-heading"><span>{t("Tracker 公告")}</span></div>
             <Show when={trackers().length > 0} fallback={
-              <small class="empty-diagnostic">{props.state.room ? "尚未产生 Tracker announce 记录。" : "加入房间后开始 Tracker announce。"}</small>
+              <small class="empty-diagnostic">{props.state.room ? t("尚未产生 Tracker announce 记录。") : t("加入房间后开始 Tracker announce。")}</small>
             }>
               <div class="tracker-groups">
                 <For each={trackerGroups().map((group) => group.provider)}>{(provider, groupIndex) => {
                 const group = () => trackerGroups().find((candidate) => candidate.provider === provider)!;
                 return (
                   <article class="tracker-group">
-                    <header><strong title={group().provider}>{group().provider}</strong><small>{group().items.length} 个候选地址</small></header>
+                    <header><strong title={group().provider}>{group().provider}</strong><small>{t("{count} 个候选地址", { count: group().items.length.toLocaleString(locale()) })}</small></header>
                     <For each={group().items.map((tracker) => tracker.candidate)}>{(candidate, trackerIndex) => {
                       const tracker = () => group().items.find((status) => status.candidate === candidate)!;
                       const tooltipID = () => `tracker-peers-${groupIndex()}-${trackerIndex()}`;
@@ -498,12 +513,12 @@ export default function Settings(props: SettingsProps) {
                             setDismissedTrackerTooltip(tooltipKey);
                           }}
                         >
-                          <span><small>请求地址</small><code>{tracker().candidate || "等待候选地址"}</code></span>
-                          <span class="tracker-next"><small>下次公告</small><b>{tracker().nextAnnounce ? formatRelativeTime(tracker().nextAnnounce!, now()) : "等待"}</b></span>
+                          <span><small>{t("请求地址")}</small><code>{tracker().candidate || t("等待候选地址")}</code></span>
+                          <span class="tracker-next"><small>{t("下次公告")}</small><b>{tracker().nextAnnounce ? formatRelativeTime(tracker().nextAnnounce!, now()) : t("等待")}</b></span>
                           <div id={tooltipID()} class="tracker-peer-popover" role="tooltip">
-                            <strong>{tracker().error ? "Tracker 错误" : "本次返回的地址"}</strong>
-                            <Show when={!tracker().error} fallback={<p>{tracker().error}</p>}>
-                              <Show when={(tracker().peerAddresses ?? []).length > 0} fallback={<p>本次 announce 没有返回 Peer 地址。</p>}>
+                            <strong>{tracker().error ? t("Tracker 错误") : t("本次返回的地址")}</strong>
+                            <Show when={!tracker().error} fallback={<p>{translateMessage(tracker().error || "")}</p>}>
+                              <Show when={(tracker().peerAddresses ?? []).length > 0} fallback={<p>{t("本次 announce 没有返回 Peer 地址。")}</p>}>
                                 <ul><For each={tracker().peerAddresses ?? []}>{(address) => <li><code>{address}</code></li>}</For></ul>
                               </Show>
                             </Show>
@@ -530,9 +545,9 @@ function SettingsCloseIcon() {
 
 function formatRelativeTime(value: string, now: number): string {
   const target = Date.parse(value);
-  if (!Number.isFinite(target)) return "等待 announce";
+  if (!Number.isFinite(target)) return t("等待 announce");
   const seconds = Math.max(0, Math.ceil((target - now) / 1000));
-  return `${seconds} 秒后`;
+  return t("{seconds} 秒后", { seconds: seconds.toLocaleString(locale()) });
 }
 
 function positionTrackerPeerPopover(row: HTMLElement) {
@@ -548,27 +563,27 @@ function positionTrackerPeerPopover(row: HTMLElement) {
 
 function CandidateRow(props: { candidate: Candidate }) {
   const typeLabel = () => {
-    if (props.candidate.type === "port-mapped") return "端口映射";
-    if (props.candidate.type === "stun") return "STUN 响应";
-    if (props.candidate.type === "nic") return "网卡";
-    return "未知";
+    if (props.candidate.type === "port-mapped") return t("端口映射");
+    if (props.candidate.type === "stun") return t("STUN 响应");
+    if (props.candidate.type === "nic") return t("网卡");
+    return t("未知");
   };
   return (
     <li>
       <code>{props.candidate.address}</code>
-      <div class="address-origin"><b>{typeLabel()}</b><small>{props.candidate.interface || props.candidate.source || props.candidate.family || "系统"}</small></div>
+      <div class="address-origin"><b>{typeLabel()}</b><small>{props.candidate.interface || props.candidate.source || props.candidate.family || t("系统")}</small></div>
     </li>
   );
 }
 
 function discoveryHintSourceLabel(source: string): string {
-  return ({ "historical-remote": "历史远端", local: "本机", mdns: "mDNS", tracker: "Tracker", topology: "拓扑" } as Record<string, string>)[source] || "发现";
+  return t(({ "historical-remote": "历史远端", local: "本机", mdns: "mDNS", tracker: "Tracker", topology: "拓扑" } as Record<string, string>)[source] || "发现");
 }
 
 function formatDiscoveryHintExpiry(value: string | undefined, now: number): string {
-  if (!value) return "会话期间有效";
+  if (!value) return t("会话期间有效");
   const target = Date.parse(value);
-  if (!Number.isFinite(target)) return "有效期未知";
+  if (!Number.isFinite(target)) return t("有效期未知");
   const seconds = Math.max(0, Math.ceil((target-now) / 1000));
-  return seconds === 0 ? "即将过期" : `线索剩余 ${seconds} 秒`;
+  return seconds === 0 ? t("即将过期") : t("线索剩余 {seconds} 秒", { seconds: seconds.toLocaleString(locale()) });
 }

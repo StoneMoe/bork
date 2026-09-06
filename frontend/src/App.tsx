@@ -17,6 +17,7 @@ import { appendIssue, collectStateIssues } from "./issues";
 import { closePopoversEvent, nativePopoverOpen, nativePopoverSupported } from "./popover";
 import { parseRoomHistory, roomHistoryStorageKey, withRecentRoom } from "./room-history";
 import { createRemoteState } from "./sync";
+import { languagePreference, locale, refreshSystemLanguage, t, translateMessage } from "./i18n";
 import type { IssueContext, IssueInput, IssueRecord } from "./issues";
 import type { RoomHistoryEntry } from "./room-history";
 import type { ActionProps, AppState, FriendlyStatus, PushToTalkPreference } from "./types";
@@ -54,18 +55,30 @@ function humanStatus(state: AppState): FriendlyStatus {
   if (!state.room) return {};
   if (!state.diagnostics.listenAddress) {
     return {
-      title: "正在准备连接",
-      detail: "Bork 正在打开通信端口并检查网络环境。",
+      title: t("正在准备连接"),
+      detail: t("Bork 正在打开通信端口并检查网络环境。"),
     };
   }
   if (state.room.remotePeers.length > 0) return {};
   return {
-    title: "正在寻找房间成员",
-    detail: "保持 Bork 运行，其他成员上线后会自动尝试连接。",
+    title: t("正在寻找房间成员"),
+    detail: t("保持 Bork 运行，其他成员上线后会自动尝试连接。"),
   };
 }
 
 export default function App() {
+  createEffect(() => { document.documentElement.lang = locale(); });
+  onMount(() => {
+    const refreshLanguage = () => {
+      if (languagePreference() === "auto") void refreshSystemLanguage();
+    };
+    window.addEventListener("languagechange", refreshLanguage);
+    window.addEventListener("focus", refreshLanguage);
+    onCleanup(() => {
+      window.removeEventListener("languagechange", refreshLanguage);
+      window.removeEventListener("focus", refreshLanguage);
+    });
+  });
   const [busy, setBusy] = createSignal(false);
   const [settingsOpen, setSettingsOpen] = createSignal(false);
   const [inviteCopied, setInviteCopied] = createSignal(false);
@@ -370,8 +383,8 @@ export default function App() {
               class="topbar-icon-button back-button"
               type="button"
               disabled={busy() || !ready()}
-              aria-label="离开房间"
-              title="离开房间"
+              aria-label={t("离开房间")}
+              title={t("离开房间")}
               onClick={() => void leaveRoomAction?.()}
             ><BackIcon /></button>
           </Show>
@@ -386,8 +399,8 @@ export default function App() {
                 classList={{ copied: inviteCopied() }}
                 type="button"
                 disabled={busy() || !ready()}
-                aria-label={inviteCopied() ? "邀请已复制" : "复制房间邀请"}
-                title={inviteCopied() ? "邀请已复制" : "复制房间邀请"}
+                aria-label={t(inviteCopied() ? "邀请已复制" : "复制房间邀请")}
+                title={t(inviteCopied() ? "邀请已复制" : "复制房间邀请")}
                 onClick={() => void copyInvite()}
               >
                 <Show when={inviteCopied()} fallback={<CopyIcon />}><CheckIcon /></Show>
@@ -415,17 +428,17 @@ export default function App() {
                 class="topbar-icon-button attention-button"
                 classList={{ "has-error": attentionItems().some((item) => item.level === "error") }}
                 type="button"
-                aria-label={`查看 ${attentionItems().length} 条需要关注的信息`}
+                aria-label={t("查看 {count} 条需要关注的信息", { count: attentionItems().length })}
                 aria-controls="attention-popover"
                 aria-describedby="attention-popover"
                 aria-expanded={attentionOpen()}
-                title="警告和错误"
+                title={t("警告和错误")}
                 onClick={() => setAttentionOpen((open) => !open)}
               >
                 <WarningIcon />
               </button>
-              <section id="attention-popover" class="attention-popover" aria-label="需要关注的信息">
-                <header><strong>需要关注</strong><span>{attentionItems().length}</span></header>
+              <section id="attention-popover" class="attention-popover" aria-label={t("需要关注的信息")}>
+                <header><strong>{t("需要关注")}</strong><span>{attentionItems().length}</span></header>
                 <ul>
                   <Index each={attentionItems()}>{(item) => (
                     <li class="attention-item" classList={{ [item().level]: true }}>
@@ -436,7 +449,7 @@ export default function App() {
                       <Show when={item().id}>{(id) => (
                         <button
                           type="button"
-                          aria-label={`关闭：${item().title}`}
+                          aria-label={t("关闭：{title}", { title: item().title })}
                           onClick={() => {
                             dismissIssue(id());
                             queueMicrotask(() => {
@@ -452,27 +465,27 @@ export default function App() {
               </section>
             </div>
           </Show>
-          <button ref={settingsButton} class="topbar-icon-button settings-button" type="button" disabled={!ready()} aria-label="打开设置" title="设置" onClick={openSettings}>
+          <button ref={settingsButton} class="topbar-icon-button settings-button" type="button" disabled={!ready()} aria-label={t("打开设置")} title={t("设置")} onClick={openSettings}>
             <SettingsIcon />
           </button>
           <Show when={customWindowControls}>
-            <div class="window-controls" role="group" aria-label="窗口控制">
-              <button class="window-control-button" type="button" aria-label="最小化窗口" title="最小化" onClick={WindowMinimise}><MinimiseIcon /></button>
+            <div class="window-controls" role="group" aria-label={t("窗口控制")}>
+              <button class="window-control-button" type="button" aria-label={t("最小化窗口")} title={t("最小化")} onClick={WindowMinimise}><MinimiseIcon /></button>
               <button
                 class="window-control-button"
                 type="button"
-                aria-label={windowMaximised() ? "还原窗口" : "最大化窗口"}
-                title={windowMaximised() ? "还原" : "最大化"}
+                aria-label={t(windowMaximised() ? "还原窗口" : "最大化窗口")}
+                title={t(windowMaximised() ? "还原" : "最大化")}
                 onClick={toggleWindowMaximised}
               >
                 <Show when={windowMaximised()} fallback={<MaximiseIcon />}><RestoreIcon /></Show>
               </button>
-              <button class="window-control-button close" type="button" aria-label="关闭窗口" title="关闭" onClick={Quit}><CloseIcon /></button>
+              <button class="window-control-button close" type="button" aria-label={t("关闭窗口")} title={t("关闭")} onClick={Quit}><CloseIcon /></button>
             </div>
           </Show>
         </div>
-        <span class="visually-hidden" role="status" aria-live="polite">{inviteCopied() ? "房间邀请已复制" : ""}</span>
-        <span class="visually-hidden" role="alert">{lastAnnouncement()}</span>
+        <span class="visually-hidden" role="status" aria-live="polite">{inviteCopied() ? t("房间邀请已复制") : ""}</span>
+        <span class="visually-hidden" role="alert">{translateMessage(lastAnnouncement())}</span>
       </header>
 
       <section ref={mainView} class="main-view" tabindex="-1">
@@ -623,29 +636,29 @@ function Lobby(props: LobbyProps) {
       <Show when={page() === "home"} fallback={
         <section class="lobby-subview" aria-labelledby="lobbySubviewTitle">
           <header class="lobby-subview-header">
-            <button class="lobby-subview-back" type="button" disabled={props.busy} aria-label="返回" title="返回" onClick={returnHome}>
+            <button class="lobby-subview-back" type="button" disabled={props.busy} aria-label={t("返回")} title={t("返回")} onClick={returnHome}>
               <BackIcon />
             </button>
-            <h1 id="lobbySubviewTitle">{page() === "create" ? "创建房间" : "加入房间"}</h1>
+            <h1 id="lobbySubviewTitle">{t(page() === "create" ? "创建房间" : "加入房间")}</h1>
           </header>
           <Show when={page() === "create"} fallback={
             <form class="lobby-form join" onSubmit={joinRoom}>
               <textarea
                 ref={inviteInput}
                 id="inviteInput"
-                aria-label="房间邀请"
+                aria-label={t("房间邀请")}
                 aria-describedby="inviteInputDescription"
                 maxlength={maxInviteLength}
                 spellcheck={false}
                 autocomplete="off"
-                placeholder="粘贴房间成员发送的邀请链接"
+                placeholder={t("粘贴房间成员发送的邀请链接")}
                 value={invite()}
                 onInput={(event) => setInvite(event.currentTarget.value)}
                 required
               />
-              <p id="inviteInputDescription" class="lobby-input-description">链接格式：<code>bork://join/…</code></p>
-              <button class="lobby-submit" type="submit" disabled={props.busy || !props.ready} aria-label="加入房间">
-                <span>进入</span>
+              <p id="inviteInputDescription" class="lobby-input-description">{t("链接格式：")}<code>bork://join/…</code></p>
+              <button class="lobby-submit" type="submit" disabled={props.busy || !props.ready} aria-label={t("加入房间")}>
+                <span>{t("进入")}</span>
                 <ChevronIcon />
               </button>
             </form>
@@ -654,22 +667,22 @@ function Lobby(props: LobbyProps) {
               <input
                 ref={roomNameInput}
                 id="roomName"
-                aria-label="房间名称"
+                aria-label={t("房间名称")}
                 autocomplete="off"
-                placeholder="输入房间名称"
+                placeholder={t("输入房间名称")}
                 value={roomName()}
                 onInput={(event) => setRoomName(event.currentTarget.value)}
                 required
               />
-              <button class="lobby-submit" type="submit" disabled={props.busy || !props.ready} aria-label="创建并进入房间">
-                <span>进入</span>
+              <button class="lobby-submit" type="submit" disabled={props.busy || !props.ready} aria-label={t("创建并进入房间")}>
+                <span>{t("进入")}</span>
                 <ChevronIcon />
               </button>
             </form>
           </Show>
         </section>
       }>
-        <section class="lobby-panel" aria-label="房间操作">
+        <section class="lobby-panel" aria-label={t("房间操作")}>
           <div class="lobby-entry-actions">
             <button
               ref={createButton}
@@ -679,7 +692,7 @@ function Lobby(props: LobbyProps) {
               onClick={() => openPage("create")}
             >
               <CreateRoomIcon />
-              <span>创建房间</span>
+              <span>{t("创建房间")}</span>
               <ChevronIcon />
             </button>
             <button
@@ -690,13 +703,13 @@ function Lobby(props: LobbyProps) {
               onClick={() => openPage("join")}
             >
               <JoinRoomIcon />
-              <span>加入房间</span>
+              <span>{t("加入房间")}</span>
               <ChevronIcon />
             </button>
           </div>
           <Show when={props.history.length > 0}>
             <section class="room-history" aria-labelledby="roomHistoryLabel">
-              <div id="roomHistoryLabel" class="room-history-label">最近房间</div>
+              <div id="roomHistoryLabel" class="room-history-label">{t("最近房间")}</div>
               <ul class="room-history-list">
                 <For each={props.history}>{(room) => (
                   <li class="room-history-item">
@@ -704,7 +717,7 @@ function Lobby(props: LobbyProps) {
                       class="room-history-tag"
                       type="button"
                       disabled={props.busy || !props.ready}
-                      title={`重新加入 ${room.name} · ${new Date(room.visitedAt).toLocaleString("zh-CN")}`}
+                      title={t("重新加入 {name} · {time}", { name: room.name, time: new Date(room.visitedAt).toLocaleString(locale()) })}
                       onClick={() => void props.runAction(
                         () => Backend.JoinRoom(room.invite),
                         { type: "room", title: "重新加入房间失败" },
@@ -716,8 +729,8 @@ function Lobby(props: LobbyProps) {
                     <button
                       class="room-history-remove"
                       type="button"
-                      aria-label={`从最近房间移除 ${room.name}`}
-                      title="移除记录"
+                      aria-label={t("从最近房间移除 {name}", { name: room.name })}
+                      title={t("移除记录")}
                       onClick={() => props.removeHistory(room.invite)}
                     ><CloseIcon /></button>
                   </li>

@@ -17,6 +17,7 @@
   </Properties>
   <Resources>
     <Resource Language="zh-CN" />
+    <Resource Language="en" />
   </Resources>
   <Dependencies>
     <TargetDeviceFamily

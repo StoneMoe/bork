@@ -1,4 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import { locale, t } from "./i18n";
 import * as Backend from "@wailsjs/go/app/App";
 import type { screenshare } from "@wailsjs/go/models";
 import { EventsOn } from "@wailsjs/runtime/runtime";
@@ -138,9 +139,9 @@ export default function Room(props: RoomProps) {
   ];
   const selectedRemoteSharer = () => remoteSharers().find((candidate) => candidate.peerId === selectedSharer());
   const selectedSharerName = () => {
-    if (selectedLocalScreen()) return "你";
+    if (selectedLocalScreen()) return t("你");
     const peer = selectedRemoteSharer();
-    return peer?.nickname || peer?.peerId.slice(0, 14) || "房间成员";
+    return peer?.nickname || peer?.peerId.slice(0, 14) || t("房间成员");
   };
   const selectedVideoReady = () => selectedLocalScreen() ? localVideoReady() : remoteVideoReady();
   const remoteVideoInterrupted = () => !selectedLocalScreen() && (remoteVideoRecovering() || selectedRemoteSharer()?.connected === false);
@@ -697,19 +698,19 @@ export default function Room(props: RoomProps) {
       >
         <header>
           <div>
-            <strong id="screen-source-title">选择分享内容</strong>
-            <small id="screen-source-description">选择显示器或窗口；系统支持时，同时共享 Bork 之外的系统声音。</small>
+            <strong id="screen-source-title">{t("选择分享内容")}</strong>
+            <small id="screen-source-description">{t("选择显示器或窗口；系统支持时，同时共享 Bork 之外的系统声音。")}</small>
           </div>
-          <button type="button" onClick={closeScreenSourcePicker}>关闭</button>
+          <button type="button" onClick={closeScreenSourcePicker}>{t("关闭")}</button>
         </header>
         <div class="screen-source-groups">
-          <ScreenSourceGroup title="显示器" sources={monitorSources()} select={startScreenShare} />
-          <ScreenSourceGroup title="窗口" sources={windowSources()} select={startScreenShare} />
+          <ScreenSourceGroup title={t("显示器")} sources={monitorSources()} select={startScreenShare} />
+          <ScreenSourceGroup title={t("窗口")} sources={windowSources()} select={startScreenShare} />
         </div>
       </dialog>
       <div class="room-content">
         <section class="voice-stage">
-          <section ref={roomPeersRegion} class="room-peers" aria-label="房间成员" tabindex="-1">
+          <section ref={roomPeersRegion} class="room-peers" aria-label={t("房间成员")} tabindex="-1">
             <div class="room-member-area">
               <RoomMemberList state={props.state} remotePeers={remotePeers()} focusFallback={focusRoomFallback} />
               <Show when={remotePeers().length === 0}>
@@ -739,7 +740,7 @@ export default function Room(props: RoomProps) {
               class="screen-stage"
               classList={{ fullscreen: props.screenFullscreen }}
               style={{ "aspect-ratio": `${screenAspectRatio()}` }}
-              aria-label="屏幕分享画面"
+              aria-label={t("屏幕分享画面")}
               popover={nativePopoverSupported ? "manual" : undefined}
               ref={bindScreenStage}
               onPointerDown={startScreenStageDrag}
@@ -747,8 +748,8 @@ export default function Room(props: RoomProps) {
               <button
                 type="button"
                 class="screen-fullscreen-toggle"
-                aria-label={props.screenFullscreen ? "退出全屏" : "全屏显示"}
-                title={props.screenFullscreen ? "退出全屏" : "全屏显示"}
+                aria-label={props.screenFullscreen ? t("退出全屏") : t("全屏显示")}
+                title={props.screenFullscreen ? t("退出全屏") : t("全屏显示")}
                 onPointerDown={(event) => event.stopPropagation()}
                 onClick={props.toggleScreenFullscreen}
               >
@@ -769,7 +770,7 @@ export default function Room(props: RoomProps) {
                       ref={(element) => { remoteCanvas = element; }}
                       classList={{ ready: remoteVideoReady() }}
                       role="img"
-                      aria-label={`${selectedSharerName()}分享的屏幕`}
+                      aria-label={t("{name}分享的屏幕", { name: selectedSharerName() })}
                     />
                   }
                 >
@@ -777,27 +778,27 @@ export default function Room(props: RoomProps) {
                     ref={(element) => { localCanvas = element; }}
                     classList={{ ready: localVideoReady() }}
                     role="img"
-                    aria-label="你分享的屏幕"
+                    aria-label={t("你分享的屏幕")}
                   />
                 </Show>
                 <Show when={!selectedVideoReady() || remoteVideoInterrupted()}>
                   <p class="screen-video-status" role="status">
                     {selectedLocalScreen()
-                      ? (typeof VideoDecoder === "function" ? "正在准备本机预览…" : "画面正在共享")
-                      : (remoteVideoInterrupted() ? "画面中断，正在恢复…" : "正在接收画面…")}
+                      ? (typeof VideoDecoder === "function" ? t("正在准备本机预览…") : t("画面正在共享"))
+                      : (remoteVideoInterrupted() ? t("画面中断，正在恢复…") : t("正在接收画面…"))}
                   </p>
                 </Show>
                 <figcaption class="screen-sharer">
                   <Show when={screenSharerIDs().length > 1} fallback={<span>{selectedSharerName()}</span>}>
                     <select
                       class="screen-sharer-select"
-                      aria-label="选择要观看的屏幕分享者"
+                      aria-label={t("选择要观看的屏幕分享者")}
                       value={selectedSharer()}
                       onPointerDown={(event) => event.stopPropagation()}
                       onChange={(event) => selectSharer(event.currentTarget.value)}
                     >
                       <Show when={localScreenSharing()}>
-                        <option value={localScreenSharer}>你</option>
+                        <option value={localScreenSharer}>{t("你")}</option>
                       </Show>
                       <For each={remoteSharers().map((peer) => peer.peerId)}>{(peerID) => {
                         const peer = () => remoteSharers().find((candidate) => candidate.peerId === peerID)!;
@@ -835,8 +836,8 @@ function ScreenSourceGroup(props: {
         <div class="screen-source-list">
           <For each={props.sources}>{(source) => (
             <button type="button" onClick={() => void props.select(source.id)}>
-              <strong>{source.name}</strong>
-              <small>{source.width} × {source.height}</small>
+              <strong>{source.kind === "monitor" ? source.name.replace(/（主显示器）$/, t("（主显示器）")) : source.name}</strong>
+              <small>{source.width.toLocaleString(locale())} × {source.height.toLocaleString(locale())}</small>
             </button>
           )}</For>
         </div>

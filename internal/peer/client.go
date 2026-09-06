@@ -264,6 +264,9 @@ func (c *Client) Loop(parent context.Context, mediaPort media.PeerPort) error {
 		case <-sendReady:
 			mediaPort.ConsumeSend(c.sendVoiceFrame)
 		case now := <-probeTicker.C:
+			// Only this periodic tick retries pending Hellos; receiving one cannot
+			// start a reply chain or postpone recovery from a lost packet.
+			c.retrySessionHellos()
 			c.sendDiscoveryProbes(now)
 			c.probeBridgePaths(now)
 			c.queueTopologySnapshots(now, false)

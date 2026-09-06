@@ -39,7 +39,6 @@ type Session struct {
 	lastAuthenticatedPacketAt time.Time
 	rttMillis                 int64
 	pendingPing               pendingPing
-	lastSessionHelloSentAt    time.Time
 	lastTopologyAt            time.Time
 	topologySentRevision      uint64
 	memberStateSentRevision   uint64
