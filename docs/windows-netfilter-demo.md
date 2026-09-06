@@ -17,14 +17,19 @@ redistribute SDK source code.
 ## Download
 
 In the repository's **Actions** tab, open a successful **Windows NetFilter Demo**
-run for the branch or pull request you want to test. Download the
+run for the tag, matching pull request, or manually selected branch/tag you want to test. Download the
 `bork.exe` artifact directly; there is no ZIP to extract or companion file to
 download. The workflow uses `actions/upload-artifact@v7` with `archive: false`,
 so the filename is also the artifact name. You must be signed in to GitHub.
 Artifacts expire after 14 days.
 
-The workflow runs on pushes, pull requests, and manual dispatches. Fork pull
-requests do not need secrets, but GitHub may require a maintainer to approve the
+The workflow runs on tag pushes, manual dispatches, and pull requests changing
+game-proxy implementation or its shared integration/build inputs. Ordinary branch
+pushes and Markdown-only pull requests do not trigger it. The workflow's
+`pull_request.paths` list is the source of truth; matching uses the entire PR diff,
+not only its latest commit. Tag and manual runs are not path-filtered. Manual
+dispatch requires the workflow to exist on the default branch. Fork pull requests
+do not need secrets, but GitHub may require a maintainer to approve the
 run. A pull-request artifact tests GitHub's merge commit, not just the PR's head.
 Only run a build from a revision you trust, especially before installing a driver.
 

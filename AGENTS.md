@@ -119,8 +119,9 @@ Windows 游戏代理使用 `make build TAGS=game_proxy` 或 `make dev TAGS=game_
 单独编译 `cmd/bork-driver-helper` 到上述忽略路径，再由 GUI 内嵌。直接运行带 tag 的测试或 vet 前，
 先执行 `make prepare-netfilter-helper`，再运行 `go test -tags game_proxy ./...` 和 `go vet -tags game_proxy ./...`。
 SDK 获取与校验见 [`internal/gameproxy/netfilter/SDK.md`](internal/gameproxy/netfilter/SDK.md)。
-GitHub Actions 的 `Windows NetFilter Demo` 工作流会在 push、PR 或手动触发时构建和测试，
-先验证没有 SDK/helper 的默认版本与绑定/前端隔离，再获取 SDK、准备 helper 并验证启用版本，成功后通过 `actions/upload-artifact@v7` 的 `archive: false`
+GitHub Actions 的 `Windows NetFilter Demo` 工作流仅在 tag push、涉及游戏代理实现或其共享集成/构建入口的 PR，以及手动触发时构建和测试；普通分支 push 和仅修改 Markdown 文档的 PR 不触发。
+PR 路径清单以工作流的 `pull_request.paths` 为准，按整个 PR 的差异判断，而非仅最新一次提交；tag 和手动运行不受路径筛选限制。手动触发需要该工作流先存在于默认分支。
+工作流先验证没有 SDK/helper 的默认版本与绑定/前端隔离，再获取 SDK、准备 helper 并验证启用版本，成功后通过 `actions/upload-artifact@v7` 的 `archive: false`
 直接上传 `build/bin/bork.exe`，artifact 名为 `bork.exe`，保留 14 天。构建、测试和 CI
 都不得运行 helper 或安装、启动驱动；通过 CI 不代表真实 WFP 拦截已经验收。
 

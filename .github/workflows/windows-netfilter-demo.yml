@@ -2,7 +2,48 @@ name: Windows NetFilter Demo
 
 on:
   push:
+    tags:
+      - '**'
   pull_request:
+    paths:
+      - 'internal/gameproxy/**'
+      - 'cmd/bork-driver-helper/**'
+      - 'tools/netfiltersdk/**'
+      # Shared lifecycle, snapshots and persisted proxy configuration.
+      - 'internal/app/gameproxy*.go'
+      - 'internal/app/snapshot_*.go'
+      - 'internal/app/app*.go'
+      - 'internal/app/run*.go'
+      - 'internal/app/state.go'
+      - 'internal/app/commands.go'
+      - 'internal/config/**'
+      - 'frontend/src/GameProxy*'
+      - 'frontend/src/game-proxy.*'
+      - 'frontend/src/App.tsx'
+      - 'frontend/src/Settings.tsx'
+      - 'frontend/src/Room.tsx'
+      - 'frontend/src/sync.ts'
+      - 'frontend/src/types.ts'
+      - 'frontend/src/issues.ts'
+      - 'frontend/src/main.tsx'
+      - 'frontend/src/base.css'
+      - 'frontend/src/app.css'
+      - 'frontend/src/settings.css'
+      # Build inputs that select and package the enabled/disabled variants.
+      - '.github/workflows/windows-netfilter-demo.yml'
+      - 'Makefile'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/bork/**'
+      - 'internal/webassets/**'
+      - 'frontend/package.json'
+      - 'frontend/package-lock.json'
+      - 'frontend/tsconfig*.json'
+      - 'frontend/typecheck.mjs'
+      - 'frontend/vite.config.ts'
+      - 'frontend/index.html'
+      - 'frontend/packaging/windows/wails.exe.manifest'
+      - '!**/*.md'
   workflow_dispatch:
 
 permissions:
