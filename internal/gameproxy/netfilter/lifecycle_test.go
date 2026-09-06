@@ -1,0 +1,287 @@
+//go:build game_proxy
+
+package netfilter
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"sync"
+	"testing"
+
+	"bork/internal/gameproxy/intercept"
+)
+
+func TestBridge_lifecycle_rejections_return_sentinel_errors(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*Bridge) error
+		want error
+	}{
+		{name: "nil callbacks", run: func(bridge *Bridge) error { return bridge.Start(context.Background(), nil) }, want: ErrNilCallbacks},
+		{name: "wait before start", run: func(bridge *Bridge) error { return bridge.Wait(context.Background()) }, want: ErrNotStarted},
+		{name: "duplicate start", run: func(bridge *Bridge) error {
+			if err := bridge.Start(context.Background(), callbackStub{}); err != nil {
+				return err
+			}
+			return bridge.Start(context.Background(), callbackStub{})
+		}, want: ErrAlreadyStarted},
+		{name: "start after close", run: func(bridge *Bridge) error {
+			if err := bridge.Close(); err != nil {
+				return err
+			}
+			return bridge.Start(context.Background(), callbackStub{})
+		}, want: ErrClosed},
+		{name: "wait after close", run: func(bridge *Bridge) error {
+			if err := bridge.Close(); err != nil {
+				return err
+			}
+			return bridge.Wait(context.Background())
+		}, want: ErrClosed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bridge := newTestBridge(t, &fakeNativeBackend{})
+
+			err := test.run(bridge)
+
+			if !errors.Is(err, test.want) {
+				t.Fatalf("lifecycle error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestBridge_Start_returns_pre_cancellation_without_native_call(t *testing.T) {
+	backend := &fakeNativeBackend{}
+	bridge := newTestBridge(t, backend)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := bridge.Start(ctx, callbackStub{})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context.Canceled", err)
+	}
+	if got := backend.eventsSnapshot(); len(got) != 0 {
+		t.Fatalf("native calls = %q, want none", got)
+	}
+}
+
+func TestBridge_Wait_propagates_context_cancellation(t *testing.T) {
+	waitStarted := make(chan struct{})
+	waitExited := make(chan struct{})
+	backend := &fakeNativeBackend{waitForContext: true, waitStarted: waitStarted, waitExited: waitExited}
+	bridge := newTestBridge(t, backend)
+	if err := bridge.Start(context.Background(), callbackStub{}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- bridge.Wait(ctx) }()
+	<-waitStarted
+
+	cancel()
+
+	err := <-result
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait() error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-waitExited:
+	default:
+		t.Fatal("Bridge.Wait returned before backend waiter exited")
+	}
+}
+
+func TestBridge_serializes_Start_and_UpdateRules(t *testing.T) {
+	startEntered := make(chan struct{})
+	releaseStart := make(chan struct{})
+	backend := &fakeNativeBackend{onStart: func(nativeCallbackSink) error {
+		close(startEntered)
+		<-releaseStart
+		return nil
+	}}
+	bridge := newTestBridge(t, backend)
+	startResult := make(chan error, 1)
+	go func() { startResult <- bridge.Start(context.Background(), callbackStub{}) }()
+	<-startEntered
+	updateResult := make(chan error, 1)
+	go func() { updateResult <- bridge.UpdateRules(context.Background(), []string{`c:\games\other.exe`}) }()
+	select {
+	case err := <-updateResult:
+		t.Fatalf("UpdateRules completed during Start: %v", err)
+	default:
+	}
+	close(releaseStart)
+	if err := <-startResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-updateResult; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bridge.Close() })
+}
+
+func TestBridge_UpdateRules_invalidates_pending_native_admissions(t *testing.T) {
+	backend := &fakeNativeBackend{}
+	callbacks := &tcpTestCallbacks{state: intercept.GenerationState{Generation: 3, Ready: true}}
+	bridge := startTCPTestBridge(t, backend, callbacks)
+	t.Cleanup(func() { _ = bridge.Close() })
+	tcpID := intercept.NativeID(93)
+	if port := bridge.tcpConnectRequest(validTCPConnectRequest(tcpID, reserveTCPPort(t))); port == 0 {
+		t.Fatal("pending TCP redirect returned no listener")
+	}
+	udpID := intercept.NativeID(94)
+	bridge.mu.Lock()
+	bridge.udpSockets[udpID] = nativeUDPCreatedEvent{ID: udpID}
+	bridge.mu.Unlock()
+
+	if err := bridge.UpdateRules(context.Background(), []string{`c:\games\other.exe`}); err != nil {
+		t.Fatal(err)
+	}
+	bridge.mu.Lock()
+	_, hasTCP := bridge.tcpPending[tcpID]
+	_, hasUDP := bridge.udpSockets[udpID]
+	bridge.mu.Unlock()
+	if hasTCP || hasUDP {
+		t.Fatalf("pending TCP/UDP remained after rule update: %v/%v", hasTCP, hasUDP)
+	}
+	if got := backend.suspendSnapshot(); len(got) != 1 || got[0] != udpID {
+		t.Fatalf("SuspendUDP calls = %v, want [%d]", got, udpID)
+	}
+}
+
+func TestBridge_failed_Start_cannot_retry_and_Close_does_not_retry_native_close(t *testing.T) {
+	startErr := errors.New("native start failed")
+	backend := &fakeNativeBackend{startErr: startErr}
+	bridge := newTestBridge(t, backend)
+	if err := bridge.Start(context.Background(), callbackStub{}); !errors.Is(err, startErr) {
+		t.Fatalf("first Start() error = %v, want native start failure", err)
+	}
+
+	startAgainErr := bridge.Start(context.Background(), callbackStub{})
+	closeErr := bridge.Close()
+
+	if !errors.Is(startAgainErr, ErrAlreadyStarted) {
+		t.Fatalf("second Start() error = %v, want ErrAlreadyStarted", startAgainErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("Close() error = %v, want nil", closeErr)
+	}
+	if got := backend.closeCount(); got != 1 {
+		t.Fatalf("native Close calls = %d, want 1", got)
+	}
+}
+
+type fakeNativeBackend struct {
+	mu             sync.Mutex
+	events         []string
+	rules          []nativeRule
+	onStart        func(nativeCallbackSink) error
+	startErr       error
+	waitErr        error
+	closeErr       error
+	waitForContext bool
+	waitStarted    chan struct{}
+	waitExited     chan struct{}
+	closes         int
+	suspended      []intercept.NativeID
+}
+
+func (backend *fakeNativeBackend) Start(ctx context.Context, sink nativeCallbackSink, rules []nativeRule) error {
+	backend.mu.Lock()
+	backend.events = append(backend.events, "start")
+	backend.rules = append([]nativeRule(nil), rules...)
+	hook := backend.onStart
+	startErr := backend.startErr
+	backend.mu.Unlock()
+	if hook != nil {
+		if err := hook(sink); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return startErr
+}
+
+func (backend *fakeNativeBackend) UpdateRules(_ context.Context, rules []nativeRule) error {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	backend.rules = append([]nativeRule(nil), rules...)
+	backend.events = append(backend.events, "update-rules")
+	return nil
+}
+
+func (backend *fakeNativeBackend) Wait(ctx context.Context) error {
+	backend.mu.Lock()
+	backend.events = append(backend.events, "wait")
+	waitForContext := backend.waitForContext
+	waitStarted := backend.waitStarted
+	waitErr := backend.waitErr
+	backend.mu.Unlock()
+	if waitStarted != nil {
+		close(waitStarted)
+	}
+	if waitForContext {
+		<-ctx.Done()
+		if backend.waitExited != nil {
+			close(backend.waitExited)
+		}
+		return ctx.Err()
+	}
+	return waitErr
+}
+
+func (backend *fakeNativeBackend) Close() error {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	backend.events = append(backend.events, "close")
+	backend.closes++
+	return backend.closeErr
+}
+
+func (backend *fakeNativeBackend) rulesSnapshot() []nativeRule {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	return append([]nativeRule(nil), backend.rules...)
+}
+
+func (backend *fakeNativeBackend) eventsSnapshot() []string {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	return append([]string(nil), backend.events...)
+}
+
+func (backend *fakeNativeBackend) closeCount() int {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	return backend.closes
+}
+
+func (backend *fakeNativeBackend) suspendSnapshot() []intercept.NativeID {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	return append([]intercept.NativeID(nil), backend.suspended...)
+}
+
+func TestFakeNativeBackend_records_stable_call_order(t *testing.T) {
+	backend := &fakeNativeBackend{}
+	bridge := newTestBridge(t, backend)
+	if err := bridge.Start(context.Background(), callbackStub{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := backend.eventsSnapshot(); !reflect.DeepEqual(got, []string{"start", "wait", "close"}) {
+		t.Fatalf("native calls = %q, want [start wait close]", got)
+	}
+}

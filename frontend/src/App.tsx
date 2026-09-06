@@ -12,6 +12,7 @@ import {
 } from "@wailsjs/runtime/runtime";
 import Room from "./Room";
 import Settings from "./Settings";
+import { StatusBar } from "@game-proxy";
 import { appendIssue, collectStateIssues } from "./issues";
 import { closePopoversEvent, nativePopoverOpen, nativePopoverSupported } from "./popover";
 import { parseRoomHistory, roomHistoryStorageKey, withRecentRoom } from "./room-history";
@@ -516,6 +517,14 @@ export default function App() {
           />
         </Show>
       </section>
+
+      <StatusBar
+        state={state()}
+        screenFullscreen={screenFullscreen()}
+        ready={ready() && !settingsOpen()}
+        refresh={remote.refresh}
+        reportIssue={reportIssue}
+      />
 
       <Show when={settingsOpen()}>
         <Settings

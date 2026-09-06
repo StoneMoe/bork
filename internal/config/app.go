@@ -19,11 +19,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type AppConfig struct {
-	FilePath string        `yaml:"-"`
-	Network  NetworkConfig `yaml:"network"`
-}
-
 type NetworkConfig struct {
 	UDPListen   string   `yaml:"udp_listen"`
 	STUNServers []string `yaml:"stun_servers"`
@@ -51,32 +46,26 @@ func LoadAppConfig() (AppConfig, error) {
 	return config, nil
 }
 
-func loadAppConfigFile(path string) (AppConfig, error) {
-	config := AppConfig{
-		Network: NetworkConfig{
-			UDPListen:   endpoint.DefaultOptions().ListenAddress,
-			STUNServers: []string{"stun.cloudflare.com:3478", "stun.miwifi.com:3478"},
-			TrackerURLs: []string{"https://bork-pex.iii.moe/announce"},
-			PortMapping: true,
-		},
+func defaultNetworkConfig() NetworkConfig {
+	return NetworkConfig{
+		UDPListen:   endpoint.DefaultOptions().ListenAddress,
+		STUNServers: []string{"stun.cloudflare.com:3478", "stun.miwifi.com:3478"},
+		TrackerURLs: []string{"https://bork-pex.iii.moe/announce"},
+		PortMapping: true,
 	}
-	contents, exists, err := readAppConfig(path)
+}
+
+func loadAppConfigFile(path string) (AppConfig, error) {
+	contents, _, err := readAppConfig(path)
 	if err != nil {
 		return AppConfig{}, fmt.Errorf("load client config %q: %w", path, err)
 	}
-	if !exists || len(bytes.TrimSpace(contents)) == 0 {
-		return config, nil
-	}
-	decoder := yaml.NewDecoder(bytes.NewReader(contents))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&config); err != nil {
-		return AppConfig{}, fmt.Errorf("parse client config %q: %w", path, err)
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return AppConfig{}, fmt.Errorf("parse client config %q: multiple YAML documents are not allowed", path)
-		}
+	return parseAppConfig(contents, path)
+}
+
+func parseAppConfig(contents []byte, path string) (AppConfig, error) {
+	config, err := decodeAppConfig(contents)
+	if err != nil {
 		return AppConfig{}, fmt.Errorf("parse client config %q: %w", path, err)
 	}
 	config.Network.UDPListen = strings.TrimSpace(config.Network.UDPListen)
@@ -92,6 +81,25 @@ func loadAppConfigFile(path string) (AppConfig, error) {
 		return AppConfig{}, fmt.Errorf("validate client config %q: %w", path, err)
 	}
 	return config, nil
+}
+
+func decodeConfigYAML(contents []byte, target any) error {
+	if len(bytes.TrimSpace(contents)) == 0 {
+		return nil
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(contents))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple YAML documents are not allowed")
+		}
+		return err
+	}
+	return nil
 }
 
 func (c NetworkConfig) Options() networking.Options {

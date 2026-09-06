@@ -1,0 +1,163 @@
+name: Windows NetFilter Demo
+
+on:
+  push:
+    tags:
+      - '**'
+  pull_request:
+    paths:
+      - 'internal/gameproxy/**'
+      - 'cmd/bork-driver-helper/**'
+      - 'tools/netfiltersdk/**'
+      # Shared lifecycle, snapshots and persisted proxy configuration.
+      - 'internal/app/gameproxy*.go'
+      - 'internal/app/snapshot_*.go'
+      - 'internal/app/app*.go'
+      - 'internal/app/run*.go'
+      - 'internal/app/state.go'
+      - 'internal/app/commands.go'
+      - 'internal/config/**'
+      - 'frontend/src/GameProxy*'
+      - 'frontend/src/game-proxy.*'
+      - 'frontend/src/App.tsx'
+      - 'frontend/src/Settings.tsx'
+      - 'frontend/src/Room.tsx'
+      - 'frontend/src/sync.ts'
+      - 'frontend/src/types.ts'
+      - 'frontend/src/issues.ts'
+      - 'frontend/src/main.tsx'
+      - 'frontend/src/base.css'
+      - 'frontend/src/app.css'
+      - 'frontend/src/settings.css'
+      # Build inputs that select and package the enabled/disabled variants.
+      - '.github/workflows/windows-netfilter-demo.yml'
+      - 'Makefile'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cmd/bork/**'
+      - 'internal/webassets/**'
+      - 'frontend/package.json'
+      - 'frontend/package-lock.json'
+      - 'frontend/tsconfig*.json'
+      - 'frontend/typecheck.mjs'
+      - 'frontend/vite.config.ts'
+      - 'frontend/index.html'
+      - 'frontend/packaging/windows/wails.exe.manifest'
+      - '!**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      CGO_ENABLED: '1'
+      CC: gcc
+      CXX: g++
+      GOTOOLCHAIN: local
+      BORK_NETFILTER_SMOKE: '0'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          path-type: inherit
+          update: true
+          install: make mingw-w64-ucrt-x86_64-gcc
+
+      - name: Enable Media Foundation for native tests and Wails bindings
+        shell: powershell
+        run: |
+          $result = Install-WindowsFeature Server-Media-Foundation
+          if (-not $result.Success -or $result.RestartNeeded -eq 'Yes') {
+            throw 'Media Foundation installation failed or requires a runner restart'
+          }
+
+      - name: Install the Wails version from go.mod
+        run: |
+          set -euo pipefail
+          go install github.com/wailsapp/wails/v2/cmd/wails@$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2)
+
+      - name: Test the default build without the SDK or helper
+        run: |
+          set -euo pipefail
+          go test ./... -count=1 -timeout=5m
+          go vet ./...
+          dependencies=$(go list -deps ./cmd/bork)
+          if printf '%s\n' "$dependencies" | grep -E '^(bork/internal/gameproxy|github.com/sagernet/gvisor)(/|$)' >/dev/null; then
+            echo 'Default application must not depend on game proxy packages' >&2
+            exit 1
+          fi
+
+      - name: Typecheck and build the default application before SDK ingestion
+        run: |
+          set -euo pipefail
+          make typecheck-frontend
+          make build PLATFORMS=windows/amd64
+          if grep -REl 'GameProxy|gameProxy|gameproxy|game-proxy|proxy-quality|netfilter|iWAN|游戏代理|游戏加速' build/wailsjs/go internal/webassets/dist; then
+            echo 'Default bindings and frontend must not contain the game proxy feature' >&2
+            exit 1
+          fi
+
+      - name: Download the pinned demo SDK
+        shell: pwsh
+        run: |
+          $lock = Get-Content -Raw internal/gameproxy/netfilter/sdk.lock.json | ConvertFrom-Json
+          Invoke-WebRequest -Uri $lock.source_url -OutFile "$env:RUNNER_TEMP/netfilter-sdk.zip"
+
+      - name: Ingest the demo SDK
+        run: |
+          set -euo pipefail
+          go run ./tools/netfiltersdk ingest -archive "$RUNNER_TEMP/netfilter-sdk.zip"
+
+      - name: Verify the SDK and build the embedded helper without running it
+        run: make prepare-netfilter-helper TAGS=game_proxy
+
+      - name: Test the game proxy build without installing the driver
+        run: |
+          set -euo pipefail
+          go test -tags game_proxy ./... -count=1 -timeout=5m
+          go test -race -tags game_proxy ./internal/gameproxy/... ./internal/app ./internal/config -count=1 -timeout=5m
+          go vet -tags game_proxy ./...
+
+      - name: Generate game proxy bindings and typecheck the frontend
+        run: make typecheck-frontend TAGS=game_proxy
+
+      - name: Build the Windows game proxy application
+        run: |
+          set -euo pipefail
+          make build TAGS=game_proxy PLATFORMS=windows/amd64
+          grep -q 'StartGameProxy' build/wailsjs/go/app/App.js
+          grep -Rq 'game-proxy-footer' internal/webassets/dist/assets
+
+      - name: Upload the single Windows executable
+        uses: actions/upload-artifact@v7
+        with:
+          path: build/bin/bork.exe
+          archive: false
+          if-no-files-found: error
+          retention-days: 14

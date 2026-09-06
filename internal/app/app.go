@@ -30,6 +30,8 @@ const (
 var BuildVersion = "dev"
 
 type App struct {
+	gameProxyAppState
+
 	config         config.AppConfig
 	logger         *slog.Logger
 	emit           func(context.Context, string, ...interface{})
@@ -94,24 +96,27 @@ func NewApp(cfg config.AppConfig, logger *slog.Logger) *App {
 		logger = slog.Default()
 	}
 	return &App{
-		config:          cfg,
-		logger:          logger,
-		emit:            wailsruntime.EventsEmit,
-		openFileDialog:  wailsruntime.OpenFileDialog,
-		saveFileDialog:  wailsruntime.SaveFileDialog,
-		startupDone:     make(chan struct{}),
-		statePending:    make(chan struct{}, 1),
-		lastDiagnostics: emptyDiagnostics(),
-		pushToTalk:      globalkey.New(),
-		pushToTalkKey:   globalkey.DefaultCode,
+		gameProxyAppState: newGameProxyAppState(),
+		config:            cfg,
+		logger:            logger,
+		emit:              wailsruntime.EventsEmit,
+		openFileDialog:    wailsruntime.OpenFileDialog,
+		saveFileDialog:    wailsruntime.SaveFileDialog,
+		startupDone:       make(chan struct{}),
+		statePending:      make(chan struct{}, 1),
+		lastDiagnostics:   emptyDiagnostics(),
+		pushToTalk:        globalkey.New(),
+		pushToTalkKey:     globalkey.DefaultCode,
 	}
 }
 
 func (a *App) startup(ctx context.Context) {
 	a.stateMu.Lock()
 	a.appContext = ctx
+	a.initGameProxyRunContextLocked(ctx)
 	a.stateMu.Unlock()
 	a.startStateNotifier(ctx)
+	a.startGameProxyWatcher(ctx)
 
 	a.commandMu.Lock()
 	if err := a.initializeAudio(); err != nil {
@@ -639,14 +644,15 @@ func (a *App) snapshot() AppSnapshot {
 	if room == nil {
 		diagnostics = cloneDiagnostics(a.lastDiagnostics)
 	}
-	a.stateMu.RUnlock()
-
 	state := AppSnapshot{
 		Version:     BuildVersion,
 		Nickname:    nickname,
 		Audio:       emptyAudioStatus(),
 		Diagnostics: diagnostics,
 	}
+	a.snapshotGameProxyConfigLocked(&state)
+	a.stateMu.RUnlock()
+	a.snapshotGameProxyStatus(&state)
 	if audioEngine != nil {
 		state.Audio = audioEngine.Status()
 	} else if audioInitError != "" {
@@ -704,11 +710,15 @@ func (a *App) shutdown(context.Context) {
 		return
 	}
 	a.shuttingDown = true
+	cancelGameProxyRuns := a.detachGameProxyRunContextLocked()
 	room := a.room
 	if room != nil {
 		room.stopping = true
 	}
 	a.stateMu.Unlock()
+	if cancelGameProxyRuns != nil {
+		cancelGameProxyRuns()
+	}
 	if room != nil {
 		// Start the peer shutdown before waiting for native capture teardown.
 		room.cancel()
@@ -721,7 +731,9 @@ func (a *App) shutdown(context.Context) {
 		audioEngine.Stop()
 	}
 	a.commandMu.Unlock()
+	a.shutdownGameProxy()
 	a.stopRoom(room)
+	a.stopGameProxyWatcher()
 
 	a.stateMu.Lock()
 	stopAudioWatcher, audioWatcherDone := a.stopAudioWatcher, a.audioWatcherDone

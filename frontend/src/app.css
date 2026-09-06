@@ -2,7 +2,8 @@
   width: 100%;
   height: 100%;
   display: grid;
-  grid-template-rows: 70px 1fr;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 70px minmax(0, 1fr) auto;
   padding: 12px;
   position: relative;
 }
@@ -434,7 +435,7 @@
 }
 
 @media (max-width: 640px) {
-  .shell { grid-template-rows: 58px 1fr; padding: 7px; }
+  .shell { grid-template-rows: 58px minmax(0, 1fr) auto; padding: 7px; }
   .topbar { padding: 0 12px; }
   .window-controls { margin-left: 4px; margin-right: -4px; padding-left: 4px; }
   .window-control-button { width: 32px; height: 32px; }

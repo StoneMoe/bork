@@ -1,9 +1,10 @@
-import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import * as Backend from "@wailsjs/go/app/App";
+import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { SettingsPanel, settingsTabs as gameProxyTabs } from "@game-proxy";
+import type { IssueRecord } from "./issues";
 import { MicrophoneIcon, SpeakerIcon } from "./RoomControls";
 import Select, { type SelectOption } from "./Select";
 import { t, locale, languagePreference, setLanguagePreference, translateMessage } from "./i18n";
-import type { IssueRecord } from "./issues";
 import type { ActionProps, AppState, Candidate, PushToTalkPreference, TrackerStatus } from "./types";
 
 type ThemePreference = "system" | "dark" | "light";
@@ -22,6 +23,7 @@ const themeStorageKey = "bork.theme";
 const settingsTabs = [
   { id: "audio", label: "语音" },
   { id: "device", label: "偏好" },
+  ...gameProxyTabs,
   { id: "network", label: "诊断" },
 ] as const;
 
@@ -405,6 +407,13 @@ export default function Settings(props: SettingsProps) {
             />
           </div>
           </section>
+          <SettingsPanel
+            state={props.state}
+            activeTab={activeTab()}
+            busy={props.busy}
+            ready={props.ready}
+            runAction={props.runAction}
+          />
           <section
           id="settings-panel-network"
           class="settings-section settings-panel"

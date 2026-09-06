@@ -4,7 +4,7 @@ package screenshare
 
 /*
 #cgo windows CXXFLAGS: -std=c++17
-#cgo windows LDFLAGS: -ld3d11 -ldxgi -lmfplat -lmf -lmfuuid -lwmcodecdspuuid -lole32 -loleaut32 -lruntimeobject -luuid
+#cgo windows LDFLAGS: -static -ld3d11 -ldxgi -lmfplat -lmf -lmfuuid -lwmcodecdspuuid -lole32 -loleaut32 -lruntimeobject -luuid
 #include "video_capture_windows.h"
 */
 import "C"

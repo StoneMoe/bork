@@ -35,6 +35,6 @@ func TestLoadAppConfigFileKeepsDefaults(t *testing.T) {
 	}
 	network := config.Network
 	if network.UDPListen != "[::]:0" || len(network.STUNServers) != 2 || network.TrackerURLs == nil || len(network.TrackerURLs) != 0 || network.PortMapping {
-		t.Fatalf("config = %#v", config)
+		t.Fatal("network defaults did not match")
 	}
 }
