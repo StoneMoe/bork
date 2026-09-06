@@ -1,5 +1,12 @@
 # 当前的工程决策
 
+## 界面语言
+
+- 前端统一决定有效语言：语言设置默认为 `auto`，所有 `zh` 语言变体映射到 `zh-CN`，其余映射到 `en`。手选 `zh-CN` 或 `en` 后立即更新界面，并写入 WebView 的 `localStorage` 键 `bork.language`；选择自动时删除该键。
+- `GetSystemLanguage` 读取当前用户的界面首选语言，不以日期和数字的区域格式代替。Windows 使用现有 `x/sys/windows` 的用户 UI 语言接口，macOS 使用 `CFLocaleCopyPreferredLanguages`，Linux 使用消息语言环境变量；原生接口不可用时使用 WebView 的 `navigator.language`。
+- 首次渲染前读取系统语言。自动模式在窗口重新获得焦点或收到 `languagechange` 时重新读取，手选语言不随系统变化。
+- 中文源文案同时作为翻译键，英文文案集中在前端词典，通过现有 Solid 响应式状态更新，无新增国际化依赖。原生文件选择与保存对话框的标题由前端翻译后传入，Go 不另存语言偏好或维护翻译词典。
+
 ## 网络与连接
 
 - 基础网络层始终使用单个 UDP 端点。

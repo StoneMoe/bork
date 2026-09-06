@@ -31,7 +31,7 @@ func (a *App) GetInvite() (string, error) {
 	return client.EncodedInvite(), nil
 }
 
-func (a *App) OfferFile(recipientPeerIDText string) (string, error) {
+func (a *App) OfferFile(recipientPeerIDText, title string) (string, error) {
 	recipientPeerID, err := identity.ParsePeerID(recipientPeerIDText)
 	if err != nil {
 		return "", err
@@ -50,7 +50,7 @@ func (a *App) OfferFile(recipientPeerIDText string) (string, error) {
 	a.stateMu.RLock()
 	ctx := a.appContext
 	a.stateMu.RUnlock()
-	path, err := a.openFileDialog(ctx, wailsruntime.OpenDialogOptions{Title: "选择要发送的文件"})
+	path, err := a.openFileDialog(ctx, wailsruntime.OpenDialogOptions{Title: title})
 	if err != nil || path == "" {
 		return "", err
 	}
@@ -62,7 +62,7 @@ func (a *App) OfferFile(recipientPeerIDText string) (string, error) {
 	return client.OfferFile(recipientPeerID, path)
 }
 
-func (a *App) AcceptFile(transferID string) error {
+func (a *App) AcceptFile(transferID, title string) error {
 	a.waitForStartup()
 	a.commandMu.Lock()
 	if a.isShuttingDown() {
@@ -90,7 +90,7 @@ func (a *App) AcceptFile(transferID string) error {
 	a.stateMu.RLock()
 	ctx := a.appContext
 	a.stateMu.RUnlock()
-	path, err := a.saveFileDialog(ctx, wailsruntime.SaveDialogOptions{Title: "保存接收的文件", DefaultFilename: safeFilename(name)})
+	path, err := a.saveFileDialog(ctx, wailsruntime.SaveDialogOptions{Title: title, DefaultFilename: safeFilename(name)})
 	if err != nil || path == "" {
 		return err
 	}

@@ -2,12 +2,12 @@
   <img src="assets/brand/appicon.png" alt="Bork" width="240">
 </p>
 
-Bork 是一个低资源占用、低延迟、去中心化的游戏语音软件。
+Bork is a lightweight, low-latency, decentralized voice chat app for gaming.
 
-## 功能
+## Features
 
-- 低延迟多人语音，无需注册账号，无需服务器，无需互联网
-- 支持屏幕共享和文件传输
-- 支持自定义全局按键说话（Linux 按键由桌面系统确认）
-- 支持回声消除、神经网络降噪与多人响度均衡
-- 支持 Windows、macOS 和 Linux
+- Low-latency group voice chat with no account, server, or internet connection required
+- Screen sharing and file transfers
+- Customizable global push-to-talk shortcuts, with desktop confirmation on Linux
+- Echo cancellation, neural network noise suppression, and volume leveling across participants
+- Support for Windows, macOS, and Linux

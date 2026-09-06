@@ -139,7 +139,8 @@
 .theme-button-group button[aria-pressed="true"] { color: var(--accent-strong); background: rgba(var(--accent-rgb), 0.13); }
 
 .audio-toggles { display: grid; margin-top: 17px; }
-.audio-toggle { margin: 0 -8px; border-radius: 7px; padding: 0 8px; transition: background-color 120ms ease; }
+/* Translated descriptions may wrap; keep space between neighboring rows. */
+.audio-toggle { margin: 0 -8px; border-radius: 7px; padding: 8px; transition: background-color 120ms ease; }
 .audio-toggle:has(input:not(:disabled)):hover,
 .audio-toggle:focus-within { background: rgba(var(--accent-rgb), 0.035); }
 .audio-toggle > span { display: grid; gap: 5px; }
