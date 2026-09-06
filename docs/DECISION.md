@@ -86,6 +86,9 @@ Speaker -- F1+-- L2
 - 每次创建或加入房间时随机生成新的 16 字节 PeerID；离开房间后丢弃。Bork 不创建 `identity.key`，不提供账户、设备身份或跨房间、离开后重入的身份连续性；同一次入房内的 Session 重握手和路径切换继续使用同一 PeerID。
 - PeerID 用于 Session transcript、拓扑和桥接寻址。它不是密码学身份，也不代表独立安全主体；权限仅来自 `RoomSeed`。
 - 发现阶段使用带准入 MAC 的 Hello probe；probe 不参与 Session transcript。每个 Session 独占一个 SessionID、一对 Session Hello 和 X25519 临时密钥，同一 Session 的路径切换继续复用这对 Session Hello。
+- 创建 Session 时立即发送本地 Hello；主动探测新路径、响应 Hello probe 或纠正旧 Session Hello 时也可发送当前 Hello。发送入口统一登记候选路径，避免依赖对方再回一个 Hello 才能接收该路径上的 Ping/Pong；候选路径仍须通过 Ping/Pong 验证。
+- 收到与已有 Session 匹配的 Hello 时，只补齐密钥、登记候选路径并发送 Ping，不再回复 Hello。尚未完成认证的 pending Session 仅由现有 2 秒探测定时器向原路径和已有候选路径重发 Hello；不维护每个 Session 的 Hello 发送时钟。首次发送临近定时器时允许很快重复一次。
+- Session 经有效 Pong 完成认证后停止 Hello 重发，继续用 Ping/Pong 测量延迟和检查连通性。报文格式保持不变；建议双方同时更新，旧版在旧 Hello 纠正分支遗漏候选路径登记时，混用版本的路径恢复仍可能等待重新发现或超时重建。
 - Room Datagram 使用房间共享密钥执行 AEAD。Voice StreamID 等于 PeerID；每次开始或替换屏幕分享时生成新的 Screen StreamID。可信 Forwarder 验证并转发原始数据包，不重新编码或加密。
 - 群组数据在互联网上保持加密，互联网观察者无法读取媒体。
 - 每个 Session 使用临时 X25519 密钥派生点对点控制加密密钥。

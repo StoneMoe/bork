@@ -17,7 +17,6 @@ import (
 const (
 	discoveryProbeInterval    = 2 * time.Second
 	maxDiscoveryProbeInterval = 8 * time.Second
-	sessionHelloInterval      = 2 * time.Second
 	pingInterval              = time.Second
 	remotePeerTimeout         = 8 * time.Second
 	pathFailoverTimeout       = 2500 * time.Millisecond
@@ -280,6 +279,9 @@ func (c *Client) sendSessionHelloOnPath(session *Session, path Path) {
 	if session == nil || len(session.localHelloPacket) == 0 {
 		return
 	}
+	// Register the return path before announcing this Session. This also covers
+	// replies to old Hellos; the other peer may answer with Ping instead of Hello.
+	c.rememberCandidatePath(session, path, time.Now())
 	_ = c.sendPeerPacketOnPath(path, session.localHelloPacket)
 }
 
@@ -502,7 +504,6 @@ func (c *Client) handleHelloProbe(remotePeer *RemotePeer, path Path, now time.Ti
 		session, usePendingSession = remotePeer.activeSession, false
 	}
 	if session != nil {
-		c.rememberCandidatePath(session, path, now)
 		c.sendSessionHelloOnPath(session, path)
 		c.sendPing(remotePeer.peerID, usePendingSession)
 		return
@@ -536,7 +537,6 @@ func (c *Client) handleSessionHello(remotePeer *RemotePeer, hello protocol.Sessi
 	}
 	remotePeer.pendingSession = session
 	c.remotePeers[remotePeer.peerID] = remotePeer
-	session.lastSessionHelloSentAt = now
 	c.sendSessionHelloOnPath(session, path)
 	c.sendPing(remotePeer.peerID, true)
 }
@@ -545,16 +545,16 @@ func (c *Client) resumeSessionFromHello(remotePeer *RemotePeer, session *Session
 	if session == nil {
 		return false
 	}
+	matches := session.matchesRemoteHello(hello)
 	if !session.sessionReady() && session.id() == hello.SessionID {
-		if err := session.completeSessionHello(hello); err != nil {
-			return false
-		}
-	} else if !session.matchesRemoteHello(hello) {
+		matches = session.completeSessionHello(hello) == nil
+	}
+	if !matches {
 		return false
 	}
 	c.rememberCandidatePath(session, path, now)
-	session.lastSessionHelloSentAt = now
-	c.sendSessionHelloOnPath(session, path)
+	// Matching Hellos never trigger another Hello. The periodic pending-Session
+	// retry handles loss, while Ping/Pong verifies the keys and candidate path.
 	c.sendPing(remotePeer.peerID, pending)
 	return true
 }
@@ -580,8 +580,21 @@ func (c *Client) startInitiatingSession(remotePeer *RemotePeer, path Path, now t
 	}
 	remotePeer.pendingSession = session
 	c.remotePeers[remotePeer.peerID] = remotePeer
-	session.lastSessionHelloSentAt = now
 	c.sendSessionHelloOnPath(session, path)
+}
+
+func (c *Client) retrySessionHellos() {
+	for _, peer := range c.remotePeers {
+		session := peer.pendingSession
+		if session == nil {
+			continue
+		}
+		c.sendSessionHelloOnPath(session, session.path)
+		// The original path may have failed before the other peer got our Hello.
+		if session.candidatePath != nil {
+			c.sendSessionHelloOnPath(session, session.candidatePath.path)
+		}
+	}
 }
 
 func (c *Client) sendPings() {
@@ -604,27 +617,15 @@ func (c *Client) sendPings() {
 }
 
 func (c *Client) sendPing(peerID identity.PeerID, usePendingSession bool) {
-	var session *Session
 	peer := c.remotePeers[peerID]
 	if peer == nil {
 		return
 	}
+	session := peer.activeSession
 	if usePendingSession {
 		session = peer.pendingSession
-	} else {
-		session = peer.activeSession
 	}
-	if session == nil {
-		return
-	}
-	if usePendingSession {
-		now := time.Now()
-		if now.Sub(session.lastSessionHelloSentAt) >= sessionHelloInterval {
-			session.lastSessionHelloSentAt = now
-			c.sendSessionHelloOnPath(session, session.path)
-		}
-	}
-	if !session.sessionReady() {
+	if session == nil || !session.sessionReady() {
 		return
 	}
 	c.sendPingOnPath(session, session.path, &session.pendingPing)

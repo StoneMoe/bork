@@ -117,7 +117,6 @@ func (c *Client) probeBridgePaths(now time.Time) {
 			c.sendHelloProbeOnPath(path)
 			continue
 		}
-		c.rememberCandidatePath(session, path, now)
 		c.sendSessionHelloOnPath(session, path)
 	}
 }
