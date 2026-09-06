@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"bork/internal/gameproxy/intercept"
 	"bork/internal/gameproxy/iwan"
@@ -111,7 +112,7 @@ func TestManager_Start_rejects_empty_rules_before_bridge_availability(t *testing
 	bridgeFactory := &fakeBridgeFactory{log: log, supported: true}
 	manager := newManager(managerDependencies{
 		bridge: bridgeFactory,
-		scanRules: func([]string) (ruleSet, error) {
+		scanRules: func(context.Context, []string) (ruleSet, error) {
 			log.add("scan")
 			return ruleSet{matcher: fakeMatcher{}}, nil
 		},
@@ -184,7 +185,7 @@ func TestManager_Start_validates_before_scanning(t *testing.T) {
 	log := &eventLog{}
 	manager := newManager(managerDependencies{
 		bridge: &fakeBridgeFactory{log: log, supported: true},
-		scanRules: func([]string) (ruleSet, error) {
+		scanRules: func(context.Context, []string) (ruleSet, error) {
 			log.add("scan")
 			return ruleSet{}, nil
 		},
@@ -201,5 +202,51 @@ func TestManager_Start_validates_before_scanning(t *testing.T) {
 	}
 	if got := log.snapshot(); len(got) != 0 {
 		t.Fatalf("events = %q, want none", got)
+	}
+}
+
+func TestManager_Stop_cancels_rule_scan(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	log := &eventLog{}
+	scanning := make(chan struct{})
+	manager := newManager(managerDependencies{
+		bridge: &fakeBridgeFactory{log: log, supported: true},
+		scanRules: func(scanCtx context.Context, _ []string) (ruleSet, error) {
+			close(scanning)
+			select {
+			case <-scanCtx.Done():
+				return ruleSet{}, scanCtx.Err()
+			case <-ctx.Done():
+				return ruleSet{}, ctx.Err()
+			}
+		},
+	})
+	result := make(chan error, 1)
+	go func() { result <- manager.Start(ctx, validStartInput()) }()
+	select {
+	case <-scanning:
+	case <-ctx.Done():
+		t.Fatal("scanner did not start")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		manager.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		t.Fatal("Stop did not cancel the scanner")
+	}
+	// The watchdog also releases the fake scanner; that must not count as Stop.
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("Stop completed only after the scanner watchdog: %v", err)
+	}
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start error = %v, want context.Canceled", err)
+	}
+	if got := log.snapshot(); len(got) != 0 {
+		t.Fatalf("events = %q, want no bridge or supervisor calls", got)
 	}
 }

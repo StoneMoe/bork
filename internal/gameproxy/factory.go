@@ -34,15 +34,15 @@ type ruleSet struct {
 
 type managerDependencies struct {
 	bridge        BridgeFactory
-	scanRules     func([]string) (ruleSet, error)
+	scanRules     func(context.Context, []string) (ruleSet, error)
 	newSupervisor func(iwan.Options) (supervisorRuntime, error)
 }
 
 func defaultDependencies(bridge BridgeFactory) managerDependencies {
 	return managerDependencies{
 		bridge: bridge,
-		scanRules: func(directories []string) (ruleSet, error) {
-			rules, err := ScanExecutableRules(directories)
+		scanRules: func(ctx context.Context, directories []string) (ruleSet, error) {
+			rules, err := ScanExecutableRules(ctx, directories)
 			if err != nil {
 				return ruleSet{}, err
 			}

@@ -53,7 +53,7 @@ func (manager *Manager) UpdateDirectories(ctx context.Context, directories []str
 	if len(directories) == 0 {
 		return fmt.Errorf("directories: %w", ErrInvalidStartInput)
 	}
-	rules, err := manager.dependencies.scanRules(directories)
+	rules, err := manager.dependencies.scanRules(ctx, directories)
 	if err != nil {
 		return fmt.Errorf("scan executable rules: %w", err)
 	}

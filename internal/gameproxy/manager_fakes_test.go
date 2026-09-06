@@ -252,7 +252,7 @@ func (fakeMatcher) Match(string) (bool, error) { return true, nil }
 func newTestManager(log *eventLog, supervisor *fakeSupervisor, bridgeFactory *fakeBridgeFactory) *Manager {
 	return newManager(managerDependencies{
 		bridge: bridgeFactory,
-		scanRules: func([]string) (ruleSet, error) {
+		scanRules: func(context.Context, []string) (ruleSet, error) {
 			log.add("scan")
 			paths := []string{"alpha.exe", "zeta.exe"}
 			return ruleSet{matcher: fakeMatcher{}, paths: paths, executableCount: len(paths)}, nil

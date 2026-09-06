@@ -60,7 +60,7 @@ func TestManager_Start_keeps_rule_paths_immutable_from_bridge_factory(t *testing
 	supervisor := newFakeSupervisor(log, iwan.Status{State: iwan.StateReady, Generation: 2})
 	manager := newManager(managerDependencies{
 		bridge: bridgeFactory,
-		scanRules: func([]string) (ruleSet, error) {
+		scanRules: func(context.Context, []string) (ruleSet, error) {
 			return ruleSet{matcher: matcher, paths: managerPaths, executableCount: len(managerPaths)}, nil
 		},
 		newSupervisor: func(iwan.Options) (supervisorRuntime, error) { return supervisor, nil },

@@ -3,6 +3,7 @@
 package gameproxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -22,8 +23,8 @@ type ExecutableRules struct {
 	canonicalize pathCanonicalizer
 }
 
-func ScanExecutableRules(roots []string) (ExecutableRules, error) {
-	return scanExecutableRulesFromRoots(roots, canonicalPath)
+func ScanExecutableRules(ctx context.Context, roots []string) (ExecutableRules, error) {
+	return scanExecutableRulesFromRoots(ctx, roots, canonicalPath)
 }
 
 func (rules ExecutableRules) Paths() []string {
@@ -39,16 +40,24 @@ func (rules ExecutableRules) Match(executablePath string) (bool, error) {
 	return matched, nil
 }
 
-func scanExecutableRules(root string, canonicalize pathCanonicalizer) (ExecutableRules, error) {
+func scanExecutableRules(ctx context.Context, root string, canonicalize pathCanonicalizer, pathSet map[string]struct{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	canonicalRoot, err := canonicalize(root)
 	if err != nil {
-		return ExecutableRules{}, fmt.Errorf("canonicalize scan root %q: %w", root, err)
+		return fmt.Errorf("canonicalize scan root %q: %w", root, err)
 	}
 
-	pathSet := make(map[string]struct{})
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return fmt.Errorf("scan path %q: %w", path, walkErr)
+		}
+		if !entry.IsDir() && !strings.EqualFold(filepath.Ext(entry.Name()), ".exe") {
+			return nil
 		}
 		reparseDirectory, err := isDirectoryReparsePoint(path, entry)
 		if err != nil {
@@ -61,7 +70,7 @@ func scanExecutableRules(root string, canonicalize pathCanonicalizer) (Executabl
 			}
 			return nil
 		}
-		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".exe") {
+		if entry.IsDir() {
 			return nil
 		}
 		info, err := entry.Info()
@@ -86,33 +95,29 @@ func scanExecutableRules(root string, canonicalize pathCanonicalizer) (Executabl
 		return nil
 	})
 	if err != nil {
-		return ExecutableRules{}, fmt.Errorf("scan executable root %q: %w", root, err)
+		return fmt.Errorf("scan executable root %q: %w", root, err)
 	}
-
-	paths := make([]string, 0, len(pathSet))
-	for path := range pathSet {
-		paths = append(paths, path)
-	}
-	sort.Strings(paths)
-	return ExecutableRules{paths: paths, pathSet: pathSet, canonicalize: canonicalize}, nil
+	return nil
 }
 
-func scanExecutableRulesFromRoots(roots []string, canonicalize pathCanonicalizer) (ExecutableRules, error) {
+func scanExecutableRulesFromRoots(ctx context.Context, roots []string, canonicalize pathCanonicalizer) (ExecutableRules, error) {
 	pathSet := make(map[string]struct{})
 	for _, root := range roots {
-		rules, err := scanExecutableRules(root, canonicalize)
-		if err != nil {
+		if err := scanExecutableRules(ctx, root, canonicalize, pathSet); err != nil {
 			return ExecutableRules{}, err
 		}
-		for _, path := range rules.paths {
-			pathSet[path] = struct{}{}
-		}
+	}
+	if err := ctx.Err(); err != nil {
+		return ExecutableRules{}, err
 	}
 	paths := make([]string, 0, len(pathSet))
 	for path := range pathSet {
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
+	if err := ctx.Err(); err != nil {
+		return ExecutableRules{}, err
+	}
 	return ExecutableRules{paths: paths, pathSet: pathSet, canonicalize: canonicalize}, nil
 }
 

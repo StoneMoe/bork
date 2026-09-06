@@ -3,6 +3,7 @@
 package gameproxy
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
@@ -23,7 +24,7 @@ func TestScanExecutableRulesDiscoversRegularExecutablesRecursively(t *testing.T)
 		t.Fatal(err)
 	}
 
-	rules, err := scanExecutableRules(root, canonicalizeTestPath)
+	rules, err := scanExecutableRulesFromRoots(t.Context(), []string{root}, canonicalizeTestPath)
 
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +42,7 @@ func TestScanExecutableRulesMergesMultipleRootsWithoutDuplicates(t *testing.T) {
 	first := writeTestFile(t, filepath.Join(root, "first.exe"))
 	second := writeTestFile(t, filepath.Join(nested, "second.exe"))
 
-	rules, err := ScanExecutableRules([]string{root, nested})
+	rules, err := ScanExecutableRules(t.Context(), []string{root, nested})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +80,7 @@ func TestScanExecutableRulesReturnsStableDeduplicatedPaths(t *testing.T) {
 		}
 	}
 
-	rules, err := scanExecutableRules(root, canonicalize)
+	rules, err := scanExecutableRulesFromRoots(t.Context(), []string{root}, canonicalize)
 
 	if err != nil {
 		t.Fatal(err)
@@ -101,7 +102,7 @@ func TestScanExecutableRulesRejectsCanonicalPathOutsideRoot(t *testing.T) {
 		return canonicalizeTestPath(path)
 	}
 
-	_, err := scanExecutableRules(root, canonicalize)
+	_, err := scanExecutableRulesFromRoots(t.Context(), []string{root}, canonicalize)
 
 	if !errors.Is(err, ErrExecutableOutsideRoot) {
 		t.Fatalf("error = %v, want ErrExecutableOutsideRoot", err)
@@ -113,17 +114,19 @@ func TestScanExecutableRulesSkipsDirectoryLinksWithoutSkippingSiblings(t *testin
 	inside := writeTestFile(t, filepath.Join(root, "game.exe"))
 	externalRoot := t.TempDir()
 	writeTestFile(t, filepath.Join(externalRoot, "outside.exe"))
-	link := filepath.Join(root, "00-linked")
-	if runtime.GOOS == "windows" {
-		// Junctions exercise directory reparse points without symlink privileges.
-		if output, err := exec.Command("cmd.exe", "/d", "/c", "mklink", "/J", link, externalRoot).CombinedOutput(); err != nil {
-			t.Fatalf("create directory junction: %v: %s", err, output)
+	for _, name := range []string{"00-linked", "01-linked.exe"} {
+		link := filepath.Join(root, name)
+		if runtime.GOOS == "windows" {
+			// Junctions exercise directory reparse points without symlink privileges.
+			if output, err := exec.Command("cmd.exe", "/d", "/c", "mklink", "/J", link, externalRoot).CombinedOutput(); err != nil {
+				t.Fatalf("create directory junction: %v: %s", err, output)
+			}
+		} else if err := os.Symlink(externalRoot, link); err != nil {
+			t.Skipf("directory symlinks unavailable: %v", err)
 		}
-	} else if err := os.Symlink(externalRoot, link); err != nil {
-		t.Skipf("directory symlinks unavailable: %v", err)
 	}
 
-	rules, err := scanExecutableRules(root, canonicalizeTestPath)
+	rules, err := scanExecutableRulesFromRoots(t.Context(), []string{root}, canonicalizeTestPath)
 
 	if err != nil {
 		t.Fatal(err)
@@ -131,6 +134,26 @@ func TestScanExecutableRulesSkipsDirectoryLinksWithoutSkippingSiblings(t *testin
 	want := []string{canonicalizeTestPathRequired(t, inside)}
 	if got := rules.Paths(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Paths() = %q, want %q", got, want)
+	}
+
+	// An explicitly configured descendant through a skipped junction still
+	// owns its own scan; it must not be discarded as a redundant nested root.
+	explicit := writeTestFile(t, filepath.Join(externalRoot, "nested", "allowed.exe"))
+	rules, err = ScanExecutableRules(t.Context(), []string{root, filepath.Join(root, "00-linked", "nested")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = nil
+	for _, path := range []string{inside, explicit} {
+		canonical, err := canonicalPath(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, canonical)
+	}
+	sort.Strings(want)
+	if got := rules.Paths(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Paths() with explicit linked descendant = %q, want %q", got, want)
 	}
 }
 
@@ -140,7 +163,7 @@ func TestScanExecutableRulesReturnsWalkErrors(t *testing.T) {
 		return filepath.Abs(path)
 	}
 
-	_, err := scanExecutableRules(root, canonicalize)
+	_, err := scanExecutableRulesFromRoots(t.Context(), []string{root}, canonicalize)
 
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("error = %v, want fs.ErrNotExist", err)
@@ -157,7 +180,7 @@ func TestScanExecutableRulesReturnsCanonicalizationPermissionErrors(t *testing.T
 		return canonicalizeTestPath(path)
 	}
 
-	_, err := scanExecutableRules(root, canonicalize)
+	_, err := scanExecutableRulesFromRoots(t.Context(), []string{root}, canonicalize)
 
 	if !errors.Is(err, fs.ErrPermission) {
 		t.Fatalf("error = %v, want fs.ErrPermission", err)
@@ -169,7 +192,7 @@ func TestExecutableRulesMatchUsesCanonicalFullPathOnly(t *testing.T) {
 	allowed := writeTestFile(t, filepath.Join(workspace, "allowed", "game.exe"))
 	other := writeTestFile(t, filepath.Join(workspace, "other", "game.exe"))
 
-	rules, err := ScanExecutableRules([]string{filepath.Dir(allowed)})
+	rules, err := ScanExecutableRules(t.Context(), []string{filepath.Dir(allowed)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,6 +210,51 @@ func TestExecutableRulesMatchUsesCanonicalFullPathOnly(t *testing.T) {
 	}
 	if matchedOther {
 		t.Fatal("same basename at a different full path matched")
+	}
+}
+
+func TestScanExecutableRulesCancellation(t *testing.T) {
+	for _, stage := range []string{"before root", "during walk", "between roots", "before result", "empty roots"} {
+		t.Run(stage, func(t *testing.T) {
+			root := t.TempDir()
+			first := writeTestFile(t, filepath.Join(root, "first.exe"))
+			roots := []string{root}
+			if stage == "during walk" {
+				writeTestFile(t, filepath.Join(root, "second.exe"))
+			}
+			if stage == "between roots" {
+				roots = append(roots, t.TempDir())
+			}
+			if stage == "empty roots" {
+				roots = nil
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			wantCalls := 2 // The first root and its first executable.
+			if stage == "before root" || stage == "empty roots" {
+				cancel()
+				wantCalls = 0
+			}
+			calls := 0
+			canonicalize := func(path string) (string, error) {
+				calls++
+				if path == first {
+					cancel()
+				}
+				return canonicalizeTestPath(path)
+			}
+
+			rules, err := scanExecutableRulesFromRoots(ctx, roots, canonicalize)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context.Canceled", err)
+			}
+			if calls != wantCalls {
+				t.Fatalf("canonicalization calls = %d, want %d", calls, wantCalls)
+			}
+			if rules.pathSet != nil || rules.paths != nil {
+				t.Fatalf("canceled scan returned partial rules: %#v", rules)
+			}
+		})
 	}
 }
 

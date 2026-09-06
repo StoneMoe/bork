@@ -21,7 +21,7 @@ func TestManager_UpdateDirectories_updates_live_rules_and_status(t *testing.T) {
 	supervisor := newFakeSupervisor(log, iwan.Status{State: iwan.StateReady, Generation: 1})
 	manager := newManager(managerDependencies{
 		bridge: &fakeBridgeFactory{log: log, supported: true, bridge: bridge},
-		scanRules: func(directories []string) (ruleSet, error) {
+		scanRules: func(_ context.Context, directories []string) (ruleSet, error) {
 			paths := make([]string, len(directories))
 			for index, directory := range directories {
 				paths[index] = filepath.Join(directory, "game.exe")
@@ -47,6 +47,22 @@ func TestManager_UpdateDirectories_updates_live_rules_and_status(t *testing.T) {
 	wantDirectories := []string{filepath.Clean("C:/new-one"), filepath.Clean("C:/new-two")}
 	if !slices.Equal(status.Directories, wantDirectories) || status.ExecutableCount != 2 {
 		t.Fatalf("status after directory update = %#v", status)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	manager.dependencies.scanRules = func(scanCtx context.Context, _ []string) (ruleSet, error) {
+		cancel()
+		return ruleSet{}, scanCtx.Err()
+	}
+	if err := manager.UpdateDirectories(ctx, []string{"C:/canceled"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("UpdateDirectories error = %v, want context.Canceled", err)
+	}
+	if got := bridge.updatedPaths(); !slices.Equal(got, wantPaths) {
+		t.Fatalf("canceled scan changed native rule paths: %q", got)
+	}
+	if got := manager.Status(); !slices.Equal(got.Directories, wantDirectories) || got.ExecutableCount != 2 {
+		t.Fatalf("canceled scan changed directory status: %#v", got)
 	}
 }
 

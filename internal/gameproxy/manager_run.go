@@ -21,7 +21,7 @@ const (
 
 func (manager *Manager) run(run *managerRun, input StartInput) {
 	defer close(run.done)
-	rules, err := manager.dependencies.scanRules(input.Directories)
+	rules, err := manager.dependencies.scanRules(run.ctx, input.Directories)
 	if err != nil {
 		manager.finishStartFailure(run, fmt.Errorf("scan executable rules: %w", err))
 		return
