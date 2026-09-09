@@ -159,3 +159,31 @@ func TestTrackerPortSweepCandidatesStayInPortRange(t *testing.T) {
 		t.Fatalf("high-port candidates = %v", high)
 	}
 }
+
+func TestTrackerPortSweepRepeatsWithDiscoveryBackoff(t *testing.T) {
+	now := time.Date(2026, time.September, 10, 12, 0, 0, 0, time.UTC)
+	address := netip.MustParseAddrPort("198.51.100.20:40000")
+	client := &Client{
+		logger: slog.New(slog.DiscardHandler),
+		discoveredAddresses: map[netip.AddrPort]discoveredAddress{
+			address: {
+				source:        discovery.SourceTracker,
+				nextProbe:     now,
+				probeInterval: discoveryProbeInterval,
+			},
+		},
+	}
+	client.sendDiscoveryProbes(now)
+	if client.trackerSweepAttempts != 1 || client.trackerSweepPackets != uint64(trackerPortSweepRadius)*2 {
+		t.Fatalf("tracker sweep counters = %d attempts, %d packets", client.trackerSweepAttempts, client.trackerSweepPackets)
+	}
+	remembered := client.discoveredAddresses[address]
+	client.sendDiscoveryProbes(now.Add(time.Millisecond))
+	if client.trackerSweepAttempts != 1 {
+		t.Fatal("tracker sweep repeated before discovery backoff elapsed")
+	}
+	client.sendDiscoveryProbes(remembered.nextProbe)
+	if client.trackerSweepAttempts != 2 || client.trackerSweepPackets != uint64(trackerPortSweepRadius)*4 {
+		t.Fatalf("repeated tracker sweep counters = %d attempts, %d packets", client.trackerSweepAttempts, client.trackerSweepPackets)
+	}
+}

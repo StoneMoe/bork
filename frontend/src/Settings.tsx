@@ -473,6 +473,15 @@ export default function Settings(props: SettingsProps) {
             </Show>
           </div>
           <div class="diagnostic-section">
+            <div class="diagnostic-heading"><span>{t("UDP 打洞探测")}</span></div>
+            <code class="diagnostic-value">
+              {t("已执行 {attempts} 轮端口预测，共发送 {packets} 个预测探测包", {
+                attempts: (connectivity()?.trackerSweepAttempts || 0).toLocaleString(locale()),
+                packets: (connectivity()?.trackerSweepPackets || 0).toLocaleString(locale()),
+              })}
+            </code>
+          </div>
+          <div class="diagnostic-section">
             <div class="diagnostic-heading"><span>{t("STUN 探测")}</span></div>
             <Show when={stun().length > 0} fallback={
               <small class="empty-diagnostic">{props.state.room ? t("尚未获得 STUN 探测结果。") : t("加入房间后开始 STUN 探测。")}</small>

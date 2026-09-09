@@ -66,6 +66,7 @@ network:
 - 空的 `tracker_urls` 列表会禁用公共 Tracker 服务。
 - 将 `port_mapping` 设为 `false` 会禁用网关端口映射。
 - PCP、NAT-PMP 和 UPnP 都不可用时，Bork 仍会使用 STUN 候选地址和 Tracker 尝试同时 UDP 打洞；只要 STUN 已取得映射，界面不会把可选的网关映射失败显示为房间告警，完整失败原因仍保留在诊断快照中。
+- 对 Tracker 返回的 IPv4 地址，客户端会在首次发现以及后续退避重试中重复探测其相邻 ±16 UDP 端口，使 endpoint-dependent NAT 两侧的映射建立时间能够重叠；诊断快照记录预测轮数和探测包数。
 - 如果自动端口映射和 UDP 打洞都失败，可将 `udp_listen` 改为固定端口（例如 `'[::]:40000'`），并在路由器上手动转发同一个 UDP 端口。运营商 CGNAT 或对称 NAT 无法由客户端源码创建公网入站映射，需要公网 IPv4/可入站 IPv6、上级路由器配置或其他网络。
 - 默认 Tracker 可看到派生的 tracker hash、派生的 20 字节 tracker `peer_id`、候选地址和源地址，但无法获取 `RoomSeed`、房间状态或媒体明文；tracker `peer_id` 由本次入房的 `PeerID` 派生。
 - “设置 → 诊断”可以复制不含邀请和房间密钥的诊断报告，并打开持久日志目录。Windows 日志默认位于 `%LocalAppData%\bork\logs\bork.log`，达到 4 MiB 后轮转并保留一份旧日志。

@@ -34,6 +34,8 @@ const emptyState = new app.AppSnapshot({
     tracker: [],
     connectivity: {
       discoveryHints: [],
+      trackerSweepAttempts: 0,
+      trackerSweepPackets: 0,
     },
   },
 });

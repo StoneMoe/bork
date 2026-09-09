@@ -53,7 +53,6 @@ func (c *Client) addDiscoveryHintAt(hint discovery.Hint, now time.Time) {
 		c.logger.Info("discovered peer candidate", "source", hint.Source, "address", address)
 		c.sendHelloProbe(address)
 		if hint.Source == discovery.SourceTracker {
-			c.logger.Info("probing tracker candidate port window", "address", address, "radius", trackerPortSweepRadius)
 			c.sendTrackerPortSweep(address)
 		}
 	}
@@ -63,7 +62,14 @@ func (c *Client) addDiscoveryHintAt(hint discovery.Hint, now time.Time) {
 }
 
 func (c *Client) sendTrackerPortSweep(observed netip.AddrPort) {
-	for _, candidate := range trackerPortSweepCandidates(observed, trackerPortSweepRadius) {
+	candidates := trackerPortSweepCandidates(observed, trackerPortSweepRadius)
+	if len(candidates) == 0 {
+		return
+	}
+	c.trackerSweepAttempts++
+	c.trackerSweepPackets += uint64(len(candidates))
+	c.logger.Info("probing tracker candidate port window", "address", observed, "radius", trackerPortSweepRadius, "attempt", c.trackerSweepAttempts, "packets", len(candidates))
+	for _, candidate := range candidates {
 		c.sendHelloProbe(candidate)
 	}
 }
@@ -327,6 +333,12 @@ func (c *Client) sendDiscoveryProbes(now time.Time) {
 		remembered.nextProbe = now.Add(remembered.probeInterval)
 		c.discoveredAddresses[address] = remembered
 		c.sendHelloProbe(address)
+		// Endpoint-dependent NAT mappings often do not exist when the first
+		// tracker hint arrives. Repeat the bounded prediction window alongside
+		// the normal backoff probes so both peers eventually overlap in time.
+		if remembered.source == discovery.SourceTracker {
+			c.sendTrackerPortSweep(address)
+		}
 	}
 }
 

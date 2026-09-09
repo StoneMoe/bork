@@ -138,6 +138,8 @@ const english: Record<string, string> = {
   "尚未发现可用的本机候选地址。": "No local candidate addresses found yet.",
   "加入房间后开始收集本机候选地址。": "Join a room to collect local candidate addresses.",
   "远端候选地址": "Remote candidate addresses",
+  "UDP 打洞探测": "UDP hole-punch probes",
+  "已执行 {attempts} 轮端口预测，共发送 {packets} 个预测探测包": "Port prediction rounds: {attempts}; predicted probe packets sent: {packets}",
   "尚未收到其他成员的候选地址。": "No candidate addresses received from other members yet.",
   "加入房间后开始收集远端候选地址。": "Join a room to collect remote candidate addresses.",
   "STUN 探测": "STUN probes",
