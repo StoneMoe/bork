@@ -126,3 +126,36 @@ func TestHistoricalRemoteHintKeepsRoomLifetimeSource(t *testing.T) {
 		t.Fatalf("room-lifetime source was replaced: %+v", remembered)
 	}
 }
+
+func TestTrackerPortSweepCandidates(t *testing.T) {
+	observed := netip.MustParseAddrPort("198.51.100.20:40000")
+	got := trackerPortSweepCandidates(observed, 2)
+	want := []netip.AddrPort{
+		netip.MustParseAddrPort("198.51.100.20:40001"),
+		netip.MustParseAddrPort("198.51.100.20:39999"),
+		netip.MustParseAddrPort("198.51.100.20:40002"),
+		netip.MustParseAddrPort("198.51.100.20:39998"),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("candidate count = %d, want %d: %v", len(got), len(want), got)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("candidate %d = %v, want %v", index, got[index], want[index])
+		}
+	}
+	if got := trackerPortSweepCandidates(netip.MustParseAddrPort("[2001:db8::1]:40000"), 16); len(got) != 0 {
+		t.Fatalf("IPv6 candidates = %v, want none", got)
+	}
+}
+
+func TestTrackerPortSweepCandidatesStayInPortRange(t *testing.T) {
+	low := trackerPortSweepCandidates(netip.MustParseAddrPort("198.51.100.20:1"), 2)
+	if len(low) != 2 || low[0].Port() != 2 || low[1].Port() != 3 {
+		t.Fatalf("low-port candidates = %v", low)
+	}
+	high := trackerPortSweepCandidates(netip.MustParseAddrPort("198.51.100.20:65535"), 2)
+	if len(high) != 2 || high[0].Port() != 65534 || high[1].Port() != 65533 {
+		t.Fatalf("high-port candidates = %v", high)
+	}
+}

@@ -27,6 +27,10 @@ const (
 	// maxDiscoveryHints is an untrusted-input safety budget, not a room member limit.
 	maxDiscoveryHints = 2048
 	topologyHintTTL   = 30 * time.Second
+	// Endpoint-dependent NATs commonly allocate a nearby external UDP port for
+	// each destination. Probe a small, bounded window around tracker-observed
+	// IPv4 ports so two peers can still establish the first authenticated path.
+	trackerPortSweepRadius = 16
 
 	likeForLikeMargin = 5
 )
@@ -47,10 +51,37 @@ func (c *Client) addDiscoveryHintAt(hint discovery.Hint, now time.Time) {
 	address, added, changed := c.rememberDiscoveryHint(hint, now)
 	if added {
 		c.sendHelloProbe(address)
+		if hint.Source == discovery.SourceTracker {
+			c.sendTrackerPortSweep(address)
+		}
 	}
 	if changed {
 		c.publishStateChange()
 	}
+}
+
+func (c *Client) sendTrackerPortSweep(observed netip.AddrPort) {
+	for _, candidate := range trackerPortSweepCandidates(observed, trackerPortSweepRadius) {
+		c.sendHelloProbe(candidate)
+	}
+}
+
+func trackerPortSweepCandidates(observed netip.AddrPort, radius uint16) []netip.AddrPort {
+	if !observed.IsValid() || !observed.Addr().Unmap().Is4() || observed.Port() == 0 || radius == 0 {
+		return nil
+	}
+	address := observed.Addr().Unmap()
+	port := uint32(observed.Port())
+	candidates := make([]netip.AddrPort, 0, int(radius)*2)
+	for offset := uint32(1); offset <= uint32(radius); offset++ {
+		if port+offset <= 65535 {
+			candidates = append(candidates, netip.AddrPortFrom(address, uint16(port+offset)))
+		}
+		if port > offset {
+			candidates = append(candidates, netip.AddrPortFrom(address, uint16(port-offset)))
+		}
+	}
+	return candidates
 }
 
 func (c *Client) rememberDiscoveryHint(hint discovery.Hint, now time.Time) (netip.AddrPort, bool, bool) {

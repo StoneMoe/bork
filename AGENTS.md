@@ -65,6 +65,8 @@ network:
 - 空的 `stun_servers` 列表会禁用公共 STUN 服务。
 - 空的 `tracker_urls` 列表会禁用公共 Tracker 服务。
 - 将 `port_mapping` 设为 `false` 会禁用网关端口映射。
+- PCP、NAT-PMP 和 UPnP 都不可用时，Bork 仍会使用 STUN 候选地址和 Tracker 尝试同时 UDP 打洞；只要 STUN 已取得映射，界面不会把可选的网关映射失败显示为房间告警，完整失败原因仍保留在诊断快照中。
+- 如果自动端口映射和 UDP 打洞都失败，可将 `udp_listen` 改为固定端口（例如 `'[::]:40000'`），并在路由器上手动转发同一个 UDP 端口。运营商 CGNAT 或对称 NAT 无法由客户端源码创建公网入站映射，需要公网 IPv4/可入站 IPv6、上级路由器配置或其他网络。
 - 默认 Tracker 可看到派生的 tracker hash、派生的 20 字节 tracker `peer_id`、候选地址和源地址，但无法获取 `RoomSeed`、房间状态或媒体明文；tracker `peer_id` 由本次入房的 `PeerID` 派生。
 
 ### 构建与验证
