@@ -1,9 +1,13 @@
 package app
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"bork/internal/audio"
 	"bork/internal/globalkey"
@@ -14,6 +18,40 @@ import (
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
+
+func (a *App) GetDiagnosticReport() (string, error) {
+	a.waitForStartup()
+	snapshot := a.snapshot()
+	remotePeers := 0
+	if snapshot.Room != nil {
+		remotePeers = len(snapshot.Room.RemotePeers)
+	}
+	report := struct {
+		GeneratedAt time.Time   `json:"generatedAt"`
+		Version     string      `json:"version"`
+		RoomActive  bool        `json:"roomActive"`
+		RemotePeers int         `json:"remotePeers"`
+		Diagnostics Diagnostics `json:"diagnostics"`
+	}{time.Now().UTC(), snapshot.Version, snapshot.Room != nil, remotePeers, snapshot.Diagnostics}
+	contents, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("encode diagnostic report: %w", err)
+	}
+	return string(contents), nil
+}
+
+func (a *App) OpenLogDirectory() error {
+	a.waitForStartup()
+	path := a.config.LogPath()
+	if path == "" {
+		return errors.New("log path is unavailable")
+	}
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return fmt.Errorf("create log directory: %w", err)
+	}
+	return openDirectory(directory)
+}
 
 func (a *App) GetSnapshot() AppSnapshot {
 	a.waitForStartup()

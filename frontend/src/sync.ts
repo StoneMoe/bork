@@ -27,12 +27,15 @@ const emptyState = new app.AppSnapshot({
     playbackDevices: [],
   },
   diagnostics: {
+    logPath: "",
     listenAddress: "",
     candidates: [],
     stun: [],
     tracker: [],
     connectivity: {
       discoveryHints: [],
+      trackerSweepAttempts: 0,
+      trackerSweepPackets: 0,
     },
   },
 });

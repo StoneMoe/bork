@@ -31,6 +31,13 @@ type NetworkConfig struct {
 	PortMapping bool     `yaml:"port_mapping"`
 }
 
+func (c AppConfig) LogPath() string {
+	if c.FilePath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(c.FilePath), "logs", "bork.log")
+}
+
 func LoadAppConfig() (AppConfig, error) {
 	configDir := os.UserConfigDir
 	if runtime.GOOS == "windows" {

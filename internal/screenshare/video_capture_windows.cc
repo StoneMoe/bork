@@ -1,5 +1,11 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#ifndef WINVER
+#define WINVER _WIN32_WINNT
+#endif
 
 #include <windows.h>
 #include <inspectable.h>
@@ -14,6 +20,7 @@
 #include <mfidl.h>
 #include <mftransform.h>
 #include <codecapi.h>
+#include <icodecapi.h>
 #include <propvarutil.h>
 
 #include "video_capture_windows.h"

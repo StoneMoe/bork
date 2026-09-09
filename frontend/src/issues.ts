@@ -72,7 +72,15 @@ function collectNetworkIssues(diagnostics: app.Diagnostics): IssueRecord[] {
       message: diagnostics.discoveryError,
     }));
   }
-  if (diagnostics.portMappingError) {
+  // PCP/NAT-PMP/UPnP are optional ways to obtain a stable public endpoint.
+  // A STUN mapping is already enough for the tracker to coordinate UDP hole
+  // punching, so do not present an unsupported gateway protocol as an
+  // actionable room warning while that fallback is available. Keep the raw
+  // portMappingError in Diagnostics for troubleshooting.
+  const hasStunFallback = (diagnostics.candidates ?? []).some(
+    (candidate) => candidate.type === "stun" && Boolean(candidate.address),
+  );
+  if (diagnostics.portMappingError && !hasStunFallback) {
     issues.push(issueRecord({
       type: "network",
       level: "warning",

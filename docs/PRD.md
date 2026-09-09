@@ -9,6 +9,7 @@
 - 将 20 至 50 人作为房间规模设计目标，但不作绝对承诺和约束。
 - Bork 不提供无头中继模式；需要桥接和群组转发时，自动使用 GUI Peer。
 - Windows 直接下载版以单个 `bork.exe` 交付，无需安装器、额外 DLL 或其他文件。
+- Windows 构建必须静态包含 MinGW 的 GCC、C++ 和线程运行库，并在构建后拒绝仍导入 `libgcc_s_seh-1.dll`、`libstdc++-6.dll` 或 `libwinpthread-1.dll` 的产物。
 - Microsoft Store 版按商店要求以 MSIX 包交付。
 
 ## 界面语言

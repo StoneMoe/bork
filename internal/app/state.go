@@ -114,6 +114,7 @@ type AppSnapshot struct {
 }
 
 type Diagnostics struct {
+	LogPath          string                    `json:"logPath,omitempty"`
 	ListenAddress    string                    `json:"listenAddress"`
 	Candidates       []endpoint.Candidate      `json:"candidates"`
 	STUN             []endpoint.STUNResult     `json:"stun"`

@@ -29,7 +29,9 @@ type ClientSnapshot struct {
 }
 
 type ConnectivitySnapshot struct {
-	DiscoveryHints []DiscoveryHintSnapshot `json:"discoveryHints"`
+	DiscoveryHints       []DiscoveryHintSnapshot `json:"discoveryHints"`
+	TrackerSweepAttempts uint64                  `json:"trackerSweepAttempts"`
+	TrackerSweepPackets  uint64                  `json:"trackerSweepPackets"`
 }
 
 type DiscoveryHintSnapshot struct {
@@ -63,6 +65,8 @@ type Client struct {
 	admissionKey             [32]byte
 	helloProbePacket         []byte
 	discoveredAddresses      map[netip.AddrPort]discoveredAddress
+	trackerSweepAttempts     uint64
+	trackerSweepPackets      uint64
 	remotePeers              map[identity.PeerID]*RemotePeer
 	topologyRevision         uint64
 	topology                 map[identity.PeerID]*topologyPeer
@@ -396,5 +400,9 @@ func (c *Client) connectivitySnapshot() ConnectivitySnapshot {
 		}
 		return discoveryHints[i].Address < discoveryHints[j].Address
 	})
-	return ConnectivitySnapshot{DiscoveryHints: discoveryHints}
+	return ConnectivitySnapshot{
+		DiscoveryHints:       discoveryHints,
+		TrackerSweepAttempts: c.trackerSweepAttempts,
+		TrackerSweepPackets:  c.trackerSweepPackets,
+	}
 }

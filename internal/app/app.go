@@ -666,6 +666,7 @@ func (a *App) snapshot() AppSnapshot {
 		}
 		state.Diagnostics = projectDiagnostics(networkSnapshot, peerSnapshot.Connectivity)
 	}
+	state.Diagnostics.LogPath = a.config.LogPath()
 	return state
 }
 
