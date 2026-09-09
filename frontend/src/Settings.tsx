@@ -1,5 +1,6 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import * as Backend from "@wailsjs/go/app/App";
+import { ClipboardSetText } from "@wailsjs/runtime/runtime";
 import { MicrophoneIcon, SpeakerIcon } from "./RoomControls";
 import Select, { type SelectOption } from "./Select";
 import { t, locale, languagePreference, setLanguagePreference, translateMessage } from "./i18n";
@@ -85,6 +86,7 @@ export default function Settings(props: SettingsProps) {
   const [capturingPushToTalkKey, setCapturingPushToTalkKey] = createSignal(false);
   const [now, setNow] = createSignal(Date.now());
   const [dismissedTrackerTooltip, setDismissedTrackerTooltip] = createSignal("");
+  const [diagnosticsCopied, setDiagnosticsCopied] = createSignal(false);
   const clock = window.setInterval(() => setNow(Date.now()), 1000);
   onCleanup(() => window.clearInterval(clock));
   onMount(() => {
@@ -110,6 +112,16 @@ export default function Settings(props: SettingsProps) {
   async function saveNickname() {
     if (nickname() === props.state.nickname) return;
     if (!await props.runAction(() => Backend.SetNickname(nickname()))) setNickname(props.state.nickname);
+  }
+
+  async function copyDiagnostics() {
+    const copied = await props.runAction(async () => {
+      const report = await Backend.GetDiagnosticReport();
+      await ClipboardSetText(report);
+    });
+    if (!copied) return;
+    setDiagnosticsCopied(true);
+    window.setTimeout(() => setDiagnosticsCopied(false), 1800);
   }
 
   function updateTheme(next: ThemePreference) {
@@ -412,6 +424,17 @@ export default function Settings(props: SettingsProps) {
           aria-labelledby="settings-tab-network"
           hidden={activeTab() !== "network"}
         >
+          <div class="diagnostic-actions">
+            <button type="button" disabled={props.busy} onClick={() => void copyDiagnostics()}>
+              {diagnosticsCopied() ? t("诊断报告已复制") : t("复制诊断报告")}
+            </button>
+            <button type="button" disabled={props.busy} onClick={() => void props.runAction(Backend.OpenLogDirectory)}>
+              {t("打开日志目录")}
+            </button>
+          </div>
+          <Show when={diagnostics().logPath}>
+            <p class="diagnostic-log-path">{t("日志文件：{path}", { path: diagnostics().logPath || "" })}</p>
+          </Show>
           <div class="diagnostic-section">
             <div class="diagnostic-heading"><span>{t("版本")}</span></div>
             <code class="diagnostic-value">{props.state.version}</code>

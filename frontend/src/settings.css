@@ -195,6 +195,22 @@
 .nickname-form input:disabled { cursor: default; opacity: 0.5; }
 .nickname-form small { color: var(--text-faint); font-size: 11px; line-height: 1.45; }
 
+.diagnostic-actions { display: flex; gap: 8px; margin-bottom: 8px; }
+.diagnostic-actions button {
+  min-height: 32px;
+  border: 1px solid rgba(var(--accent-rgb), 0.22);
+  border-radius: 7px;
+  padding: 0 11px;
+  color: var(--accent-strong);
+  cursor: pointer;
+  background: rgba(var(--accent-rgb), 0.07);
+  font-size: 11px;
+}
+.diagnostic-actions button:hover:not(:disabled),
+.diagnostic-actions button:focus-visible { border-color: rgba(var(--accent-rgb), 0.45); background: rgba(var(--accent-rgb), 0.12); }
+.diagnostic-actions button:disabled { cursor: default; opacity: .5; }
+.diagnostic-log-path { margin: 0 0 20px; overflow-wrap: anywhere; color: var(--text-faint); font: 10px/1.45 var(--font-mono); }
+
 .diagnostic-heading {
   min-height: 22px;
   display: flex;

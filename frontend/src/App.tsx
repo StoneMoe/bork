@@ -59,9 +59,36 @@ function humanStatus(state: AppState): FriendlyStatus {
     };
   }
   if (state.room.remotePeers.length > 0) return {};
+  const stun = state.diagnostics.stun || [];
+  const trackers = state.diagnostics.tracker || [];
+  const hints = state.diagnostics.connectivity?.discoveryHints || [];
+  if (stun.length === 0) {
+    return {
+      title: t("正在检测公网地址"),
+      detail: t("Bork 正在通过 STUN 检查公网连通性。"),
+    };
+  }
+  if (trackers.length > 0 && trackers.every((tracker) => Boolean(tracker.error))) {
+    return {
+      title: t("Tracker 连接失败"),
+      detail: t("暂时无法交换成员地址，请打开“设置 → 诊断”查看错误并复制诊断报告。"),
+    };
+  }
+  if (hints.length > 0 || trackers.some((tracker) => (tracker.peerAddresses || []).length > 0)) {
+    return {
+      title: t("已发现成员，正在建立直连"),
+      detail: t("已收到远端地址并正在 UDP 打洞；若长时间无响应，请检查双方防火墙是否允许 Bork。"),
+    };
+  }
+  if (trackers.some((tracker) => !tracker.error)) {
+    return {
+      title: t("已连接 Tracker，等待成员"),
+      detail: t("请确认双方使用完全相同的邀请链接，并尽量使用相同版本的 Bork。"),
+    };
+  }
   return {
     title: t("正在寻找房间成员"),
-    detail: t("保持 Bork 运行，其他成员上线后会自动尝试连接。"),
+    detail: t("正在连接 Tracker 并搜索局域网成员。"),
   };
 }
 

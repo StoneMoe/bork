@@ -4,12 +4,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"runtime"
 	"strings"
 
 	"bork/internal/app"
 	"bork/internal/config"
+	"bork/internal/logging"
 	"bork/internal/webassets"
 )
 
@@ -47,7 +50,18 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "bork: %v\n", err)
 		return 2
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logOutput := io.Writer(os.Stderr)
+	logFile, logErr := logging.Open(cfg.LogPath())
+	if logErr != nil {
+		fmt.Fprintf(os.Stderr, "bork: persistent log unavailable: %v\n", logErr)
+	} else {
+		defer logFile.Close()
+		// Windows GUI binaries can expose an invalid stderr handle. Write the
+		// durable file first so a console error cannot suppress persistent logs.
+		logOutput = io.MultiWriter(logFile, os.Stderr)
+	}
+	logger := slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger.Info("application starting", "version", app.BuildVersion, "os", runtime.GOOS, "arch", runtime.GOARCH, "config", cfg.FilePath, "log", cfg.LogPath())
 	if err := app.RunGUI(cfg, webassets.Files, logger); err != nil {
 		logger.Error("GUI stopped", "error", err)
 		return 1

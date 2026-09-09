@@ -68,6 +68,7 @@ network:
 - PCP、NAT-PMP 和 UPnP 都不可用时，Bork 仍会使用 STUN 候选地址和 Tracker 尝试同时 UDP 打洞；只要 STUN 已取得映射，界面不会把可选的网关映射失败显示为房间告警，完整失败原因仍保留在诊断快照中。
 - 如果自动端口映射和 UDP 打洞都失败，可将 `udp_listen` 改为固定端口（例如 `'[::]:40000'`），并在路由器上手动转发同一个 UDP 端口。运营商 CGNAT 或对称 NAT 无法由客户端源码创建公网入站映射，需要公网 IPv4/可入站 IPv6、上级路由器配置或其他网络。
 - 默认 Tracker 可看到派生的 tracker hash、派生的 20 字节 tracker `peer_id`、候选地址和源地址，但无法获取 `RoomSeed`、房间状态或媒体明文；tracker `peer_id` 由本次入房的 `PeerID` 派生。
+- “设置 → 诊断”可以复制不含邀请和房间密钥的诊断报告，并打开持久日志目录。Windows 日志默认位于 `%LocalAppData%\bork\logs\bork.log`，达到 4 MiB 后轮转并保留一份旧日志。
 
 ### 构建与验证
 
@@ -84,6 +85,7 @@ make typecheck-frontend
 - Git 会忽略 `internal/webassets/dist/` 中的前端产物。
 - 品牌源文件位于 `assets/brand/`。
 - `make build` 和 `make dev` 会将应用图标复制到 Wails 工作区。
+- Windows 的 `make build` 使用 Wails 的 `-webview2 embed`，将 Evergreen Bootstrapper 嵌入单文件 EXE；WebView2 Runtime 本体仍由微软安装程序安装。
 - 通过 `TAGS` 传递额外的 Go build tags。
 - 通过 `PLATFORMS` 传递目标平台。
 - 不要在 `BUILD_FLAGS` 或 `DEV_FLAGS` 中直接加入 `-tags`。

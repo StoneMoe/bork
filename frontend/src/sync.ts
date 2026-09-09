@@ -27,6 +27,7 @@ const emptyState = new app.AppSnapshot({
     playbackDevices: [],
   },
   diagnostics: {
+    logPath: "",
     listenAddress: "",
     candidates: [],
     stun: [],

@@ -292,6 +292,11 @@ func (a *Announcer) recordSuccess(configured provider, response announceResponse
 	a.recordStatus(configured, ProviderStatus{
 		NextAnnounce: now.Add(interval).Format(time.RFC3339), PeerAddresses: addresses,
 	})
+	if len(addresses) > 0 {
+		a.logger.Info("tracker returned peer candidates", "provider", configured.display, "candidate", a.candidate.Address.String(), "port", a.candidate.Port, "count", len(addresses))
+	} else {
+		a.logger.Debug("tracker announce succeeded without peers", "provider", configured.display, "candidate", a.candidate.Address.String(), "port", a.candidate.Port)
+	}
 }
 
 func (a *Announcer) recordFailure(configured provider, err error, retryAt time.Time) {

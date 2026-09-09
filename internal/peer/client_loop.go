@@ -50,8 +50,10 @@ func (c *Client) addDiscoveryHint(hint discovery.Hint) {
 func (c *Client) addDiscoveryHintAt(hint discovery.Hint, now time.Time) {
 	address, added, changed := c.rememberDiscoveryHint(hint, now)
 	if added {
+		c.logger.Info("discovered peer candidate", "source", hint.Source, "address", address)
 		c.sendHelloProbe(address)
 		if hint.Source == discovery.SourceTracker {
+			c.logger.Info("probing tracker candidate port window", "address", address, "radius", trackerPortSweepRadius)
 			c.sendTrackerPortSweep(address)
 		}
 	}
