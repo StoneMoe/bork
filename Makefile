@@ -65,6 +65,9 @@ prepare-packaging:
 build: prepare-packaging
 	$(CHECK_BUILD_VERSION)
 	$(WAILS_CMD) build -clean -trimpath -ldflags "-s -w -X bork/internal/app.BuildVersion=$(VERSION)" $(PLATFORM_FLAGS) $(TAG_FLAGS) $(BUILD_FLAGS)
+ifeq ($(OS),Windows_NT)
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check-windows-runtime.ps1 build/bin/bork.exe
+endif
 
 package-msix: PLATFORM_FLAGS = -platform "windows/amd64"
 package-msix: build
